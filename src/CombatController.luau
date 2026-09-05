@@ -298,28 +298,43 @@ local function refreshTargets(rootPart, now)
     state.cachedTargets = targets
 end
 
+local hasBlockingRay
+
 local function getClosestEnemy(rootPart, now)
     refreshTargets(rootPart, now)
-    if isValidTarget(state.lockedTarget) then
+    if now - (state.lastTargetChoice or 0) < 0.15 and isValidTarget(state.lockedTarget) then
         local root = getRootPart(state.lockedTarget)
         local distance = (rootPart.Position - root.Position).Magnitude
         if distance <= CFG.DETECTION_RADIUS and state.lockedTarget:IsDescendantOf(Workspace) then
             return state.lockedTarget, distance
         end
     end
-    state.lockedTarget = nil
-    local closest, closestDistance
+    state.lastTargetChoice = now
+    local candidates = {}
     for _, model in ipairs(state.cachedTargets) do
-        if isValidTarget(model) then
+        if isValidTarget(model) and model:IsDescendantOf(Workspace) then
             local root = getRootPart(model)
             local distance = (rootPart.Position - root.Position).Magnitude
-            if not closestDistance or distance < closestDistance then
-                closest, closestDistance = model, distance
+            if distance <= CFG.DETECTION_RADIUS then
+                table.insert(candidates, { model = model, root = root, distance = distance })
             end
         end
     end
-    state.lockedTarget = closest
-    return closest, closestDistance or CFG.DETECTION_RADIUS
+    table.sort(candidates, function(a, b) return a.distance < b.distance end)
+    local closest = candidates[1]
+    if closest then
+        -- Prefer nearby enemies we can engage over a closer one behind a wall.
+        local searchDistance = math.max(CFG.THREAT_RADIUS, closest.distance + 24)
+        for _, candidate in ipairs(candidates) do
+            if candidate.distance > searchDistance then break end
+            if not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
+                closest = candidate
+                break
+            end
+        end
+    end
+    state.lockedTarget = closest and closest.model
+    return state.lockedTarget, closest and closest.distance or CFG.DETECTION_RADIUS
 end
 
 local function buildRaycastParams(character, target)
@@ -333,7 +348,7 @@ local function buildRaycastParams(character, target)
     return params
 end
 
-local function hasBlockingRay(origin, destination, character, target)
+hasBlockingRay = function(origin, destination, character, target)
     local direction = destination - origin
     local params = buildRaycastParams(character, target)
     for _ = 1, 6 do
@@ -881,16 +896,6 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.lastThreatPart = zone and zone.id
     local crowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
-    if crowd < crowdLimit and now - (state.lastEmergencyTarget or 0) > 1.5 then
-        for _, enemy in ipairs(state.nearbyEnemies) do
-            if (enemy.root.Position + enemy.velocity * 0.5 - rootPart.Position).Magnitude < enemy.radius and enemy.model ~= target
-                and enemy.distance + 4 < (targetRoot.Position - rootPart.Position).Magnitude then
-                state.lockedTarget = enemy.model
-                state.lastEmergencyTarget = now
-                break
-            end
-        end
-    end
     if state.escapeGoal and now < (state.escapeUntil or 0) then
         if (state.escapeGoal - rootPart.Position).Magnitude > 1.5
             and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.PRECAST_MARGIN)
@@ -984,6 +989,15 @@ local function controllerTick()
         state.lockedTarget = nil
         return
     end
+    if state.currentTarget ~= target then
+        local previousRoot = state.currentTarget and getRootPart(state.currentTarget)
+        if not previousRoot or (previousRoot.Position - targetRoot.Position).Magnitude > 4 then
+            clearPath()
+            state.motionGoal, state.fallbackGoal = nil, nil
+            state.pathUpdateTime = 0
+        end
+        state.lastProgressDistance, state.stuckStartTime = math.huge, 0
+    end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
     state.prevHealth[target] = targetHumanoid.Health
     refreshSafety(rootPart, now)
@@ -1075,7 +1089,7 @@ local function setRunning(running)
         state.skillToggle, state.lastSkillTime = false, 0
         state.lockedTarget, state.currentTarget = nil, nil
         state.cachedTargets, state.prevHealth = {}, setmetatable({}, { __mode = "k" })
-        state.lastTargetScan = 0
+        state.lastTargetScan, state.lastTargetChoice = 0, 0
         state.lastDodgeTime, state.dodgeGoal = 0, nil
         state.motionGoal, state.motionGoalMode, state.motionMode = nil, nil, "idle"
         state.fallbackGoal, state.fallbackUntil = nil, 0

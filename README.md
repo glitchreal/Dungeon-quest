@@ -66,6 +66,9 @@ excluded; no movement-speed increase is required.
 Approach steps also check enemies' predicted positions half a second ahead.
 This lets the controller brake or retreat before a closing enemy reaches it,
 including enemies arriving from behind and larger enemy bodies.
+Target selection refreshes every 0.15 seconds, preferring the closest nearby
+enemy in clear sight over one behind a wall. Switching to a different area
+invalidates the old route; switches within a close group preserve smooth walking.
 
 Automation, movement overrides, hover, and logging are off by default. Auto
 Dungeon enables combat; Auto Create Lobby and Auto Start Dungeon enable queueing.
