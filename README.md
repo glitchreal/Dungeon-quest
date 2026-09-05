@@ -70,6 +70,22 @@ Target selection refreshes every 0.15 seconds, preferring the closest nearby
 enemy in clear sight over one behind a wall. Switching to a different area
 invalidates the old route; switches within a close group preserve smooth walking.
 
+Abilities use the equipped tools' real cooldowns and the game's normal
+`localEvent` / `abilityUsed` activation path. The scheduler skips unavailable
+slots, respects `busyCasting`, and avoids casting while you type. Cast totals
+advance when the cooldown activates, rather than on attempted key presses.
+The Combat Status group shows equipped ability cooldowns, target health, active
+hazards, path calculations, and the most recent damage event.
+
+Short clear routes use direct walking after body-width and ground-support checks.
+Escape and recovery steps check the whole route for gaps, not just the landing
+point. Enemy avoidance checks the full predicted crossing path for each nearby
+enemy, so moving away from one cannot mask entering another's danger radius.
+Adaptive Safety Spacing adds three studs briefly after a hit and up to eight
+studs at low health; the larger buffer applies, rather than stacking both. It is
+enabled by default and can be disabled to keep exactly the configured spacing.
+Dynamic distance reads the currently equipped weapon, including mid-run changes.
+
 Automation, movement overrides, hover, and logging are off by default. Auto
 Dungeon enables combat; Auto Create Lobby and Auto Start Dungeon enable queueing.
 With `autoloadconfig = true`, existing settings are retained when reloading or
@@ -86,7 +102,8 @@ This repository contains only the Obsidian project. `main.luau` is the public
 entry point; `src/Lobby.luau` and `src/Dungeon.luau` contain place-specific logic.
 `src/CombatController.luau` has no separate legacy UI. Shared controls and game
 interfaces are in `src/ObsidianHub.luau`, `src/GameAdapter.luau`, and
-`src/HubLogic.luau`.
+`src/HubLogic.luau`. Ready-slot casting is in `src/AbilityController.luau`, and
+collision/trajectory calculations are in `src/ThreatGeometry.luau`.
 
 After changing source, rebuild and commit the generated scripts with it:
 

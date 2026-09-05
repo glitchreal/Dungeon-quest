@@ -15,6 +15,7 @@ function Adapter.value(root, name, fallback)
 end
 
 function Adapter.level()
+    if Adapter.value(player, "dataLoaded", true) == false then return nil end
     return Adapter.value(player:FindFirstChild("leaderstats"), "Level", nil)
 end
 

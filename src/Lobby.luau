@@ -12,6 +12,7 @@ local function createController()
 end
 
 local function queueAction(config, now, arrivedAt)
+    if not Adapter.level() then return "Waiting for player data" end
     if config.AutoRaid then
         local lobby = Adapter.findLobby(true)
         if lobby then

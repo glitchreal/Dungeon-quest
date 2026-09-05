@@ -14,7 +14,7 @@ local CFG = {
     COMBAT_DISTANCE = 20,
     COMBAT_MIN_DISTANCE = 16,
     COMBAT_MAX_DISTANCE = 24,
-    SKILL_COOLDOWN = 1.5,
+    SKILL_COOLDOWN = 0.2,
     CONTROL_INTERVAL = 1 / 30,
     UI_INTERVAL = 0.15,
     THREAT_SCAN_INTERVAL = 0.2,
@@ -125,7 +125,14 @@ local state = {
     lastSafetyScan = -math.huge,
     lastEscapePlan = -math.huge,
     enemyMotion = setmetatable({}, { __mode = "k" }),
+    pathComputations = 0,
 }
+
+local abilities = AbilityController.new(player, function(slot)
+    if state.closed then return end
+    local key = slot == "q" and "skillQ_count" or "skillE_count"
+    state[key] = state[key] + 1
+end)
 
 local connections = {}
 local function connect(signal, callback)
@@ -376,12 +383,38 @@ local function groundPosition(position, character, target)
     return position
 end
 
+local function walkingSegmentClear(rootPart, destination, target, params, startFloor)
+    params = params or buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    startFloor = startFloor or Workspace:Raycast(rootPart.Position, Vector3.new(0, -12, 0), params)
+    if not startFloor then return false end
+    local startPosition = rootPart.Position
+    local flat = Vector3.new(destination.X - startPosition.X, 0, destination.Z - startPosition.Z)
+    if flat.Magnitude < 0.1 then return true end
+    local previousY = startFloor.Position.Y
+    local steps = math.max(1, math.ceil(flat.Magnitude / 3))
+    for i = 1, steps do
+        local sample = startPosition + flat * (i / steps)
+        sample = Vector3.new(sample.X, previousY + 6, sample.Z)
+        local ground = Workspace:Raycast(sample, Vector3.new(0, -12, 0), params)
+        if not ground or ground.Normal.Y < 0.55 or math.abs(ground.Position.Y - previousY) > 2 then return false end
+        previousY = ground.Position.Y
+    end
+    local endPosition = startPosition + flat + Vector3.new(0, previousY - startFloor.Position.Y, 0)
+    local right = Vector3.new(-flat.Z, 0, flat.X).Unit * math.min(CFG.AGENT_RADIUS, 1.5)
+    for _, offset in ipairs({ Vector3.zero, right, -right }) do
+        if hasBlockingRay(startPosition + offset, endPosition + offset, rootPart.Parent, target) then return false end
+    end
+    return true
+end
+
 local function pathKey(startPosition, endPosition, mode)
     local function quantize(value) return math.floor(value / 4 + 0.5) end
     return string.format("%s:%d,%d,%d>%d,%d,%d", mode or "combat", quantize(startPosition.X), quantize(startPosition.Y), quantize(startPosition.Z), quantize(endPosition.X), quantize(endPosition.Y), quantize(endPosition.Z))
 end
 
 local function clearPath()
+    state.directTravel = false
     state.pathGeneration = state.pathGeneration + 1
     if state.pathBlockedConn then state.pathBlockedConn:Disconnect() end
     state.pathBlockedConn = nil
@@ -409,6 +442,7 @@ local function createPath(startPosition, endPosition, mode, now)
     }
     for _, configuration in ipairs(configurations) do
         local path = PathfindingService:CreatePath(configuration)
+        state.pathComputations = state.pathComputations + 1
         local ok = pcall(function() path:ComputeAsync(startPosition, endPosition) end)
         if ok and path.Status == Enum.PathStatus.Success then
             local waypoints = path:GetWaypoints()
@@ -423,25 +457,31 @@ local function createPath(startPosition, endPosition, mode, now)
     return nil
 end
 
+local function clearanceFromEnemy(enemy, position)
+    local current = enemy.root.Position
+    return ThreatGeometry.segmentDistance(position, current, current + enemy.velocity * 0.5) - enemy.radius
+end
+
 local function enemyClearance(position)
     local nearest = math.huge
     for _, enemy in ipairs(state.nearbyEnemies) do
         if enemy.root.Parent then
-            local current = enemy.root.Position
-            local future = current + enemy.velocity * 0.5
-            local distance = math.min((current - position).Magnitude, (future - position).Magnitude)
-            nearest = math.min(nearest, distance - enemy.radius)
+            nearest = math.min(nearest, clearanceFromEnemy(enemy, position))
         end
     end
     return nearest
 end
 
 local function safeEnemyStep(startPosition, endPosition)
-    local original = enemyClearance(startPosition)
-    for i = 1, 4 do
-        local clearance = enemyClearance(startPosition:Lerp(endPosition, i / 4))
-        if clearance < math.min(0, original) - 0.1 then return false end
-        original = clearance
+    for _, enemy in ipairs(state.nearbyEnemies) do
+        if enemy.root.Parent then
+            local original = clearanceFromEnemy(enemy, startPosition)
+            for i = 1, 4 do
+                local clearance = clearanceFromEnemy(enemy, startPosition:Lerp(endPosition, i / 4))
+                if clearance < math.min(0, original) - 0.1 then return false end
+                original = clearance
+            end
+        end
     end
     return true
 end
@@ -497,7 +537,7 @@ local function chooseFallbackStep(rootPart, goal, target)
     }
     for _, direction in ipairs(directions) do
         local candidate = groundPosition(rootPart.Position + direction * 8, rootPart.Parent, target)
-        if not hasBlockingRay(rootPart.Position + Vector3.new(0, 2, 0), candidate + Vector3.new(0, 2, 0), rootPart.Parent, target) then
+        if walkingSegmentClear(rootPart, candidate, target) then
             return candidate
         end
     end
@@ -525,6 +565,24 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         end
         state.fallbackGoal, state.fallbackUntil = nil, 0
     end
+
+    if (goal - rootPart.Position).Magnitude <= CFG.DIRECT_PATH_DISTANCE then
+        local probe = state.directProbe
+        if not probe or now - probe.at > 0.2 or probe.target ~= target or probe.character ~= rootPart.Parent
+            or (probe.origin - rootPart.Position).Magnitude > 5 or (probe.goal - goal).Magnitude > 4 then
+            probe = { at = now, target = target, character = rootPart.Parent, origin = rootPart.Position, goal = goal,
+                clear = walkingSegmentClear(rootPart, goal, target) }
+            state.directProbe = probe
+        end
+        if probe.clear then
+            if not state.directTravel then clearPath() end
+            state.directTravel, state.pathMode = true, mode
+            state.pathStatus = "Pathfinding: direct walk"
+            issueMove(humanoid, goal, mode, now)
+            return
+        end
+    end
+    state.directTravel = false
 
     local shouldRepath = state.pathBlocked or #state.waypoints == 0 or not state.pathGoal or (goal - state.pathGoal).Magnitude > 2
     if shouldRepath and not state.pathPending and now - state.pathUpdateTime >= CFG.PATH_UPDATE_INTERVAL and (goal - rootPart.Position).Magnitude > CFG.WAYPOINT_REACH_THRESHOLD then
@@ -570,7 +628,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             if #state.waypoints > 0 and not state.pathBlocked then return end
             clearPath()
             local fallback = nil
-            if not hasBlockingRay(rootPart.Position + Vector3.new(0, 2, 0), goal + Vector3.new(0, 2, 0), rootPart.Parent, target) then
+            if (goal - rootPart.Position).Magnitude <= CFG.DIRECT_PATH_DISTANCE and walkingSegmentClear(rootPart, goal, target) then
                 fallback = goal
             else
                 -- A failed long path still gets a short, collision-checked step.
@@ -602,7 +660,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not waypoint then
         if #state.waypoints > 0 then clearPath() end
         if (goal - rootPart.Position).Magnitude <= CFG.DIRECT_PATH_DISTANCE
-            and not hasBlockingRay(rootPart.Position, goal, rootPart.Parent, target) then
+            and walkingSegmentClear(rootPart, goal, target) then
             issueMove(humanoid, goal, mode, now)
         else
             humanoid:MoveTo(rootPart.Position)
@@ -639,7 +697,7 @@ local function chooseRecoveryGoal(rootPart, goal, target)
     end
     for _, candidate in ipairs(candidates) do
         candidate = groundPosition(candidate, rootPart.Parent, target)
-        if not hasBlockingRay(rootPart.Position + Vector3.new(0, 2, 0), candidate + Vector3.new(0, 2, 0), rootPart.Parent, target) then return candidate end
+        if walkingSegmentClear(rootPart, candidate, target) then return candidate end
     end
     return nil
 end
@@ -763,17 +821,16 @@ local function findEscapeGoal(rootPart, targetRoot)
         for i = 0, 15 do
             local angle = i * math.pi / 8
             local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
-            local ground = Workspace:Raycast(candidate + Vector3.new(0, 2, 0), Vector3.new(0, -12, 0), params)
-            if ground and math.abs(ground.Position.Y - floor.Position.Y) <= 2
-                and not hasBlockingRay(rootPart.Position, candidate, rootPart.Parent, targetRoot.Parent)
-                and safeEnemyStep(rootPart.Position, candidate)
+            if safeEnemyStep(rootPart.Position, candidate)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.PRECAST_MARGIN) then
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.PRECAST_MARGIN)
                 local crowd = crowdDistance(candidate)
                 if (originalRisk == 0 or risk < originalRisk - 0.1) and (originalCrowd >= crowdLimit or crowd > originalCrowd + 0.25) then
                     local targetDistance = (candidate - targetRoot.Position).Magnitude
                     local score = -risk * 100 + math.min(crowd, 20) * 2 - math.abs(targetDistance - CFG.COMBAT_DISTANCE) * 0.1 - radius * 0.05
-                    if score > bestScore then best, bestScore = candidate, score end
+                    if score > bestScore and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
+                        best, bestScore = candidate, score
+                    end
                 end
             end
         end
@@ -862,20 +919,7 @@ end
 local function castSkill()
     if not CFG.AUTO_ABILITIES then return end
     local now = os.clock()
-    if now - state.lastSkillTime < CFG.SKILL_COOLDOWN then return end
-    state.lastSkillTime = now
-    local key = state.skillToggle and Enum.KeyCode.Q or Enum.KeyCode.E
-    local ok = pcall(function()
-        local virtualInput = game:GetService("VirtualInputManager")
-        virtualInput:SendKeyEvent(true, key, false, game)
-        task.delay(0.05, function()
-            pcall(function() virtualInput:SendKeyEvent(false, key, false, game) end)
-        end)
-    end)
-    if ok then
-        if state.skillToggle then state.skillQ_count = state.skillQ_count + 1 else state.skillE_count = state.skillE_count + 1 end
-    end
-    state.skillToggle = not state.skillToggle
+    if abilities.TryCast(now, CFG.SKILL_COOLDOWN) then state.lastSkillTime = now end
 end
 
 local function stopMovement(humanoid, rootPart)
@@ -897,12 +941,16 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local crowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     if state.escapeGoal and now < (state.escapeUntil or 0) then
+        if now - (state.lastEscapeCheck or 0) >= 0.2 then
+            state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
+            state.lastEscapeCheck = now
+        end
         if (state.escapeGoal - rootPart.Position).Magnitude > 1.5
             and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.PRECAST_MARGIN)
             and safeEnemyStep(rootPart.Position, state.escapeGoal)
-            and not hasBlockingRay(rootPart.Position, state.escapeGoal, rootPart.Parent, target)
+            and state.escapeClear
             and (crowd >= crowdLimit or crowdDistance(state.escapeGoal) > crowd) then
-            state.status = "Escaping attack area"
+            state.status = state.escapeReason or "Avoiding nearby enemies"
             issueMove(humanoid, state.escapeGoal, "evade", now)
             return true
         end
@@ -936,13 +984,15 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     clearPath()
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
+    state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
     if zone then
         local delta = goal - rootPart.Position
         local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
         performDodgeTeleport(humanoid, rootPart, step, target, zone.id, now)
     end
-    state.status = zone and "Escaping attack area" or "Avoiding nearby enemies"
+    state.escapeReason = zone and "Escaping attack area" or "Avoiding nearby enemies"
+    state.status = state.escapeReason
     issueMove(humanoid, goal, "evade", now)
     return true
 end
@@ -971,6 +1021,7 @@ local function controllerTick()
     end
     if state.lastPlayerHealth and humanoid.Health < state.lastPlayerHealth - 0.01 then
         state.damageEvents = state.damageEvents + 1
+        state.lastDamage = { amount = state.lastPlayerHealth - humanoid.Health, at = now }
         warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f)", state.damageEvents, state.lastPlayerHealth, humanoid.Health))
     end
     state.lastPlayerHealth = humanoid.Health
@@ -1147,6 +1198,7 @@ return {
     State = state,
     SetRunning = setRunning,
     Shutdown = shutdown,
+    AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end
