@@ -300,6 +300,9 @@ local previousFPS = type(getfpscap) == "function" and getfpscap() or nil
 local fpsChanged = false
 local controls = {}
 local errors, lastErrors = {}, {}
+local configPath = "DungeonQuestObsidian-config.json"
+local saveReady, saveDirty, saveVersion = false, false, 0
+local menuKey = "RightShift"
 
 local function uiIdentity()
     if type(setthreadidentity) == "function" then setthreadidentity(8) end
@@ -319,6 +322,29 @@ local function notify(message)
         uiIdentity()
         pcall(function() Library:Notify({ Title = "Dungeon Quest", Description = tostring(message), Time = 5 }) end)
     end
+end
+
+local function saveConfig()
+    if not saveReady or not saveDirty then return end
+    if type(writefile) ~= "function" then
+        errors.config = "Executor file saving is unavailable"
+        return
+    end
+    local ok = pcall(function()
+        writefile(configPath, HttpService:JSONEncode({ Version = 1, Config = C, MenuKey = menuKey }))
+    end)
+    if ok then saveDirty = false; errors.config = nil
+    else errors.config = "Could not save settings" end
+end
+
+local function scheduleSave()
+    if not saveReady then return end
+    saveDirty = true
+    saveVersion = saveVersion + 1
+    local version = saveVersion
+    task.delay(0.5, function()
+        if alive and version == saveVersion then saveConfig() end
+    end)
 end
 
 local function job(key, callback)
@@ -469,25 +495,25 @@ local tabs = {
 }
 local function toggle(group, key, text, callback, tooltip)
     local control = group:AddToggle(key, { Text = text, Default = C[key], Tooltip = tooltip })
-    control:OnChanged(function(value) C[key] = value; if callback then callback(value) end end)
+    control:OnChanged(function(value) C[key] = value; scheduleSave(); if callback then callback(value) end end)
     controls[key] = control
     return control
 end
 local function slider(group, key, text, min, max, rounding, callback)
     local control = group:AddSlider(key, { Text = text, Default = C[key], Min = min, Max = max, Rounding = rounding or 0 })
-    control:OnChanged(function(value) C[key] = value; if callback then callback(value) end end)
+    control:OnChanged(function(value) C[key] = value; scheduleSave(); if callback then callback(value) end end)
     controls[key] = control
     return control
 end
 local function input(group, key, text, numeric, callback)
     local control = group:AddInput(key, { Text = text, Default = tostring(C[key]), Numeric = numeric or false, Finished = true, ClearTextOnFocus = false })
-    control:OnChanged(function(value) C[key] = value; if callback then callback(value) end end)
+    control:OnChanged(function(value) C[key] = value; scheduleSave(); if callback then callback(value) end end)
     controls[key] = control
     return control
 end
 local function dropdown(group, key, text, values, callback, multi)
     local control = group:AddDropdown(key, { Text = text, Values = values, Default = C[key], Multi = multi or false, Searchable = #values > 8 })
-    control:OnChanged(function(value) C[key] = value; if callback then callback(value) end end)
+    control:OnChanged(function(value) C[key] = value; scheduleSave(); if callback then callback(value) end end)
     controls[key] = control
     return control
 end
@@ -670,6 +696,7 @@ developer:AddButton({ Text = "Send Farm Log", Func = function() sendWebhook(last
 
 local function unload()
     if not alive then return end
+    saveConfig()
     alive = false
     controller.Shutdown()
     clearLine(); clearHover(); restoreMovement()
@@ -686,25 +713,23 @@ local queueTeleport = queue_on_teleport or queueonteleport or (syn and syn.queue
 settings:AddLabel("Teleport continuation: " .. (type(queueTeleport) == "function" and "Available" or "Unavailable"))
 settings:AddLabel("Menu key"):AddKeyPicker("MenuKey", { Default = "RightShift", NoUI = true, Text = "Menu" })
 Library.ToggleKeybind = Library.Options.MenuKey
+Library.Options.MenuKey:OnChanged(function()
+    menuKey = Library.Options.MenuKey.Value
+    scheduleSave()
+end)
 settings:AddButton({ Text = "Unload", Func = unload })
-local saveOK, SaveManager = pcall(function() return loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))() end)
-if saveOK and type(writefile) == "function" then
-    SaveManager:SetLibrary(Library)
-    SaveManager:IgnoreThemeSettings()
-    SaveManager:SetIgnoreIndexes({ "MenuKey", "WebhookURL", "Webhook", "Disable3D", "KickOnJoin" })
-    SaveManager:SetFolder("DungeonQuestObsidian")
-    SaveManager:BuildConfigSection(tabs.Settings)
-end
 
 env.DungeonQuestObsidian = { Unload = unload, Config = C, Controller = controller, Library = Library, Totals = totals, Errors = errors, Mode = MODE,
     Elapsed = function() return os.clock() - startedAt end }
 local teleportQueued = false
 connect(player.OnTeleport, function(teleportState)
     if teleportState == Enum.TeleportState.Failed then teleportQueued = false; return end
-    if teleportState ~= Enum.TeleportState.Started or teleportQueued or type(queueTeleport) ~= "function" then return end
+    if teleportState ~= Enum.TeleportState.Started then return end
+    saveConfig()
+    if env.autoexecute == false or teleportQueued or type(queueTeleport) ~= "function" then return end
     local loaderURL = env.DQObsidianLoaderURL or "https://raw.githubusercontent.com/glitchreal/Dungeon-quest/main/main.luau"
     local snapshot = HttpService:JSONEncode({ Config = C, Totals = totals, Elapsed = os.clock() - startedAt })
-    local queued = string.format("getgenv().DQObsidianResume=game:GetService('HttpService'):JSONDecode(%q)\nassert(loadstring(game:HttpGet(%q)))()", snapshot, loaderURL)
+    local queued = string.format("getgenv().autoexecute=true\ngetgenv().autoloadconfig=%s\ngetgenv().DQObsidianResume=game:GetService('HttpService'):JSONDecode(%q)\nassert(loadstring(game:HttpGet(%q)))()", tostring(env.autoloadconfig ~= false), snapshot, loaderURL)
     queueTeleport(queued)
     teleportQueued = true
 end)
@@ -908,13 +933,32 @@ connect(RunService.Heartbeat, function(dt)
     end
 end)
 
-if type(resume) == "table" and type(resume.Config) == "table" then
-    for key, value in pairs(resume.Config) do
-        if controls[key] and C[key] ~= nil then controls[key]:SetValue(value) end
+if env.autoloadconfig ~= false then
+    local saved
+    if type(readfile) == "function" then
+        local ok, data = pcall(function() return HttpService:JSONDecode(readfile(configPath)) end)
+        if ok and type(data) == "table" and data.Version == 1 then saved = data end
     end
-elseif saveOK and SaveManager and type(isfile) == "function" then
-    SaveManager:LoadAutoloadConfig()
+    local values = type(resume) == "table" and resume.Config or saved and saved.Config
+    if type(values) == "table" then
+        for key, value in pairs(values) do
+            if controls[key] and C[key] ~= nil then
+                local expected = type(C[key])
+                if expected == "number" then value = tonumber(value) end
+                if type(value) == expected then
+                    local ok = pcall(function() controls[key]:SetValue(value) end)
+                    if not ok then errors.config = "Some saved settings could not be restored" end
+                end
+            end
+        end
+    end
+    if saved and type(saved.MenuKey) == "string" then
+        pcall(function() Library.Options.MenuKey:SetValue({ saved.MenuKey, "Toggle" }) end)
+    end
 end
+saveReady = true
+if env.autoloadconfig ~= false and type(resume) == "table" then scheduleSave() end
+if type(writefile) ~= "function" then notify("Automatic saving is unavailable in this executor") end
 refreshDifficulties()
 job("inventory", refreshInventory)
 if MODE == "Lobby" then tabs.Lobby:Show() else tabs.Farm:Show() end
