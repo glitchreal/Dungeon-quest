@@ -194,6 +194,54 @@ end
 return Adapter
 
 end)()
+local ThreatGeometry = (function()
+local Geometry = {}
+
+function Geometry.clearance(zone, position, margin)
+    local point = zone.frame:PointToObjectSpace(position)
+    local half = zone.size * 0.5
+    if zone.shape == "Cylinder" then
+        return math.max(math.abs(point.X) - half.X - 4,
+            Vector2.new(point.Y, point.Z).Magnitude - math.max(half.Y, half.Z) - margin)
+    end
+    if zone.shape == "Projectile" then
+        local delta = zone.velocity * zone.lookahead
+        local offset = position - zone.frame.Position
+        local fraction = delta:Dot(delta) > 0.001 and math.clamp(offset:Dot(delta) / delta:Dot(delta), 0, 1) or 0
+        return (offset - delta * fraction).Magnitude - math.max(half.X, half.Y, half.Z) - margin
+    end
+    return math.max(math.abs(point.X) - half.X - margin,
+        math.abs(point.Y) - half.Y - 4, math.abs(point.Z) - half.Z - margin)
+end
+
+function Geometry.risk(zones, position, margin)
+    local risk, nearest = 0, nil
+    for _, zone in ipairs(zones) do
+        local clearance = Geometry.clearance(zone, position, margin)
+        if clearance < 0 then
+            risk = risk + 1 + clearance * clearance
+            if not nearest or clearance < nearest.clearance then nearest = { zone = zone, clearance = clearance } end
+        end
+    end
+    return risk, nearest and nearest.zone
+end
+
+function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
+    local steps = math.max(1, math.ceil((endPosition - startPosition).Magnitude))
+    for _, zone in ipairs(zones) do
+        local previous = Geometry.clearance(zone, startPosition, margin)
+        for i = 1, steps do
+            local clearance = Geometry.clearance(zone, startPosition:Lerp(endPosition, i / steps), margin)
+            if clearance < math.min(0, previous) - 0.02 then return false end
+            previous = clearance
+        end
+    end
+    return true
+end
+
+return Geometry
+
+end)()
 local function createController()
 -- Obsidian dungeon combat controller; creates no separate UI.
 -- The controller has one movement owner: dodge goals preempt combat goals,
@@ -316,6 +364,11 @@ local state = {
     dodgeHistory = {},
     dodgedThreats = setmetatable({}, { __mode = "k" }),
     observedThreats = setmetatable({}, { __mode = "k" }),
+    activeZones = {},
+    nearbyEnemies = {},
+    safetyUntil = 0,
+    lastSafetyScan = -math.huge,
+    lastEscapePlan = -math.huge,
 }
 
 local connections = {}
@@ -329,6 +382,7 @@ local humanoidModels = {}
 -- PrecastHitbox and similar effects are transient BaseParts. Tracking additions
 -- lets the dodge check remain cheap and catches indicators created under Workspace.
 local threatParts = {}
+local announcedZones = {}
 local function trackInstance(instance)
     if instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
         humanoidModels[instance] = instance.Parent
@@ -342,10 +396,39 @@ local function trackInstance(instance)
 end
 connect(Workspace.DescendantAdded, trackInstance)
 connect(Workspace.DescendantRemoving, function(instance)
-    threatParts[instance] = nil
+    local sample = threatParts[instance]
+    if sample and sample.zone then sample.removedAt = os.clock() else threatParts[instance] = nil end
     humanoidModels[instance] = nil
 end)
 for _, instance in ipairs(Workspace:GetDescendants()) do trackInstance(instance) end
+
+-- The game announces boss telegraphs before their Parts become visible.
+pcall(function()
+    local storage = game:GetService("ReplicatedStorage")
+    local utility = storage:FindFirstChild("Utility")
+    local module = utility and utility:FindFirstChild("BridgeNet2")
+    if not module then return end
+    local bridge = require(module)
+    local action = bridge.ReferenceIdentifier("action")
+    local connection = bridge.ReferenceBridge("precastHitbox"):Connect(function(data)
+        if state.closed or type(data) ~= "table" then return end
+        local kind = data[action]
+        if kind ~= "Circle" and kind ~= "Cube" then return end
+        local now = os.clock()
+        local remaining = (tonumber(data.delayUntilAttack) or 0) - (Workspace:GetServerTimeNow() - (tonumber(data.startTime) or Workspace:GetServerTimeNow()))
+        local frame, size, shape
+        if kind == "Circle" and typeof(data.position) == "Vector3" and type(data.radius) == "number" then
+            frame = CFrame.new(data.position) * CFrame.Angles(0, 0, math.pi / 2)
+            size, shape = Vector3.new(0.5, data.radius * 2, data.radius * 2), "Cylinder"
+        elseif kind == "Cube" and typeof(data.cframe) == "CFrame" and typeof(data.size) == "Vector3" then
+            frame, size, shape = data.cframe, data.size, "Block"
+        end
+        if frame and remaining > -0.35 then
+            table.insert(announcedZones, { frame = frame, size = size, shape = shape, expires = now + math.max(0, remaining) + 0.4, id = {} })
+        end
+    end)
+    table.insert(connections, connection)
+end)
 
 local function getChar()
     local character = player.Character
@@ -570,6 +653,21 @@ local function createPath(startPosition, endPosition, mode, now)
 end
 
 local function issueMove(humanoid, position, mode, now)
+    if CFG.AUTO_DODGE and #state.activeZones > 0 then
+        local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
+        if root then
+            local delta = position - root.Position
+            local nextPosition = delta.Magnitude > 12 and root.Position + delta.Unit * 12 or position
+            if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.PRECAST_MARGIN) then
+                humanoid:MoveTo(root.Position)
+                state.motionMode = "safety-hold"
+                state.movementBlocked = true
+                state.safetyUntil = math.max(state.safetyUntil, now + 0.3)
+                state.lastMoveToCall = 0
+                return
+            end
+        end
+    end
     local changed = state.motionMode ~= mode or (position - state.lastMoveToPosition).Magnitude > 0.75
     if changed or now - state.lastMoveToCall >= CFG.MOVETO_REFRESH_INTERVAL then
         humanoid:MoveTo(position)
@@ -768,136 +866,104 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
     return true
 end
 
-local function findThreat(rootPart, target, now)
-    local character = rootPart.Parent
-    local overlapParams = OverlapParams.new()
-    overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-    local overlapIgnore = { character }
-    if state.waypointFolder then table.insert(overlapIgnore, state.waypointFolder) end
-    overlapParams.FilterDescendantsInstances = overlapIgnore
-    local nearbyParts = {}
-    if now - state.lastThreatScan >= CFG.THREAT_SCAN_INTERVAL then
-    state.lastThreatScan = now
-    pcall(function()
-        nearbyParts = Workspace:GetPartBoundsInRadius(rootPart.Position, CFG.THREAT_RADIUS, overlapParams)
-    end)
-    -- DescendantAdded catches new projectiles; the overlap pass also catches
-    -- telegraphs that existed before this LocalScript was injected.
-    for _, part in ipairs(nearbyParts) do
-        if part:IsA("BasePart") and not part.CanCollide and not threatParts[part] then
-            threatParts[part] = { createdAt = now, lastPosition = part.Position, lastAt = now }
+local function refreshSafety(rootPart, now)
+    if now - state.lastSafetyScan < 0.1 then return end
+    state.lastSafetyScan = now
+    local zones, enemies = {}, {}
+    for _, model in ipairs(state.cachedTargets) do
+        if isValidTarget(model) then
+            local root = getRootPart(model)
+            local distance = (root.Position - rootPart.Position).Magnitude
+            if distance < 28 and not hasBlockingRay(rootPart.Position, root.Position, rootPart.Parent, model) then
+                table.insert(enemies, { model = model, root = root, distance = distance })
+            end
         end
     end
+    state.nearbyEnemies = enemies
+    for i = #announcedZones, 1, -1 do
+        local zone = announcedZones[i]
+        if zone.expires < now then table.remove(announcedZones, i)
+        elseif (zone.frame.Position - rootPart.Position).Magnitude <= CFG.THREAT_RADIUS + zone.size.Magnitude then
+            table.insert(zones, zone)
+        end
     end
     for part, sample in pairs(threatParts) do
-        if not part.Parent or now - sample.createdAt > CFG.THREAT_MAX_AGE then
+        if sample.removedAt then
+            if now - sample.removedAt > 0.35 then threatParts[part] = nil
+            elseif sample.zone then table.insert(zones, sample.zone) end
+        elseif not part.Parent then
             threatParts[part] = nil
-        elseif not part:IsDescendantOf(character) and (not target or not part:IsDescendantOf(target)) and (not state.waypointFolder or not part:IsDescendantOf(state.waypointFolder)) then
+        elseif not part:IsDescendantOf(rootPart.Parent)
+            and (not state.waypointFolder or not part:IsDescendantOf(state.waypointFolder)) then
             local distance = (part.Position - rootPart.Position).Magnitude
-            if distance <= CFG.THREAT_RADIUS then
-                local name = part.Name:lower()
-                local parentName = part.Parent and part.Parent.Name:lower() or ""
-                local model = part:FindFirstAncestorOfClass("Model")
-                local modelName = model and model.Name:lower() or ""
-                local halfSize = part.Size * 0.5
-                local localPosition = part.CFrame:PointToObjectSpace(rootPart.Position)
-                local shape = part:IsA("Part") and part.Shape or nil
-                local hitboxRelevant
-                if shape == Enum.PartType.Cylinder then
-                    -- PrecastHitbox rotates cylinders to match terrain, so use
-                    -- a conservative sphere around the two largest dimensions
-                    -- instead of assuming the cylinder axis is world Y.
-                    local radius = math.max(halfSize.X, halfSize.Y, halfSize.Z) + CFG.PRECAST_MARGIN
-                    hitboxRelevant = localPosition.Magnitude <= radius
-                else
-                    hitboxRelevant = math.abs(localPosition.X) <= halfSize.X + CFG.PRECAST_MARGIN and math.abs(localPosition.Y) <= halfSize.Y + CFG.PRECAST_MARGIN and math.abs(localPosition.Z) <= halfSize.Z + CFG.PRECAST_MARGIN
-                end
-                local visible = part.Transparency < 0.9
-                local named = name:find("attack") or name:find("hitbox") or name:find("projectile") or name:find("danger") or name:find("warning") or name:find("telegraph") or name:find("precast")
-                local namedThreat = named and visible and hitboxRelevant
-                local tagged = parentName:find("attack") or parentName:find("hitbox") or parentName:find("projectile") or parentName:find("precast")
-                local taggedThreat = tagged and visible and hitboxRelevant
-                local attributesThreat = (part:GetAttribute("Attack") == true or part:GetAttribute("Damage") ~= nil or part:GetAttribute("Hitbox") == true) and hitboxRelevant
-                -- PrecastHitbox uses generic, non-queryable Parts. Restrict
-                -- them to large transient geometry close to the locked mob;
-                -- this filters player skill VFX and map lighting.
-                local color = part.Color
-                local redPrecast = part.Material == Enum.Material.Neon and not part.CanCollide and not part.CanQuery and visible and hitboxRelevant and part.Size.Magnitude > 5 and color.R > color.G * 1.35 and color.R > color.B * 1.2 and target and (part.Position - getRootPart(target).Position).Magnitude < 30
-                local genericPrecast = part.Parent == Workspace and not part.CanCollide and not part.CanQuery and visible and hitboxRelevant and part.Size.Magnitude > 3 and target and (part.Position - getRootPart(target).Position).Magnitude < 40 and now - sample.createdAt > 0.12 and now - state.lastSkillTime > 0.35
-                -- Canal projectile hitboxes are intentionally invisible. Infer
-                -- motion from AssemblyLinearVelocity or two observed samples,
-                -- and dodge when their trajectory points at the player.
-                local projectileModel = modelName:find("shot") or modelName:find("projectile") or modelName:find("missile") or modelName:find("orb") or parentName:find("shot") or parentName:find("projectile")
-                local previousPosition = sample.lastPosition
-                local elapsed = math.max(now - sample.lastAt, 1 / 60)
-                local displacement = part.Position - previousPosition
-                local observedVelocity = displacement / elapsed
-                sample.lastPosition, sample.lastAt = part.Position, now
+            local model = part:FindFirstAncestorOfClass("Model")
+            local playerBody = model and Players:GetPlayerFromCharacter(model)
+            if not playerBody and distance < CFG.THREAT_RADIUS + part.Size.Magnitude then
+                local name = part:GetFullName():lower()
+                local elapsed = math.max(0.001, now - sample.lastAt)
                 local velocity = part.AssemblyLinearVelocity
-                if velocity.Magnitude < 1 then velocity = observedVelocity end
-                local toPlayer = rootPart.Position - part.Position
-                local heading = velocity.Magnitude > 1 and toPlayer.Magnitude > 0.001 and velocity.Unit:Dot(toPlayer.Unit) or 0
-                local timeToPlayer = velocity.Magnitude > 1 and toPlayer.Magnitude / velocity.Magnitude or math.huge
-                local sweptPoint = previousPosition
-                if displacement:Dot(displacement) > 0 then
-                    local fraction = math.clamp((rootPart.Position - previousPosition):Dot(displacement) / displacement:Dot(displacement), 0, 1)
-                    sweptPoint = previousPosition + displacement * fraction
+                if velocity.Magnitude < 1 then velocity = (part.Position - sample.lastPosition) / elapsed end
+                local projectile = (name:find("projectile") or name:find("missile") or name:find("shot")) and velocity.Magnitude > 1
+                local named = part.Transparency < 0.95 and (name:find("hitbox") or name:find("precast") or name:find("telegraph") or name:find("warning") or name:find("danger") or name:find("attack"))
+                local attributed = part:GetAttribute("Attack") == true or part:GetAttribute("Hitbox") == true or part:GetAttribute("Damage") ~= nil
+                local precast = part.Parent == Workspace and part.Anchored and not part.CanCollide
+                    and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
+                if not name:find("safespot") and (projectile or named or attributed or precast) then
+                    local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
+                    sample.zone = { frame = part.CFrame, size = part.Size, shape = shape,
+                        velocity = velocity, lookahead = CFG.PROJECTILE_LOOKAHEAD, id = part }
+                    sample.lastActive = now
+                    table.insert(zones, sample.zone)
+                elseif sample.zone and now - (sample.lastActive or 0) < 0.35 then
+                    table.insert(zones, sample.zone)
+                elseif now - sample.createdAt > CFG.THREAT_MAX_AGE then
+                    threatParts[part] = nil
                 end
-                local sweptThreat = (rootPart.Position - sweptPoint).Magnitude <= 8
-                local projectileThreat = projectileModel and (distance < 8 or sweptThreat or (heading > 0.08 and timeToPlayer <= CFG.PROJECTILE_LOOKAHEAD))
-                if namedThreat or taggedThreat or attributesThreat or redPrecast or genericPrecast or projectileThreat then
-                    return part
+                sample.lastPosition, sample.lastAt = part.Position, now
+            elseif now - sample.createdAt > CFG.THREAT_MAX_AGE and not sample.zone then
+                threatParts[part] = nil
+            end
+        end
+    end
+    state.activeZones = zones
+end
+
+local function crowdDistance(position)
+    local closest = 28
+    for _, enemy in ipairs(state.nearbyEnemies) do
+        if enemy.root.Parent then closest = math.min(closest, (enemy.root.Position - position).Magnitude) end
+    end
+    return closest
+end
+
+local function findEscapeGoal(rootPart, targetRoot)
+    local params = buildRaycastParams(rootPart.Parent, targetRoot.Parent)
+    params.RespectCanCollide = true
+    local floor = Workspace:Raycast(rootPart.Position, Vector3.new(0, -10, 0), params)
+    if not floor then return nil end
+    local best, bestScore = nil, -math.huge
+    local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.PRECAST_MARGIN)
+    local originalCrowd = crowdDistance(rootPart.Position)
+    local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE - 2, 4, 14)
+    for _, radius in ipairs({ 3, 8, 14 }) do
+        for i = 0, 15 do
+            local angle = i * math.pi / 8
+            local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
+            local ground = Workspace:Raycast(candidate + Vector3.new(0, 2, 0), Vector3.new(0, -12, 0), params)
+            if ground and math.abs(ground.Position.Y - floor.Position.Y) <= 2
+                and not hasBlockingRay(rootPart.Position, candidate, rootPart.Parent, targetRoot.Parent)
+                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.PRECAST_MARGIN) then
+                local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.PRECAST_MARGIN)
+                local crowd = crowdDistance(candidate)
+                if (originalRisk == 0 or risk < originalRisk - 0.1) and (originalCrowd >= crowdLimit or crowd > originalCrowd + 0.25) then
+                    local targetDistance = (candidate - targetRoot.Position).Magnitude
+                    local score = -risk * 100 + math.min(crowd, 20) * 2 - math.abs(targetDistance - CFG.COMBAT_DISTANCE) * 0.1 - radius * 0.05
+                    if score > bestScore then best, bestScore = candidate, score end
                 end
             end
         end
     end
-    return nil
-end
-
-local function findDodgeGoal(rootPart, targetRoot, threat)
-    local away = rootPart.Position - targetRoot.Position
-    if threat then away = rootPart.Position - threat.Position end
-    away = Vector3.new(away.X, 0, away.Z)
-    if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
-    away = away.Unit
-    local right = Vector3.new(-away.Z, 0, away.X)
-    local left = -right
-    local firstSide, secondSide = right, left
-    if state.dodgeSide < 0 then firstSide, secondSide = left, right end
-    local currentGround = Workspace:Raycast(rootPart.Position, Vector3.new(0, -8, 0), buildRaycastParams(rootPart.Parent, targetRoot.Parent))
-    if not currentGround then return nil end
-
-    local function usable(candidate, minimumTargetDistance)
-        local ground = Workspace:Raycast(candidate + Vector3.new(0, 2, 0), Vector3.new(0, -8, 0), buildRaycastParams(rootPart.Parent, targetRoot.Parent))
-        if not ground or not ground.Instance.CanCollide then return nil end
-        if math.abs(ground.Position.Y - currentGround.Position.Y) > 1.5 then return nil end
-        candidate = Vector3.new(candidate.X, rootPart.Position.Y, candidate.Z)
-        if (candidate - rootPart.Position).Magnitude > CFG.DODGE_LATERAL_DISTANCE + 0.001 then return nil end
-        local targetDistance = (candidate - targetRoot.Position).Magnitude
-        if targetDistance < (minimumTargetDistance or CFG.COMBAT_MIN_DISTANCE - 1) then return nil end
-        if hasBlockingRay(rootPart.Position + Vector3.new(0, 2, 0), candidate + Vector3.new(0, 2, 0), rootPart.Parent, targetRoot.Parent) then return nil end
-        return candidate
-    end
-
-    -- A dodge is a strafe: try alternating right/left steps before any
-    -- forward or backward displacement. This breaks wall/bridge soft-locks
-    -- while preserving enough distance from the target to keep fighting.
-    local lateralDistance = CFG.DODGE_LATERAL_DISTANCE
-    for _, side in ipairs({ firstSide, secondSide }) do
-        local lateral = usable(rootPart.Position + side * lateralDistance)
-        if lateral then return lateral end
-    end
-
-    -- If one side is partially blocked, use a diagonal strafe around it.
-    for _, side in ipairs({ firstSide, secondSide }) do
-        for _, forwardSign in ipairs({ 1, -1 }) do
-            local diagonal = (side + away * forwardSign).Unit
-            local candidate = usable(rootPart.Position + diagonal * lateralDistance)
-            if candidate then return candidate end
-        end
-    end
-
-    return usable(rootPart.Position + away * lateralDistance, 0)
+    return best
 end
 
 local function canTeleportDodge(now, distance, threat)
@@ -917,6 +983,7 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     if not destination or humanoid.FloorMaterial == Enum.Material.Air then return false end
     local delta = destination - rootPart.Position
     if not canTeleportDodge(now, delta.Magnitude, threat) then return false end
+    if not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, destination, CFG.PRECAST_MARGIN) then return false end
     -- Check several body-width rays before applying the bounded horizontal step.
     for _, offset in ipairs({ Vector3.zero, Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(0, 0, -1) }) do
         if hasBlockingRay(rootPart.Position + offset, destination + offset, rootPart.Parent, target) then return false end
@@ -925,6 +992,7 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     table.insert(state.dodgeHistory, { at = now, distance = delta.Magnitude })
     state.dodgedThreats[threat] = now
     state.lastDodgeTime = now
+    state.safetyUntil = now + 0.75
     state.dodgeCount = state.dodgeCount + 1
     state.dodgeSide = -state.dodgeSide
     clearPath()
@@ -1004,6 +1072,75 @@ local function stopMovement(humanoid, rootPart)
     clearPath()
 end
 
+local function handleSafety(humanoid, rootPart, target, targetRoot, now)
+    if not CFG.AUTO_DODGE then
+        state.escapeGoal, state.lastThreatPart, state.movementBlocked = nil, nil, false
+        return false
+    end
+    local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.PRECAST_MARGIN)
+    state.lastThreatPart = zone and zone.id
+    local crowd = crowdDistance(rootPart.Position)
+    local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE - 2, 4, 14)
+    if crowd < crowdLimit and now - (state.lastEmergencyTarget or 0) > 1.5 then
+        for _, enemy in ipairs(state.nearbyEnemies) do
+            if enemy.distance <= crowd + 0.1 and enemy.model ~= target
+                and enemy.distance + 4 < (targetRoot.Position - rootPart.Position).Magnitude then
+                state.lockedTarget = enemy.model
+                state.lastEmergencyTarget = now
+                break
+            end
+        end
+    end
+    if state.escapeGoal and now < (state.escapeUntil or 0) then
+        if (state.escapeGoal - rootPart.Position).Magnitude > 1.5
+            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.PRECAST_MARGIN)
+            and not hasBlockingRay(rootPart.Position, state.escapeGoal, rootPart.Parent, target)
+            and (crowd >= crowdLimit or crowdDistance(state.escapeGoal) > crowd) then
+            state.status = "Escaping attack area"
+            issueMove(humanoid, state.escapeGoal, "evade", now)
+            return true
+        end
+    end
+    state.escapeGoal = nil
+    if risk == 0 and crowd >= crowdLimit and not state.movementBlocked then
+        if now < state.safetyUntil then
+            state.status = "Holding safe position"
+            stopMovement(humanoid, rootPart)
+            return true
+        end
+        return false
+    end
+    if zone then
+        state.observedThreats[zone.id] = state.observedThreats[zone.id] or now
+        if now - state.observedThreats[zone.id] < CFG.REACTION_TIME then
+            stopMovement(humanoid, rootPart)
+            state.status = "Reacting to attack"
+            return true
+        end
+    end
+    if now - state.lastEscapePlan < 0.15 then return true end
+    state.lastEscapePlan = now
+    local goal = findEscapeGoal(rootPart, targetRoot)
+    state.movementBlocked = false
+    if not goal then
+        state.status = "Waiting for safe escape route"
+        stopMovement(humanoid, rootPart)
+        return true
+    end
+    clearPath()
+    state.motionGoal, state.fallbackGoal = nil, nil
+    state.escapeGoal, state.escapeUntil = goal, now + 1.5
+    state.safetyUntil = now + 0.75
+    if zone then
+        local delta = goal - rootPart.Position
+        local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
+        performDodgeTeleport(humanoid, rootPart, step, target, zone.id, now)
+    end
+    state.status = zone and "Escaping attack area" or "Avoiding nearby enemies"
+    issueMove(humanoid, goal, "evade", now)
+    return true
+end
+
 local function controllerTick()
     if not state.running or state.closed then return end
     local character, humanoid, rootPart = getChar()
@@ -1033,6 +1170,7 @@ local function controllerTick()
     state.lastPlayerHealth = humanoid.Health
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
+        state.escapeGoal, state.lastThreatPart = nil, nil
         state.status, state.targetName, state.targetDist = "Waiting for wave", "None", 0
         state.currentTarget, state.lockedTarget = nil, nil
         stopMovement(humanoid, rootPart)
@@ -1047,6 +1185,13 @@ local function controllerTick()
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
     state.prevHealth[target] = targetHumanoid.Health
+    refreshSafety(rootPart, now)
+    if handleSafety(humanoid, rootPart, target, targetRoot, now) then
+        state.navigationPhase = "evade"
+        faceEnemy(humanoid, rootPart, targetRoot)
+        if distance <= CFG.ATTACK_RANGE and not hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then castSkill() end
+        return
+    end
 
     -- A combat-distance point on this side of a wall is not an attack position.
     -- Route to the enemy's reachable area before holding distance or casting.
@@ -1061,22 +1206,6 @@ local function controllerTick()
     end
     state.navigationPhase = "combat"
     faceEnemy(humanoid, rootPart, targetRoot)
-
-    local threat = findThreat(rootPart, target, now)
-    state.lastThreatPart = threat
-    if threat and not state.observedThreats[threat] then state.observedThreats[threat] = now end
-    -- Distance is handled by the normal combat goal. Dodge state is entered
-    -- only for an active precast/projectile, and the same persistent threat is
-    -- not allowed to restart the dodge every Heartbeat.
-    if CFG.AUTO_DODGE and threat and now - state.observedThreats[threat] >= CFG.REACTION_TIME and canTeleportDodge(now, CFG.DODGE_LATERAL_DISTANCE, threat) then
-        local destination = findDodgeGoal(rootPart, targetRoot, threat)
-        if performDodgeTeleport(humanoid, rootPart, destination, target, threat, now) then
-            faceEnemy(humanoid, rootPart, targetRoot)
-            state.status = "Dodging"
-            return
-        end
-    end
-    state.dodgeGoal = nil
 
     if CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
         state.status = "Attacking " .. target.Name
@@ -1139,6 +1268,8 @@ local function setRunning(running)
     if state.closed or state.running == running then return end
     state.running = running
     if state.running then
+        state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
+        state.movementBlocked, state.lastSafetyScan, state.lastEscapePlan = false, -math.huge, -math.huge
         state.skillQ_count, state.skillE_count, state.kills, state.stuckRetries = 0, 0, 0, 0
         state.skillToggle, state.lastSkillTime = false, 0
         state.lockedTarget, state.currentTarget = nil, nil
@@ -1175,9 +1306,12 @@ local function shutdown()
     table.clear(connections)
     table.clear(threatParts)
     table.clear(humanoidModels)
+    table.clear(announcedZones)
 end
 
 connect(player.CharacterAdded, function()
+    state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
+    state.movementBlocked, state.lastSafetyScan = false, -math.huge
     restoreFacing()
     state.lockedTarget, state.currentTarget = nil, nil
     state.cachedTargets, state.prevHealth = {}, setmetatable({}, { __mode = "k" })

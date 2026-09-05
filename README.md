@@ -57,6 +57,13 @@ Eligibility uses the real game level and owned keys, including higher-level
 content. Cosmetic spoofing does not change eligibility. Teleport dodges are capped
 at 3 studs, one second apart, and two dodges/six studs per rolling three seconds.
 
+Dodges use announced boss telegraphs and observed active attack geometry. Escape
+goals account for nearby enemies in every direction, and movement checks prevent
+re-entering an active hitbox after a teleport. When a short teleport cannot clear
+a large attack, the controller continues walking outward while attacking when
+the target remains in range and visible. Static safe-zone/spawn markers are
+excluded; no movement-speed increase is required.
+
 Automation, movement overrides, hover, and logging are off by default. Auto
 Dungeon enables combat; Auto Create Lobby and Auto Start Dungeon enable queueing.
 With `autoloadconfig = true`, existing settings are retained when reloading or
