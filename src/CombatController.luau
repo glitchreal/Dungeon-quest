@@ -124,6 +124,7 @@ local state = {
     safetyUntil = 0,
     lastSafetyScan = -math.huge,
     lastEscapePlan = -math.huge,
+    enemyMotion = setmetatable({}, { __mode = "k" }),
 }
 
 local connections = {}
@@ -407,6 +408,29 @@ local function createPath(startPosition, endPosition, mode, now)
     return nil
 end
 
+local function enemyClearance(position)
+    local nearest = math.huge
+    for _, enemy in ipairs(state.nearbyEnemies) do
+        if enemy.root.Parent then
+            local current = enemy.root.Position
+            local future = current + enemy.velocity * 0.5
+            local distance = math.min((current - position).Magnitude, (future - position).Magnitude)
+            nearest = math.min(nearest, distance - enemy.radius)
+        end
+    end
+    return nearest
+end
+
+local function safeEnemyStep(startPosition, endPosition)
+    local original = enemyClearance(startPosition)
+    for i = 1, 4 do
+        local clearance = enemyClearance(startPosition:Lerp(endPosition, i / 4))
+        if clearance < math.min(0, original) - 0.1 then return false end
+        original = clearance
+    end
+    return true
+end
+
 local function issueMove(humanoid, position, mode, now)
     if CFG.AUTO_DODGE and #state.activeZones > 0 then
         local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
@@ -418,6 +442,20 @@ local function issueMove(humanoid, position, mode, now)
                 state.motionMode = "safety-hold"
                 state.movementBlocked = true
                 state.safetyUntil = math.max(state.safetyUntil, now + 0.3)
+                state.lastMoveToCall = 0
+                return
+            end
+        end
+    end
+    if CFG.AUTO_DODGE and #state.nearbyEnemies > 0 then
+        local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
+        if root then
+            local delta = position - root.Position
+            local reach = math.max(3, humanoid.WalkSpeed * 0.3)
+            local step = delta.Magnitude > reach and root.Position + delta.Unit * reach or position
+            if not safeEnemyStep(root.Position, step) then
+                humanoid:MoveTo(root.Position)
+                state.motionMode, state.movementBlocked = "safety-hold", true
                 state.lastMoveToCall = 0
                 return
             end
@@ -629,8 +667,18 @@ local function refreshSafety(rootPart, now)
         if isValidTarget(model) then
             local root = getRootPart(model)
             local distance = (root.Position - rootPart.Position).Magnitude
-            if distance < 28 and not hasBlockingRay(rootPart.Position, root.Position, rootPart.Parent, model) then
-                table.insert(enemies, { model = model, root = root, distance = distance })
+            if distance < 48 and not hasBlockingRay(rootPart.Position, root.Position, rootPart.Parent, model) then
+                local sample = state.enemyMotion[model]
+                local velocity = root.AssemblyLinearVelocity
+                if sample and now > sample.at then
+                    local observed = (root.Position - sample.position) / (now - sample.at)
+                    if observed.Magnitude > velocity.Magnitude then velocity = observed end
+                end
+                velocity = Vector3.new(velocity.X, 0, velocity.Z)
+                if velocity.Magnitude > 40 then velocity = velocity.Unit * 40 end
+                state.enemyMotion[model] = { at = now, position = root.Position }
+                local radius = math.max(math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22), math.min(22, math.max(root.Size.X, root.Size.Z) * 0.5 + 8))
+                table.insert(enemies, { model = model, root = root, distance = distance, velocity = velocity, radius = radius })
             end
         end
     end
@@ -684,11 +732,7 @@ local function refreshSafety(rootPart, now)
 end
 
 local function crowdDistance(position)
-    local closest = 28
-    for _, enemy in ipairs(state.nearbyEnemies) do
-        if enemy.root.Parent then closest = math.min(closest, (enemy.root.Position - position).Magnitude) end
-    end
-    return closest
+    return math.min(28, enemyClearance(position) + math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22))
 end
 
 local function findEscapeGoal(rootPart, targetRoot)
@@ -699,7 +743,7 @@ local function findEscapeGoal(rootPart, targetRoot)
     local best, bestScore = nil, -math.huge
     local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.PRECAST_MARGIN)
     local originalCrowd = crowdDistance(rootPart.Position)
-    local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE - 2, 4, 14)
+    local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     for _, radius in ipairs({ 3, 8, 14 }) do
         for i = 0, 15 do
             local angle = i * math.pi / 8
@@ -707,6 +751,7 @@ local function findEscapeGoal(rootPart, targetRoot)
             local ground = Workspace:Raycast(candidate + Vector3.new(0, 2, 0), Vector3.new(0, -12, 0), params)
             if ground and math.abs(ground.Position.Y - floor.Position.Y) <= 2
                 and not hasBlockingRay(rootPart.Position, candidate, rootPart.Parent, targetRoot.Parent)
+                and safeEnemyStep(rootPart.Position, candidate)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.PRECAST_MARGIN) then
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.PRECAST_MARGIN)
                 local crowd = crowdDistance(candidate)
@@ -835,10 +880,10 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.PRECAST_MARGIN)
     state.lastThreatPart = zone and zone.id
     local crowd = crowdDistance(rootPart.Position)
-    local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE - 2, 4, 14)
+    local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     if crowd < crowdLimit and now - (state.lastEmergencyTarget or 0) > 1.5 then
         for _, enemy in ipairs(state.nearbyEnemies) do
-            if enemy.distance <= crowd + 0.1 and enemy.model ~= target
+            if (enemy.root.Position + enemy.velocity * 0.5 - rootPart.Position).Magnitude < enemy.radius and enemy.model ~= target
                 and enemy.distance + 4 < (targetRoot.Position - rootPart.Position).Magnitude then
                 state.lockedTarget = enemy.model
                 state.lastEmergencyTarget = now
@@ -849,6 +894,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if state.escapeGoal and now < (state.escapeUntil or 0) then
         if (state.escapeGoal - rootPart.Position).Magnitude > 1.5
             and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.PRECAST_MARGIN)
+            and safeEnemyStep(rootPart.Position, state.escapeGoal)
             and not hasBlockingRay(rootPart.Position, state.escapeGoal, rootPart.Parent, target)
             and (crowd >= crowdLimit or crowdDistance(state.escapeGoal) > crowd) then
             state.status = "Escaping attack area"

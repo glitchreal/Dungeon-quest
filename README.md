@@ -63,6 +63,9 @@ re-entering an active hitbox after a teleport. When a short teleport cannot clea
 a large attack, the controller continues walking outward while attacking when
 the target remains in range and visible. Static safe-zone/spawn markers are
 excluded; no movement-speed increase is required.
+Approach steps also check enemies' predicted positions half a second ahead.
+This lets the controller brake or retreat before a closing enemy reaches it,
+including enemies arriving from behind and larger enemy bodies.
 
 Automation, movement overrides, hover, and logging are off by default. Auto
 Dungeon enables combat; Auto Create Lobby and Auto Start Dungeon enable queueing.
