@@ -850,6 +850,19 @@ local function controllerTick()
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
     state.prevHealth[target] = targetHumanoid.Health
+
+    -- A combat-distance point on this side of a wall is not an attack position.
+    -- Route to the enemy's reachable area before holding distance or casting.
+    if hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then
+        state.navigationPhase = "approach"
+        state.lastThreatPart, state.dodgeGoal = nil, nil
+        restoreFacing()
+        state.status = "Routing around obstacle to " .. target.Name
+        followGoal(humanoid, rootPart, targetRoot.Position, "approach", now, target)
+        updateProgress(humanoid, rootPart, targetRoot.Position, target, now)
+        return
+    end
+    state.navigationPhase = "combat"
     faceEnemy(humanoid, rootPart, targetRoot)
 
     local threat = findThreat(rootPart, target, now)
@@ -897,7 +910,8 @@ end
 
 connect(RunService.RenderStepped, function()
     local target = state.currentTarget
-    if not state.running or state.closed or not isValidTarget(target) or not target:IsDescendantOf(Workspace) then
+    if not state.running or state.closed or state.navigationPhase == "approach"
+        or not isValidTarget(target) or not target:IsDescendantOf(Workspace) then
         restoreFacing()
         return
     end
