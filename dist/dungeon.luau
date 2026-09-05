@@ -936,9 +936,12 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     return true
 end
 
-local facingHumanoid, previousAutoRotate
+local facingHumanoid, previousAutoRotate, facingRoot, facingAttachment, facingAlignment
 
 local function restoreFacing()
+    if facingAlignment then facingAlignment:Destroy(); facingAlignment = nil end
+    if facingAttachment then facingAttachment:Destroy(); facingAttachment = nil end
+    facingRoot = nil
     if facingHumanoid then
         facingHumanoid.AutoRotate = previousAutoRotate
         facingHumanoid = nil
@@ -947,16 +950,29 @@ local function restoreFacing()
 end
 
 local function faceEnemy(humanoid, rootPart, targetRoot)
-    if facingHumanoid ~= humanoid then
+    if facingHumanoid ~= humanoid or facingRoot ~= rootPart then
         restoreFacing()
         facingHumanoid, previousAutoRotate = humanoid, humanoid.AutoRotate
+        facingRoot = rootPart
+        facingAttachment = Instance.new("Attachment")
+        facingAttachment.Name = "ObsidianFacingAttachment"
+        facingAttachment.Parent = rootPart
+        facingAlignment = Instance.new("AlignOrientation")
+        facingAlignment.Name = "ObsidianFacing"
+        facingAlignment.Mode = Enum.OrientationAlignmentMode.OneAttachment
+        facingAlignment.Attachment0 = facingAttachment
+        facingAlignment.MaxTorque = 1000000
+        facingAlignment.MaxAngularVelocity = 30
+        facingAlignment.Responsiveness = 100
+        facingAlignment.Parent = rootPart
     end
     humanoid.AutoRotate = false
     local position = rootPart.Position
     local lookAt = Vector3.new(targetRoot.Position.X, position.Y, targetRoot.Position.Z)
     if (lookAt - position).Magnitude > 0.01 then
-        -- Change yaw only; facing must not consume or extend a teleport step.
-        rootPart.CFrame = CFrame.new(position, lookAt)
+        -- Writing the root CFrame cancels Humanoid.MoveTo. Rotate through physics
+        -- so facing the target never interrupts the current walking command.
+        facingAlignment.CFrame = CFrame.new(Vector3.zero, lookAt - position)
     end
 end
 
