@@ -965,6 +965,11 @@ connect(RunService.Heartbeat, function(dt)
         distance = distance + math.max(healthBuffer, damageBuffer)
     end
     if C.SmartFarm and controller.AbilityStatus then
+        if C.AdaptiveSpacing and targetRoot then
+            local contactDistance = math.max(cfg.MELEE_DANGER_DISTANCE or 11,
+                math.min(18, math.max(targetRoot.Size.X, targetRoot.Size.Z) * 0.5 + 6))
+            distance = math.max(distance, contactDistance + 2)
+        end
         for _, snapshot in pairs(controller.AbilityStatus()) do
             local profile = controller.AbilityProfile(snapshot)
             if profile.mode == "target" or profile.mode == "splash" then

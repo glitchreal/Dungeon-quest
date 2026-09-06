@@ -1206,6 +1206,11 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         state.escapeGoal = nil
         state.lastEscapePlan = -math.huge
     end
+    if risk == 0 and not state.retreating and not contactThreat and crowd >= crowdLimit
+        and not state.movementBlocked and not state.blockedByHazard then
+        state.escapeGoal, state.threatReactionAt = nil, nil
+        return false
+    end
     if state.escapeGoal and now < (state.escapeUntil or 0) then
         if now - (state.lastEscapeCheck or 0) >= 0.2 then
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
@@ -1223,18 +1228,9 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         end
     end
     state.escapeGoal = nil
-    if risk == 0 and not state.retreating and not contactThreat and crowd >= crowdLimit
-        and not state.movementBlocked and not state.blockedByHazard then
-        if now < state.safetyUntil then
-            state.status = "Holding safe position"
-            stopMovement(humanoid, rootPart)
-            return true
-        end
-        return false
-    end
     if zone then
-        state.observedThreats[zone.id] = state.observedThreats[zone.id] or now
-        if now - state.observedThreats[zone.id] < CFG.REACTION_TIME then
+        state.threatReactionAt = state.threatReactionAt or now
+        if now - state.threatReactionAt < CFG.REACTION_TIME then
             state.status = "Reacting to attack"
             return true
         end
@@ -1307,12 +1303,6 @@ local function controllerTick()
             state.prevHealth[model] = trackedHumanoid.Health
         end
     end
-    if state.lastPlayerHealth and humanoid.Health < state.lastPlayerHealth - 0.01 then
-        state.damageEvents = state.damageEvents + 1
-        state.lastDamage = { amount = state.lastPlayerHealth - humanoid.Health, at = now }
-        warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f)", state.damageEvents, state.lastPlayerHealth, humanoid.Health))
-    end
-    state.lastPlayerHealth = humanoid.Health
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
         state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
@@ -1477,7 +1467,26 @@ local function shutdown()
     table.clear(announcedZones)
 end
 
-connect(player.CharacterAdded, function()
+local function watchHealth(character)
+    if not character then return end
+    local humanoid = character:WaitForChild("Humanoid", 5)
+    if not humanoid or state.closed or character ~= player.Character then return end
+    if state.healthConnection then state.healthConnection:Disconnect() end
+    local previous = humanoid.Health
+    state.healthConnection = connect(humanoid.HealthChanged, function(health)
+        if state.running and not state.closed and character == player.Character and health < previous - 0.01 then
+            state.damageEvents = state.damageEvents + 1
+            state.lastDamage = { amount = previous - health, at = os.clock(), health = health,
+                mode = state.motionMode, status = state.status, hazards = #state.activeZones,
+                distance = state.targetDist }
+            warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f)", state.damageEvents, previous, health))
+        end
+        previous = health
+    end)
+end
+
+connect(player.CharacterAdded, function(character)
+    state.threatReactionAt = nil
     state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
     state.retreating = false
     state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
@@ -1493,7 +1502,9 @@ connect(player.CharacterAdded, function()
     state.dodgeGoal = nil
     state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
     clearPath()
+    task.spawn(watchHealth, character)
 end)
+task.spawn(watchHealth, player.Character)
 
 print("[EnemyWalker] loaded: indexed targets, asynchronous paths, bounded teleport dodges")
 

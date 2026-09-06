@@ -44,10 +44,21 @@ function Geometry.risk(zones, position, margin)
 end
 
 function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
+    local relevant = {}
+    local padding = math.sqrt(2 * margin * margin + 16)
+    for _, zone in ipairs(zones) do
+        local travel = (zone.moving or zone.shape == "Projectile")
+            and zone.velocity.Magnitude * zone.lookahead or 0
+        local radius = zone.size.Magnitude * 0.5 + padding + travel
+        if Geometry.segmentDistance(zone.frame.Position, startPosition, endPosition) <= radius then
+            table.insert(relevant, zone)
+        end
+    end
+    if #relevant == 0 then return true end
     local steps = math.max(1, math.ceil((endPosition - startPosition).Magnitude * 2))
     local initial = {}
     local previousRisk = 0
-    for index, zone in ipairs(zones) do
+    for index, zone in ipairs(relevant) do
         local clearance = Geometry.clearance(zone, startPosition, margin)
         initial[index] = clearance
         if clearance < 0 then previousRisk = previousRisk + 1 + clearance * clearance end
@@ -57,7 +68,7 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
     for i = 1, steps do
         local position = startPosition:Lerp(endPosition, i / steps)
         local risk = 0
-        for index, zone in ipairs(zones) do
+        for index, zone in ipairs(relevant) do
             local clearance = Geometry.clearance(zone, position, margin)
             if initial[index] >= 0 and clearance < -0.02 then return false end
             if clearance < 0 then risk = risk + 1 + clearance * clearance end
