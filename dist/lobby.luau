@@ -275,7 +275,7 @@ local C = {
     StartDelay = 0, AutoDungeon = false, AutoAbilities = true, SpamAbilities = false, AutoReplay = false,
     SmartFarm = true, GroupRadius = 6, CloseAoeRange = 8,
     DynamicDistance = false, AdaptiveSpacing = true, MeleeDistance = 8, Hover = false, HoverHeight = 5,
-    AutoDodge = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
+    AutoDodge = true, FastDodge = true, ReactionTime = 0, Standoff = 20, SafetyDistance = 3,
     KickOnJoin = false, AllowFriends = true, AllowedPlayers = "",
     Dungeon = "Desert Temple", Difficulty = "Easy", AutoCreate = false, AutoStart = false,
     Hardcore = false, PrivateLobby = true, WaveDefence = false,
@@ -575,7 +575,8 @@ slider(helper, "MeleeDistance", "Melee Distance", 5, 12)
 toggle(helper, "Hover", "Hover Above Hitboxes", function(value) if not value then clearHover() end end)
 slider(helper, "HoverHeight", "Hover Height", 0, 14)
 toggle(helper, "AutoDodge", "Auto Dodge")
-slider(helper, "ReactionTime", "Reaction Time", 0.05, 0.8, 2)
+toggle(helper, "FastDodge", "Fast Dodge Response", nil, "Immediate evasions, faster sensing, and earlier route renewal. Teleport limits and walk speed are unchanged.")
+slider(helper, "ReactionTime", "Reaction Time", 0, 0.8, 2)
 slider(helper, "Standoff", "Standoff Distance", 0, 60)
 slider(helper, "SafetyDistance", "Safety Distance", 0.25, 16, 2)
 toggle(helper, "KickOnJoin", "Kick On Player Join", nil, "Disconnects your own account if an unapproved player joins")
@@ -983,6 +984,7 @@ connect(RunService.Heartbeat, function(dt)
     cfg.ATTACK_RANGE = math.max(26, distance + 3)
     cfg.FARM_POSITION, cfg.PRECAST_MARGIN = C.FarmPosition, C.SafetyDistance
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime
+    cfg.FAST_DODGE = C.FastDodge
     cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
     cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.05 or 0.2
     if C.TargetLine and root and targetRoot and controller.State.running then

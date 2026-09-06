@@ -427,7 +427,7 @@ local CFG = {
     COMBAT_MIN_DISTANCE = 16,
     COMBAT_MAX_DISTANCE = 24,
     SKILL_COOLDOWN = 0.2,
-    CONTROL_INTERVAL = 1 / 30,
+    CONTROL_INTERVAL = 1 / 60,
     UI_INTERVAL = 0.15,
     THREAT_SCAN_INTERVAL = 0.2,
     DETECTION_RADIUS = 1000,
@@ -460,7 +460,8 @@ local CFG = {
     THREAT_MAX_AGE = 2,
     AUTO_ABILITIES = true,
     AUTO_DODGE = true,
-    REACTION_TIME = 0.05,
+    REACTION_TIME = 0,
+    FAST_DODGE = true,
     MELEE_DANGER_DISTANCE = 11,
     RETREAT_RELEASE_MARGIN = 5,
     FARM_POSITION = "Nearest",
@@ -1200,7 +1201,7 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
 end
 
 local function refreshSafety(rootPart, now)
-    if now - state.lastSafetyScan < 0.1 then return end
+    if now - state.lastSafetyScan < (CFG.FAST_DODGE and 0.05 or 0.1) then return end
     state.lastSafetyScan = now
     local zones, enemies = {}, {}
     for _, model in ipairs(state.cachedTargets) do
@@ -1336,7 +1337,7 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     table.insert(state.dodgeHistory, { at = now, distance = delta.Magnitude })
     state.dodgedThreats[threat] = now
     state.lastDodgeTime = now
-    state.safetyUntil = now + 0.75
+    state.safetyUntil = now + (CFG.FAST_DODGE and 0.15 or 0.75)
     state.dodgeCount = state.dodgeCount + 1
     state.dodgeSide = -state.dodgeSide
     clearPath()
@@ -1498,6 +1499,8 @@ end
 
 local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now)
     if not threat then return end
+    -- Reject cooldown-limited teleports before doing floor and collision probes.
+    if not canTeleportDodge(now, math.min(CFG.DODGE_LATERAL_DISTANCE, (goal - rootPart.Position).Magnitude), threat) then return end
     local delta = goal - rootPart.Position
     if delta.Magnitude < 0.5 then return end
     local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
@@ -1519,11 +1522,11 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
     if state.escapeGoal and now < (state.escapeUntil or 0) then
-        if now - (state.lastEscapeCheck or 0) >= 0.2 then
+        if now - (state.lastEscapeCheck or 0) >= (CFG.FAST_DODGE and 0.1 or 0.2) then
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
             state.lastEscapeCheck = now
         end
-        if (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
+        if (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * (CFG.FAST_DODGE and 0.4 or 0.25))
             and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.PRECAST_MARGIN)
             and safeEnemyStep(rootPart.Position, state.escapeGoal)
             and state.escapeClear
@@ -1545,13 +1548,13 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     end
     if zone then
         state.observedThreats[zone.id] = state.observedThreats[zone.id] or now
-        if now - state.observedThreats[zone.id] < CFG.REACTION_TIME then
+        if not CFG.FAST_DODGE and now - state.observedThreats[zone.id] < CFG.REACTION_TIME then
             stopMovement(humanoid, rootPart)
             state.status = "Reacting to attack"
             return true
         end
     end
-    if now - state.lastEscapePlan < 0.05 then return true end
+    if now - state.lastEscapePlan < (CFG.FAST_DODGE and 1 / 60 or 0.05) then return true end
     state.lastEscapePlan = now
     local goal = findEscapeGoal(rootPart, targetRoot)
     state.movementBlocked = false
@@ -1564,7 +1567,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
     state.escapeClear, state.lastEscapeCheck = true, now
-    state.safetyUntil = now + 0.75
+    state.safetyUntil = now + (CFG.FAST_DODGE and 0.15 or 0.75)
     dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now)
     state.escapeReason = zone and "Escaping attack area" or "Avoiding nearby enemies"
     state.status = state.escapeReason
@@ -1865,7 +1868,7 @@ local C = {
     StartDelay = 0, AutoDungeon = false, AutoAbilities = true, SpamAbilities = false, AutoReplay = false,
     SmartFarm = true, GroupRadius = 6, CloseAoeRange = 8,
     DynamicDistance = false, AdaptiveSpacing = true, MeleeDistance = 8, Hover = false, HoverHeight = 5,
-    AutoDodge = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
+    AutoDodge = true, FastDodge = true, ReactionTime = 0, Standoff = 20, SafetyDistance = 3,
     KickOnJoin = false, AllowFriends = true, AllowedPlayers = "",
     Dungeon = "Desert Temple", Difficulty = "Easy", AutoCreate = false, AutoStart = false,
     Hardcore = false, PrivateLobby = true, WaveDefence = false,
@@ -2165,7 +2168,8 @@ slider(helper, "MeleeDistance", "Melee Distance", 5, 12)
 toggle(helper, "Hover", "Hover Above Hitboxes", function(value) if not value then clearHover() end end)
 slider(helper, "HoverHeight", "Hover Height", 0, 14)
 toggle(helper, "AutoDodge", "Auto Dodge")
-slider(helper, "ReactionTime", "Reaction Time", 0.05, 0.8, 2)
+toggle(helper, "FastDodge", "Fast Dodge Response", nil, "Immediate evasions, faster sensing, and earlier route renewal. Teleport limits and walk speed are unchanged.")
+slider(helper, "ReactionTime", "Reaction Time", 0, 0.8, 2)
 slider(helper, "Standoff", "Standoff Distance", 0, 60)
 slider(helper, "SafetyDistance", "Safety Distance", 0.25, 16, 2)
 toggle(helper, "KickOnJoin", "Kick On Player Join", nil, "Disconnects your own account if an unapproved player joins")
@@ -2573,6 +2577,7 @@ connect(RunService.Heartbeat, function(dt)
     cfg.ATTACK_RANGE = math.max(26, distance + 3)
     cfg.FARM_POSITION, cfg.PRECAST_MARGIN = C.FarmPosition, C.SafetyDistance
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime
+    cfg.FAST_DODGE = C.FastDodge
     cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
     cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.05 or 0.2
     if C.TargetLine and root and targetRoot and controller.State.running then
