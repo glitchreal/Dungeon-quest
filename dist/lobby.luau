@@ -968,7 +968,7 @@ connect(RunService.Heartbeat, function(dt)
     cfg.FARM_POSITION, cfg.PRECAST_MARGIN = C.FarmPosition, C.SafetyDistance
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime
     cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
-    cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.05 or 0.2
+    cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.35 or 0.2
     if C.TargetLine and root and targetRoot and controller.State.running then
         if not line or beamStart.Parent ~= root or beamEnd.Parent ~= targetRoot then
             clearLine()
@@ -981,7 +981,8 @@ connect(RunService.Heartbeat, function(dt)
             line.Parent = root
         end
     else clearLine() end
-    if C.Hover and C.HoverHeight > 0 and root and targetRoot and humanoid and humanoid.Health > 0 and controller.State.running and controller.State.lastThreatPart then
+    if C.Hover and C.HoverHeight > 0 and root and targetRoot and humanoid and humanoid.Health > 0
+        and controller.State.running and controller.State.lastThreatPart and #(controller.State.activeZones or {}) == 0 then
         if not hoverForce or hoverForce.Parent ~= root then
             clearHover()
             hoverAttachment = Instance.new("Attachment")

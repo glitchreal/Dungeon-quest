@@ -101,6 +101,9 @@ Splash attacks score compact visible groups while movement retains its nearest
 enemy. Self-area attacks wait for close enemies; heals wait for health below 85%,
 shields for danger, and buffs for nearby combat. Healing can run outside attack
 range. Unknown moves retain normal targeting and configured range estimates.
+Spam Abilities has a 0.35-second request floor and is suppressed during active
+hazards or escape movement. Hover is suppressed during active hazards so its
+vertical force cannot interfere with a dodge.
 The client does not expose exact ranges for every spell: the status readout marks
 missing ranges as estimated, and grouping/close-AoE sliders supply fallbacks.
 

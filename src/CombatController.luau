@@ -1053,6 +1053,8 @@ end
 local function castSkill()
     if not CFG.AUTO_ABILITIES then return end
     local now = os.clock()
+    if CFG.AUTO_DODGE and (#state.activeZones > 0 or state.motionMode == "evade"
+        or state.motionMode == "safety-hold" or state.motionMode == "hazard-escape") then return end
     if abilities.TryCast(now, CFG.SKILL_COOLDOWN, prepareSpell) then state.lastSkillTime = now end
 end
 
