@@ -58,11 +58,6 @@ content. Cosmetic spoofing does not change eligibility. Teleport dodges are capp
 at 3 studs, one second apart, and two dodges/six studs per rolling three seconds.
 Those same shared limits also apply to emergency dodges from incoming regular
 enemies; a visible attack marker is no longer required for close melee danger.
-Fast Dodge Response defaults on: it bypasses the optional reaction delay, checks
-threats every 0.05 seconds, renews escape goals earlier, and shortens the safe
-post-escape hold to 0.15 seconds. Movement decisions run up to 60 times per second,
-subject to client frame rate. Disabling it restores the configured reaction delay.
-It does not raise WalkSpeed or the teleport distance/frequency limits.
 Retreat stays active until predicted separation clears an additional five-stud
 margin, and escape steps are renewed before the character reaches their endpoint.
 
@@ -94,10 +89,6 @@ Adaptive Safety Spacing adds three studs briefly after a hit and up to eight
 studs at low health; the larger buffer applies, rather than stacking both. It is
 enabled by default and can be disabled to keep exactly the configured spacing.
 Dynamic distance reads the currently equipped weapon, including mid-run changes.
-Recognized ranged ability descriptions override a physical weapon's melee
-distance: physical scaling does not imply a close-range spell. Adaptive spacing
-also adds up to eight studs for faster pursuers and nearby crowd pressure.
-Faster pursuers trigger melee-dodge consideration earlier, under the same limits.
 
 Smart Farming is enabled by default and profiles equipped moves from tool
 attributes, value fields, ability types, and inventory descriptions. It handles
