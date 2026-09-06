@@ -378,6 +378,8 @@ local CFG = {
     AUTO_ABILITIES = true,
     AUTO_DODGE = true,
     REACTION_TIME = 0.05,
+    MELEE_DANGER_DISTANCE = 11,
+    RETREAT_RELEASE_MARGIN = 5,
     FARM_POSITION = "Nearest",
 
     SHOW_WAYPOINTS = true,
@@ -454,6 +456,7 @@ local state = {
     lastSafetyScan = -math.huge,
     lastEscapePlan = -math.huge,
     enemyMotion = setmetatable({}, { __mode = "k" }),
+    retreating = false,
     pathComputations = 0,
 }
 
@@ -1146,7 +1149,7 @@ local function findEscapeGoal(rootPart, targetRoot)
     local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.PRECAST_MARGIN)
     local originalCrowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
-    for _, radius in ipairs({ 3, 8, 14 }) do
+    for _, radius in ipairs({ 14, 8, 3 }) do
         for i = 0, 15 do
             local angle = i * math.pi / 8
             local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
@@ -1154,9 +1157,12 @@ local function findEscapeGoal(rootPart, targetRoot)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.PRECAST_MARGIN) then
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.PRECAST_MARGIN)
                 local crowd = crowdDistance(candidate)
-                if (originalRisk == 0 or risk < originalRisk - 0.1) and (originalCrowd >= crowdLimit or crowd > originalCrowd + 0.25) then
+                if (originalRisk == 0 or risk < originalRisk - 0.1)
+                    and ((originalCrowd >= crowdLimit and not state.retreating) or crowd > originalCrowd + 0.25) then
                     local targetDistance = (candidate - targetRoot.Position).Magnitude
-                    local score = -risk * 100 + math.min(crowd, 20) * 2 - math.abs(targetDistance - CFG.COMBAT_DISTANCE) * 0.1 - radius * 0.05
+                    local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
+                    local score = -risk * 100 + math.min(crowd, 28) * 2 - math.abs(targetDistance - desiredDistance) * 0.1
+                        + (state.retreating and radius * 0.2 or -radius * 0.05)
                     if score > bestScore and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
                         best, bestScore = candidate, score
                     end
@@ -1184,6 +1190,8 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     if not destination or humanoid.FloorMaterial == Enum.Material.Air then return false end
     local delta = destination - rootPart.Position
     if not canTeleportDodge(now, delta.Magnitude, threat) then return false end
+    if not safeEnemyStep(rootPart.Position, destination) then return false end
+    if not walkingSegmentClear(rootPart, destination, target) then return false end
     if not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, destination, CFG.PRECAST_MARGIN) then return false end
     -- Check several body-width rays before applying the bounded horizontal step.
     for _, offset in ipairs({ Vector3.zero, Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(0, 0, -1) }) do
@@ -1260,32 +1268,62 @@ local function stopMovement(humanoid, rootPart)
     clearPath()
 end
 
+local function meleeThreat(rootPart)
+    local threat, closest = nil, math.huge
+    for _, enemy in ipairs(state.nearbyEnemies) do
+        if enemy.root.Parent then
+            local distance = (enemy.root.Position - rootPart.Position).Magnitude
+            local offset = rootPart.Position - enemy.root.Position
+            local closing = offset.Magnitude > 0.01 and enemy.velocity:Dot(offset.Unit) or 0
+            local limit = math.max(CFG.MELEE_DANGER_DISTANCE, math.min(18, math.max(enemy.root.Size.X, enemy.root.Size.Z) * 0.5 + 6))
+            if distance < closest and (distance <= limit or distance - math.max(0, closing) * 0.25 <= limit) then
+                threat, closest = enemy.model, distance
+            end
+        end
+    end
+    return threat
+end
+
+local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now)
+    if not threat then return end
+    local delta = goal - rootPart.Position
+    if delta.Magnitude < 0.5 then return end
+    local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
+    if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return end
+    performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
+end
+
 local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if not CFG.AUTO_DODGE then
-        state.escapeGoal, state.lastThreatPart, state.movementBlocked = nil, nil, false
+        state.escapeGoal, state.lastThreatPart, state.movementBlocked, state.retreating = nil, nil, false, false
         return false
     end
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.PRECAST_MARGIN)
     state.lastThreatPart = zone and zone.id
     local crowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
+    local clearance = enemyClearance(rootPart.Position)
+    if clearance < 0 then state.retreating = true
+    elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
+    local contactThreat = meleeThreat(rootPart)
     if state.escapeGoal and now < (state.escapeUntil or 0) then
         if now - (state.lastEscapeCheck or 0) >= 0.2 then
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
             state.lastEscapeCheck = now
         end
-        if (state.escapeGoal - rootPart.Position).Magnitude > 1.5
+        if (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
             and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.PRECAST_MARGIN)
             and safeEnemyStep(rootPart.Position, state.escapeGoal)
             and state.escapeClear
             and (crowd >= crowdLimit or crowdDistance(state.escapeGoal) > crowd) then
             state.status = state.escapeReason or "Avoiding nearby enemies"
+            dodgeAlongEscape(humanoid, rootPart, state.escapeGoal, target, zone and zone.id or contactThreat, now)
             issueMove(humanoid, state.escapeGoal, "evade", now)
             return true
         end
     end
     state.escapeGoal = nil
-    if risk == 0 and crowd >= crowdLimit and not state.movementBlocked then
+    if risk == 0 and not state.retreating and not contactThreat and crowd >= crowdLimit and not state.movementBlocked then
         if now < state.safetyUntil then
             state.status = "Holding safe position"
             stopMovement(humanoid, rootPart)
@@ -1301,7 +1339,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             return true
         end
     end
-    if now - state.lastEscapePlan < 0.15 then return true end
+    if now - state.lastEscapePlan < 0.05 then return true end
     state.lastEscapePlan = now
     local goal = findEscapeGoal(rootPart, targetRoot)
     state.movementBlocked = false
@@ -1315,11 +1353,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
-    if zone then
-        local delta = goal - rootPart.Position
-        local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
-        performDodgeTeleport(humanoid, rootPart, step, target, zone.id, now)
-    end
+    dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now)
     state.escapeReason = zone and "Escaping attack area" or "Avoiding nearby enemies"
     state.status = state.escapeReason
     issueMove(humanoid, goal, "evade", now)
@@ -1356,6 +1390,7 @@ local function controllerTick()
     state.lastPlayerHealth = humanoid.Health
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
+        state.retreating = false
         state.escapeGoal, state.lastThreatPart = nil, nil
         state.status, state.targetName, state.targetDist = "Waiting for wave", "None", 0
         state.currentTarget, state.lockedTarget = nil, nil
@@ -1463,6 +1498,7 @@ local function setRunning(running)
     if state.closed or state.running == running then return end
     state.running = running
     if state.running then
+        state.retreating = false
         state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
         state.movementBlocked, state.lastSafetyScan, state.lastEscapePlan = false, -math.huge, -math.huge
         state.skillQ_count, state.skillE_count, state.kills, state.stuckRetries = 0, 0, 0, 0
@@ -1505,6 +1541,7 @@ local function shutdown()
 end
 
 connect(player.CharacterAdded, function()
+    state.retreating = false
     state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
     state.movementBlocked, state.lastSafetyScan = false, -math.huge
     restoreFacing()
