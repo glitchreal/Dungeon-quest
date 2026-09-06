@@ -722,6 +722,7 @@ connect(RunService.Heartbeat, function(dt)
     cfg.COMBAT_MIN_DISTANCE, cfg.COMBAT_MAX_DISTANCE = math.max(0, distance - 3), distance + 3
     cfg.ATTACK_RANGE = math.max(26, distance + 3)
     cfg.FARM_POSITION, cfg.PRECAST_MARGIN = C.FarmPosition, C.SafetyDistance
+    cfg.HAZARD_MARGIN = math.max(6, C.SafetyDistance + 3)
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime
     cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
     cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.35 or 0.2
