@@ -899,6 +899,23 @@ local function findEscapeGoal(rootPart, targetRoot)
     return best
 end
 
+local function findEmergencySideStep(rootPart, target)
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    for _, radius in ipairs({ 3, 5, 8, 12 }) do
+        for index = 0, 15 do
+            local angle = index * math.pi / 8
+            local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
+            if ThreatGeometry.risk(state.activeZones, candidate, CFG.PRECAST_MARGIN) == 0
+                and safeEnemyStep(rootPart.Position, candidate)
+                and walkingSegmentClear(rootPart, candidate, target, params) then
+                return candidate
+            end
+        end
+    end
+    return nil
+end
+
 local function canTeleportDodge(now, distance, threat)
     local history = state.dodgeHistory
     while history[1] and now - history[1].at >= CFG.DODGE_WINDOW do table.remove(history, 1) end
@@ -1149,8 +1166,12 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if now - state.lastEscapePlan < 0.05 then return true end
     state.lastEscapePlan = now
     local goal = findEscapeGoal(rootPart, targetRoot)
+    if not goal and (risk > 0 or state.blockedByHazard) then
+        goal = findEmergencySideStep(rootPart, target)
+    end
     state.movementBlocked, state.blockedByHazard = false, false
     if not goal then
+        state.blockedByHazard = false
         state.status = "Waiting for safe escape route"
         stopMovement(humanoid, rootPart)
         return true
