@@ -260,6 +260,8 @@ function Abilities.new(player, onConfirmed)
     local requests = setmetatable({}, { __mode = "k" })
     local slots, snapshots = {}, {}
     local lastRefresh, lastAttempt, preferred = -math.huge, -math.huge, "q"
+    local descriptions = {}
+    local metadataCache = setmetatable({}, { __mode = "k" })
     local userInput = game:GetService("UserInputService")
     local remotes = game:GetService("ReplicatedStorage"):WaitForChild("remotes")
 
@@ -280,13 +282,30 @@ function Abilities.new(player, onConfirmed)
                         onConfirmed(slot.Value, tool.Name)
                     end
                     slots[slot.Value] = tool
-                    snapshots[slot.Value] = { name = tool.Name, cooldown = remaining }
+                    local cached = metadataCache[tool]
+                    if not cached or now - cached.at > 1 then
+                        local metadata = {}
+                        for key, value in pairs(tool:GetAttributes()) do metadata[key:lower()] = value end
+                        for _, child in ipairs(tool:GetChildren()) do
+                            if child:IsA("ValueBase") then metadata[child.Name:lower()] = child.Value end
+                        end
+                        cached = { at = now, values = metadata }
+                        metadataCache[tool] = cached
+                    end
+                    snapshots[slot.Value] = { name = tool.Name, cooldown = remaining, metadata = cached.values,
+                        description = cached.values.description or descriptions[tool.Name] }
                 end
             end
         end
     end
 
     return {
+        SetInventory = function(inventory)
+            descriptions = {}
+            for _, item in pairs(inventory.abilities or {}) do
+                if type(item.name) == "string" and type(item.description) == "string" then descriptions[item.name] = item.description end
+            end
+        end,
         Snapshot = function(now)
             refresh(now)
             return snapshots
@@ -330,12 +349,27 @@ end)()
 local FarmPlanner = (function()
 local Planner = {}
 
--- Only confirmed ability types get special handling; unknown spells retain
--- normal targeting. Grouping radius is a heuristic, not a claimed damage radius.
-function Planner.profile(name)
-    if name == "Fireball" or name == "Blue Fireball" then return "splash" end
-    if name == "Whirlwind" then return "self" end
-    return "target"
+function Planner.profile(snapshot)
+    local metadata = snapshot.metadata or {}
+    local function number(...)
+        for _, key in ipairs({ ... }) do
+            local value = tonumber(metadata[key])
+            if value and value > 0 then return value end
+        end
+    end
+    local kind = tostring(metadata.abilitytype or ""):lower()
+    local description = tostring(snapshot.description or ""):lower()
+    local shape = tostring(metadata.targettype or metadata.targeting or metadata.shape or ""):lower()
+    local range = number("range", "castrange", "attackrange", "maxdistance", "distance")
+    local radius = number("radius", "aoeradius", "explosionradius", "hitradius")
+    local mode = "target"
+    if kind == "heal" or metadata.healamount then mode = "heal"
+    elseif kind == "shield" then mode = "shield"
+    elseif metadata.buffpower then mode = "buff"
+    elseif shape == "self" or description:find("around you", 1, true) or description:find("around yourself", 1, true) then mode = "self"
+    elseif shape == "splash" or shape == "area" or radius or description:find("explod", 1, true)
+        or description:find("nearby enemies", 1, true) then mode = "splash" end
+    return { mode = mode, range = range, radius = radius, verifiedRange = range ~= nil }
 end
 
 function Planner.select(candidates, radius, connected)
@@ -1306,14 +1340,20 @@ local function faceEnemy(humanoid, rootPart, targetRoot)
 end
 
 local function spellUsable(snapshot, rootPart)
-    if FarmPlanner.profile(snapshot.name) == "self" then
+    local profile = FarmPlanner.profile(snapshot)
+    local humanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
+    if profile.mode == "heal" then return humanoid and humanoid.Health < humanoid.MaxHealth * 0.85 end
+    if profile.mode == "shield" then return state.retreating or #state.activeZones > 0 end
+    if profile.mode == "buff" then return #state.nearbyEnemies > 0 end
+    if profile.mode == "self" then
         for _, enemy in ipairs(state.nearbyEnemies) do
-            if isValidTarget(enemy.model) and (enemy.root.Position - rootPart.Position).Magnitude <= CFG.CLOSE_AOE_RANGE then
+            if isValidTarget(enemy.model) and (enemy.root.Position - rootPart.Position).Magnitude <= (profile.radius or profile.range or CFG.CLOSE_AOE_RANGE) then
                 return true
             end
         end
         return false
     end
+    if profile.range and state.targetDist > profile.range then return false end
     return true
 end
 
@@ -1322,17 +1362,20 @@ local function prepareSpell(_, snapshot)
     local character, humanoid, rootPart = getChar()
     if not character or not humanoid or not rootPart then return false end
     if not spellUsable(snapshot, rootPart) then return false end
-    local profile = FarmPlanner.profile(snapshot.name)
-    if profile ~= "splash" then return true end
+    local profile = FarmPlanner.profile(snapshot)
+    if profile.range and profile.mode == "target" and state.targetDist > profile.range then return false end
+    if profile.mode ~= "splash" then return true end
+    local range, radius = profile.range or CFG.ATTACK_RANGE, profile.radius or CFG.GROUP_RADIUS
     local now = os.clock()
     local plan = state.farmPlan
-    if not plan or now - plan.at >= 0.2 or not isValidTarget(plan.target) then
+    if not plan or plan.spell ~= snapshot.name or plan.range ~= range or plan.radius ~= radius
+        or now - plan.at >= 0.2 or not isValidTarget(plan.target) then
         local candidates = {}
         for _, model in ipairs(state.cachedTargets) do
             if isValidTarget(model) then
                 local root = getRootPart(model)
                 local distance = (root.Position - rootPart.Position).Magnitude
-                if distance <= CFG.ATTACK_RANGE then
+                if distance <= range then
                     table.insert(candidates, { model = model, position = root.Position, distance = distance })
                 end
             end
@@ -1344,7 +1387,7 @@ local function prepareSpell(_, snapshot)
             if not hasBlockingRay(rootPart.Position, candidate.position, character, candidate.model) then table.insert(visible, candidate) end
         end
         local visibilityCache = {}
-        local best, count = FarmPlanner.select(visible, CFG.GROUP_RADIUS, function(a, b)
+        local best, count = FarmPlanner.select(visible, radius, function(a, b)
             local cached = visibilityCache[a.model]
             if cached and cached[b.model] ~= nil then return cached[b.model] end
             local clear = not hasBlockingRay(a.position, b.position, character, a.model)
@@ -1352,13 +1395,13 @@ local function prepareSpell(_, snapshot)
             visibilityCache[a.model][b.model], visibilityCache[b.model][a.model] = clear, clear
             return clear
         end)
-        plan = { at = now, target = best and best.model, count = count }
+        plan = { at = now, target = best and best.model, count = count, spell = snapshot.name, range = range, radius = radius }
         state.farmPlan = plan
     end
     local target = plan.target
     if not isValidTarget(target) then return false end
     local targetRoot = getRootPart(target)
-    if (targetRoot.Position - rootPart.Position).Magnitude > CFG.ATTACK_RANGE
+    if (targetRoot.Position - rootPart.Position).Magnitude > range
         or hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then return false end
     state.castAimTarget, state.castAimUntil, state.groupCount = target, now + 0.35, plan.count
     faceEnemy(humanoid, rootPart, targetRoot)
@@ -1485,6 +1528,26 @@ local function controllerTick()
     end
 
     local now = os.clock()
+    if CFG.SMART_FARM then
+        local snapshots = abilities.Snapshot(now)
+        for _, snapshot in pairs(snapshots) do
+            local profile = FarmPlanner.profile(snapshot)
+            if profile.range and (profile.mode == "target" or profile.mode == "splash") then
+                CFG.ATTACK_RANGE = math.max(CFG.ATTACK_RANGE, profile.range)
+            end
+        end
+        for _, snapshot in pairs(snapshots) do
+            local profile = FarmPlanner.profile(snapshot)
+            if profile.mode == "heal" or profile.mode == "shield" or profile.mode == "buff" then
+                abilities.TryCast(now, CFG.SKILL_COOLDOWN, function(slot, candidate)
+                    local candidateProfile = FarmPlanner.profile(candidate)
+                    return (candidateProfile.mode == "heal" or candidateProfile.mode == "shield" or candidateProfile.mode == "buff")
+                        and prepareSpell(slot, candidate)
+                end)
+                break
+            end
+        end
+    end
     for model, health in pairs(state.prevHealth) do
         local trackedHumanoid = model:FindFirstChildOfClass("Humanoid")
         if trackedHumanoid and health > 0 and trackedHumanoid.Health <= 0 then
@@ -1692,6 +1755,8 @@ return {
     SetRunning = setRunning,
     Shutdown = shutdown,
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
+    SetAbilityInventory = abilities.SetInventory,
+    AbilityProfile = FarmPlanner.profile,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end
@@ -2135,6 +2200,7 @@ label(raidStatus, "CurrentTier", "Current Tier: none")
 label(raidStatus, "RaidAction", "Raid Action: waiting")
 local function refreshInventory()
     inventory = Adapter.inventory()
+    if controller.SetAbilityInventory then controller.SetAbilityInventory(inventory) end
     if not alive then return end
     local tiers = Logic.raidTiers(inventory)
     local values = {}
@@ -2345,7 +2411,7 @@ local function slowTick(now)
             end)
         end
     end
-    if C.AutoRaid and now - lastInv >= 15 then lastInv = now; job("inventory", refreshInventory) end
+    if (C.AutoRaid or C.SmartFarm) and now - lastInv >= 30 then lastInv = now; job("inventory", refreshInventory) end
     if now - lastQueue >= 5 and (C.AutoCreate or C.AutoStart or C.AutoRaid) and not started and not runEnded then
         lastQueue = now
         job("queue", function()
@@ -2366,6 +2432,10 @@ local function slowTick(now)
     for _, slot in ipairs({ "q", "e" }) do
         local ability = abilityStatus[slot]
         local text = ability and (ability.name .. " | " .. (ability.cooldown > 0 and string.format("%.1fs", ability.cooldown) or "Ready")) or "unequipped"
+        if ability and controller.AbilityProfile then
+            local profile = controller.AbilityProfile(ability)
+            text = text .. " | " .. profile.mode .. " | " .. (profile.range and tostring(profile.range) .. " st" or "range estimated")
+        end
         local count = slot == "q" and combatState.skillQ_count or combatState.skillE_count
         setLabel(slot == "q" and "AbilityQ" or "AbilityE", slot:upper() .. ": " .. text .. " | " .. (count or 0) .. " casts")
     end

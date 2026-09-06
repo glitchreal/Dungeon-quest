@@ -931,14 +931,20 @@ local function faceEnemy(humanoid, rootPart, targetRoot)
 end
 
 local function spellUsable(snapshot, rootPart)
-    if FarmPlanner.profile(snapshot.name) == "self" then
+    local profile = FarmPlanner.profile(snapshot)
+    local humanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
+    if profile.mode == "heal" then return humanoid and humanoid.Health < humanoid.MaxHealth * 0.85 end
+    if profile.mode == "shield" then return state.retreating or #state.activeZones > 0 end
+    if profile.mode == "buff" then return #state.nearbyEnemies > 0 end
+    if profile.mode == "self" then
         for _, enemy in ipairs(state.nearbyEnemies) do
-            if isValidTarget(enemy.model) and (enemy.root.Position - rootPart.Position).Magnitude <= CFG.CLOSE_AOE_RANGE then
+            if isValidTarget(enemy.model) and (enemy.root.Position - rootPart.Position).Magnitude <= (profile.radius or profile.range or CFG.CLOSE_AOE_RANGE) then
                 return true
             end
         end
         return false
     end
+    if profile.range and state.targetDist > profile.range then return false end
     return true
 end
 
@@ -947,17 +953,20 @@ local function prepareSpell(_, snapshot)
     local character, humanoid, rootPart = getChar()
     if not character or not humanoid or not rootPart then return false end
     if not spellUsable(snapshot, rootPart) then return false end
-    local profile = FarmPlanner.profile(snapshot.name)
-    if profile ~= "splash" then return true end
+    local profile = FarmPlanner.profile(snapshot)
+    if profile.range and profile.mode == "target" and state.targetDist > profile.range then return false end
+    if profile.mode ~= "splash" then return true end
+    local range, radius = profile.range or CFG.ATTACK_RANGE, profile.radius or CFG.GROUP_RADIUS
     local now = os.clock()
     local plan = state.farmPlan
-    if not plan or now - plan.at >= 0.2 or not isValidTarget(plan.target) then
+    if not plan or plan.spell ~= snapshot.name or plan.range ~= range or plan.radius ~= radius
+        or now - plan.at >= 0.2 or not isValidTarget(plan.target) then
         local candidates = {}
         for _, model in ipairs(state.cachedTargets) do
             if isValidTarget(model) then
                 local root = getRootPart(model)
                 local distance = (root.Position - rootPart.Position).Magnitude
-                if distance <= CFG.ATTACK_RANGE then
+                if distance <= range then
                     table.insert(candidates, { model = model, position = root.Position, distance = distance })
                 end
             end
@@ -969,7 +978,7 @@ local function prepareSpell(_, snapshot)
             if not hasBlockingRay(rootPart.Position, candidate.position, character, candidate.model) then table.insert(visible, candidate) end
         end
         local visibilityCache = {}
-        local best, count = FarmPlanner.select(visible, CFG.GROUP_RADIUS, function(a, b)
+        local best, count = FarmPlanner.select(visible, radius, function(a, b)
             local cached = visibilityCache[a.model]
             if cached and cached[b.model] ~= nil then return cached[b.model] end
             local clear = not hasBlockingRay(a.position, b.position, character, a.model)
@@ -977,13 +986,13 @@ local function prepareSpell(_, snapshot)
             visibilityCache[a.model][b.model], visibilityCache[b.model][a.model] = clear, clear
             return clear
         end)
-        plan = { at = now, target = best and best.model, count = count }
+        plan = { at = now, target = best and best.model, count = count, spell = snapshot.name, range = range, radius = radius }
         state.farmPlan = plan
     end
     local target = plan.target
     if not isValidTarget(target) then return false end
     local targetRoot = getRootPart(target)
-    if (targetRoot.Position - rootPart.Position).Magnitude > CFG.ATTACK_RANGE
+    if (targetRoot.Position - rootPart.Position).Magnitude > range
         or hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then return false end
     state.castAimTarget, state.castAimUntil, state.groupCount = target, now + 0.35, plan.count
     faceEnemy(humanoid, rootPart, targetRoot)
@@ -1110,6 +1119,26 @@ local function controllerTick()
     end
 
     local now = os.clock()
+    if CFG.SMART_FARM then
+        local snapshots = abilities.Snapshot(now)
+        for _, snapshot in pairs(snapshots) do
+            local profile = FarmPlanner.profile(snapshot)
+            if profile.range and (profile.mode == "target" or profile.mode == "splash") then
+                CFG.ATTACK_RANGE = math.max(CFG.ATTACK_RANGE, profile.range)
+            end
+        end
+        for _, snapshot in pairs(snapshots) do
+            local profile = FarmPlanner.profile(snapshot)
+            if profile.mode == "heal" or profile.mode == "shield" or profile.mode == "buff" then
+                abilities.TryCast(now, CFG.SKILL_COOLDOWN, function(slot, candidate)
+                    local candidateProfile = FarmPlanner.profile(candidate)
+                    return (candidateProfile.mode == "heal" or candidateProfile.mode == "shield" or candidateProfile.mode == "buff")
+                        and prepareSpell(slot, candidate)
+                end)
+                break
+            end
+        end
+    end
     for model, health in pairs(state.prevHealth) do
         local trackedHumanoid = model:FindFirstChildOfClass("Humanoid")
         if trackedHumanoid and health > 0 and trackedHumanoid.Health <= 0 then
@@ -1317,6 +1346,8 @@ return {
     SetRunning = setRunning,
     Shutdown = shutdown,
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
+    SetAbilityInventory = abilities.SetInventory,
+    AbilityProfile = FarmPlanner.profile,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end

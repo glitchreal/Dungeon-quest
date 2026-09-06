@@ -1,11 +1,26 @@
 local Planner = {}
 
--- Only confirmed ability types get special handling; unknown spells retain
--- normal targeting. Grouping radius is a heuristic, not a claimed damage radius.
-function Planner.profile(name)
-    if name == "Fireball" or name == "Blue Fireball" then return "splash" end
-    if name == "Whirlwind" then return "self" end
-    return "target"
+function Planner.profile(snapshot)
+    local metadata = snapshot.metadata or {}
+    local function number(...)
+        for _, key in ipairs({ ... }) do
+            local value = tonumber(metadata[key])
+            if value and value > 0 then return value end
+        end
+    end
+    local kind = tostring(metadata.abilitytype or ""):lower()
+    local description = tostring(snapshot.description or ""):lower()
+    local shape = tostring(metadata.targettype or metadata.targeting or metadata.shape or ""):lower()
+    local range = number("range", "castrange", "attackrange", "maxdistance", "distance")
+    local radius = number("radius", "aoeradius", "explosionradius", "hitradius")
+    local mode = "target"
+    if kind == "heal" or metadata.healamount then mode = "heal"
+    elseif kind == "shield" then mode = "shield"
+    elseif metadata.buffpower then mode = "buff"
+    elseif shape == "self" or description:find("around you", 1, true) or description:find("around yourself", 1, true) then mode = "self"
+    elseif shape == "splash" or shape == "area" or radius or description:find("explod", 1, true)
+        or description:find("nearby enemies", 1, true) then mode = "splash" end
+    return { mode = mode, range = range, radius = radius, verifiedRange = range ~= nil }
 end
 
 function Planner.select(candidates, radius, connected)

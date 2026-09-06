@@ -90,11 +90,19 @@ studs at low health; the larger buffer applies, rather than stacking both. It is
 enabled by default and can be disabled to keep exactly the configured spacing.
 Dynamic distance reads the currently equipped weapon, including mid-run changes.
 
-Smart Farming is enabled by default. For Fireball and Blue Fireball, it scores
-compact visible groups and temporarily aims at the best group member without
-changing the nearest enemy used for movement. It waits for the character to face
-that aim point before casting. Whirlwind is reserved for enemies within Close
-AoE Distance. Unknown abilities retain their normal targeting.
+Smart Farming is enabled by default and profiles equipped moves from tool
+attributes, value fields, ability types, and inventory descriptions. It handles
+heals, shields, buffs, self-area attacks, splash attacks, and ordinary targeted
+spells without a spell-name whitelist. Equipped tools are rediscovered as they
+change; inventory descriptions refresh every 30 seconds.
+
+Positive range and radius metadata take priority when supplied by the game.
+Splash attacks score compact visible groups while movement retains its nearest
+enemy. Self-area attacks wait for close enemies; heals wait for health below 85%,
+shields for danger, and buffs for nearby combat. Healing can run outside attack
+range. Unknown moves retain normal targeting and configured range estimates.
+The client does not expose exact ranges for every spell: the status readout marks
+missing ranges as estimated, and grouping/close-AoE sliders supply fallbacks.
 
 During cooldowns, the bot holds a safe useful range instead of needlessly closing
 the gap; threat avoidance still takes priority. Grouping Radius and Close AoE

@@ -5,6 +5,8 @@ function Abilities.new(player, onConfirmed)
     local requests = setmetatable({}, { __mode = "k" })
     local slots, snapshots = {}, {}
     local lastRefresh, lastAttempt, preferred = -math.huge, -math.huge, "q"
+    local descriptions = {}
+    local metadataCache = setmetatable({}, { __mode = "k" })
     local userInput = game:GetService("UserInputService")
     local remotes = game:GetService("ReplicatedStorage"):WaitForChild("remotes")
 
@@ -25,13 +27,30 @@ function Abilities.new(player, onConfirmed)
                         onConfirmed(slot.Value, tool.Name)
                     end
                     slots[slot.Value] = tool
-                    snapshots[slot.Value] = { name = tool.Name, cooldown = remaining }
+                    local cached = metadataCache[tool]
+                    if not cached or now - cached.at > 1 then
+                        local metadata = {}
+                        for key, value in pairs(tool:GetAttributes()) do metadata[key:lower()] = value end
+                        for _, child in ipairs(tool:GetChildren()) do
+                            if child:IsA("ValueBase") then metadata[child.Name:lower()] = child.Value end
+                        end
+                        cached = { at = now, values = metadata }
+                        metadataCache[tool] = cached
+                    end
+                    snapshots[slot.Value] = { name = tool.Name, cooldown = remaining, metadata = cached.values,
+                        description = cached.values.description or descriptions[tool.Name] }
                 end
             end
         end
     end
 
     return {
+        SetInventory = function(inventory)
+            descriptions = {}
+            for _, item in pairs(inventory.abilities or {}) do
+                if type(item.name) == "string" and type(item.description) == "string" then descriptions[item.name] = item.description end
+            end
+        end,
         Snapshot = function(now)
             refresh(now)
             return snapshots

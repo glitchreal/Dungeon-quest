@@ -665,6 +665,7 @@ label(raidStatus, "CurrentTier", "Current Tier: none")
 label(raidStatus, "RaidAction", "Raid Action: waiting")
 local function refreshInventory()
     inventory = Adapter.inventory()
+    if controller.SetAbilityInventory then controller.SetAbilityInventory(inventory) end
     if not alive then return end
     local tiers = Logic.raidTiers(inventory)
     local values = {}
@@ -875,7 +876,7 @@ local function slowTick(now)
             end)
         end
     end
-    if C.AutoRaid and now - lastInv >= 15 then lastInv = now; job("inventory", refreshInventory) end
+    if (C.AutoRaid or C.SmartFarm) and now - lastInv >= 30 then lastInv = now; job("inventory", refreshInventory) end
     if now - lastQueue >= 5 and (C.AutoCreate or C.AutoStart or C.AutoRaid) and not started and not runEnded then
         lastQueue = now
         job("queue", function()
@@ -896,6 +897,10 @@ local function slowTick(now)
     for _, slot in ipairs({ "q", "e" }) do
         local ability = abilityStatus[slot]
         local text = ability and (ability.name .. " | " .. (ability.cooldown > 0 and string.format("%.1fs", ability.cooldown) or "Ready")) or "unequipped"
+        if ability and controller.AbilityProfile then
+            local profile = controller.AbilityProfile(ability)
+            text = text .. " | " .. profile.mode .. " | " .. (profile.range and tostring(profile.range) .. " st" or "range estimated")
+        end
         local count = slot == "q" and combatState.skillQ_count or combatState.skillE_count
         setLabel(slot == "q" and "AbilityQ" or "AbilityE", slot:upper() .. ": " .. text .. " | " .. (count or 0) .. " casts")
     end
