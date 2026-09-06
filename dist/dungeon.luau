@@ -918,7 +918,8 @@ local function issueMove(humanoid, position, mode, now)
             if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.PRECAST_MARGIN) then
                 humanoid:MoveTo(root.Position)
                 state.motionMode = "safety-hold"
-                state.movementBlocked = true
+                state.movementBlocked, state.blockedByHazard = true, true
+                state.hazardBlockedGoal = position
                 state.safetyUntil = math.max(state.safetyUntil, now + 0.3)
                 state.lastMoveToCall = 0
                 return
@@ -1239,6 +1240,9 @@ local function refreshSafety(rootPart, now)
             elseif sample.zone then table.insert(zones, sample.zone) end
         elseif not part.Parent then
             threatParts[part] = nil
+        elseif now - sample.createdAt > CFG.THREAT_MAX_AGE
+            and now - (sample.lastActive or sample.createdAt) > 1.25 then
+            threatParts[part] = nil
         elseif not part:IsDescendantOf(rootPart.Parent)
             and (not state.waypointFolder or not part:IsDescendantOf(state.waypointFolder)) then
             local distance = (part.Position - rootPart.Position).Magnitude
@@ -1298,7 +1302,7 @@ local function findEscapeGoal(rootPart, targetRoot)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.PRECAST_MARGIN) then
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.PRECAST_MARGIN)
                 local crowd = crowdDistance(candidate)
-                if (originalRisk == 0 or risk < originalRisk - 0.1)
+                if ((originalRisk == 0 and risk == 0) or risk < originalRisk - 0.1)
                     and ((originalCrowd >= crowdLimit and not state.retreating) or crowd > originalCrowd + 0.25) then
                     local targetDistance = (candidate - targetRoot.Position).Magnitude
                     local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
@@ -1526,6 +1530,9 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if clearance < 0 then state.retreating = true
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
+    if risk == 0 and not contactThreat and not state.escapeGoal then
+        state.movementBlocked = false
+    end
     if state.escapeGoal and now < (state.escapeUntil or 0) then
         if now - (state.lastEscapeCheck or 0) >= (CFG.FAST_DODGE and 0.1 or 0.2) then
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
@@ -1543,6 +1550,20 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         end
     end
     state.escapeGoal = nil
+    if state.blockedByHazard then
+        state.blockedByHazard = false
+        state.lastEscapePlan = -math.huge
+        local lateral = findEscapeGoal(rootPart, targetRoot)
+        if lateral then
+            clearPath()
+            state.escapeGoal, state.escapeUntil = lateral, now + 1.5
+            state.escapeClear, state.lastEscapeCheck = true, now
+            state.escapeReason = "Clearing attack corridor"
+            state.status = state.escapeReason
+            issueMove(humanoid, lateral, "hazard-escape", now)
+            return true
+        end
+    end
     if risk == 0 and not state.retreating and not contactThreat and crowd >= crowdLimit and not state.movementBlocked then
         if now < state.safetyUntil then
             state.status = "Holding safe position"
@@ -1564,6 +1585,11 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local goal = findEscapeGoal(rootPart, targetRoot)
     state.movementBlocked = false
     if not goal then
+        if risk == 0 and not contactThreat then
+            state.movementBlocked = false
+            state.blockedByHazard = false
+            return false
+        end
         state.status = "Waiting for safe escape route"
         stopMovement(humanoid, rootPart)
         return true
@@ -1633,6 +1659,7 @@ local function controllerTick()
         state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.lastThreatPart = nil, nil
+        state.blockedByHazard, state.movementBlocked = false, false
         state.status, state.targetName, state.targetDist = "Waiting for wave", "None", 0
         state.currentTarget, state.lockedTarget = nil, nil
         stopMovement(humanoid, rootPart)
