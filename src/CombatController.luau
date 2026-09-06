@@ -404,6 +404,7 @@ local function walkingSegmentClear(rootPart, destination, target, params, startF
         sample = Vector3.new(sample.X, previousY + 6, sample.Z)
         local ground = Workspace:Raycast(sample, Vector3.new(0, -12, 0), params)
         if not ground or ground.Normal.Y < 0.55 or math.abs(ground.Position.Y - previousY) > 2 then return false end
+        if ground.Instance.Name:lower():find("lava", 1, true) and not startFloor.Instance.Name:lower():find("lava", 1, true) then return false end
         previousY = ground.Position.Y
     end
     local endPosition = startPosition + flat + Vector3.new(0, previousY - startFloor.Position.Y, 0)
@@ -420,6 +421,7 @@ local function pathKey(startPosition, endPosition, mode)
 end
 
 local function clearPath()
+    state.terrainRecovery = nil
     state.directTravel = false
     state.pathGeneration = state.pathGeneration + 1
     if state.pathBlockedConn then state.pathBlockedConn:Disconnect() end
@@ -541,17 +543,53 @@ local function chooseFallbackStep(rootPart, goal, target)
         -forward, (forward + Vector3.new(-forward.Z, 0, forward.X)).Unit,
         (forward + Vector3.new(forward.Z, 0, -forward.X)).Unit,
     }
+    local best, bestScore
+    state.fallbackVisits = state.fallbackVisits or {}
+    local now = os.clock()
+    for key, at in pairs(state.fallbackVisits) do if now - at > 15 then state.fallbackVisits[key] = nil end end
     for _, direction in ipairs(directions) do
         local candidate = groundPosition(rootPart.Position + direction * 8, rootPart.Parent, target)
         if walkingSegmentClear(rootPart, candidate, target) then
-            return candidate
+            local key = math.floor(candidate.X / 6) .. ":" .. math.floor(candidate.Z / 6)
+            local score = (candidate - goal).Magnitude + (state.fallbackVisits[key] and 40 or 0)
+            if not bestScore or score < bestScore then best, bestScore = candidate, score end
         end
     end
-    return nil
+    if best then state.fallbackVisits[math.floor(best.X / 6) .. ":" .. math.floor(best.Z / 6)] = now end
+    return best
+end
+
+local function findRecoveryPath(rootPart, goal, target)
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    local start = rootPart.Position
+    local candidates = {}
+    for _, radius in ipairs({ 24, 48, 64 }) do
+        for index = 0, 11 do
+            local angle = index * math.pi / 6
+            local sample = start + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
+            local hit = Workspace:Raycast(sample + Vector3.new(0, 60, 0), Vector3.new(0, -100, 0), params)
+            if hit and hit.Normal.Y > 0.65 and hit.Position.Y > start.Y + 4
+                and not hit.Instance.Name:lower():find("lava", 1, true) then
+                table.insert(candidates, hit.Position + Vector3.new(0, 2.5, 0))
+            end
+        end
+    end
+    table.sort(candidates, function(a, b)
+        return (a - goal).Magnitude < (b - goal).Magnitude
+    end)
+    for index = 1, math.min(6, #candidates) do
+        if state.closed or not state.running or player.Character ~= rootPart.Parent then return nil end
+        local path, waypoints = createPath(start, candidates[index], "terrain-recovery", os.clock())
+        if path then return path, waypoints, candidates[index] end
+    end
 end
 
 local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not goal then return end
+    if state.terrainRecovery and #state.waypoints > 0 then
+        goal, mode = state.terrainRecovery, "terrain-recovery"
+    end
     local newGoal = not state.motionGoal or (state.motionGoal - goal).Magnitude > 2 or state.motionGoalMode ~= mode
     if newGoal then
         state.motionGoal, state.motionGoalMode = goal, mode
@@ -597,7 +635,15 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         local generation = state.pathGeneration
         local startPosition = rootPart.Position
         task.spawn(function()
-        local ok, path, waypoints = pcall(createPath, startPosition, goal, mode, now)
+        local recoveryGoal
+        local ok, path, waypoints = pcall(function()
+            local result, points = createPath(startPosition, goal, mode, now)
+            if not result and goal.Y > rootPart.Position.Y + 6 and now - (state.lastTerrainProbe or -math.huge) > 6 then
+                state.lastTerrainProbe = now
+                result, points, recoveryGoal = findRecoveryPath(rootPart, goal, target)
+            end
+            return result, points
+        end)
         state.pathPending = false
         if not ok then
             warn("[EnemyWalker] path error: " .. tostring(path))
@@ -611,9 +657,11 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         end
         if path and waypoints then
             clearPath()
+            state.terrainRecovery = recoveryGoal
             state.pathObject = path
             state.pathBlocked = false
-            state.pathGoal, state.pathMode = goal, mode
+            state.pathGoal, state.pathMode = recoveryGoal or goal, recoveryGoal and "terrain-recovery" or mode
+            if recoveryGoal then state.motionGoal, state.motionGoalMode = recoveryGoal, "terrain-recovery" end
             state.waypoints = waypoints
             state.currentWaypointIndex = 1
             -- Computation can finish after we have walked beyond its start.
@@ -629,7 +677,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
                 if blockedIndex >= state.currentWaypointIndex then state.pathBlocked = true end
             end)
             visualizeWaypoints(waypoints, state.currentWaypointIndex)
-            state.pathStatus = "Pathfinding: " .. #waypoints .. " waypoints"
+            state.pathStatus = (recoveryGoal and "Recovering to higher ground: " or "Pathfinding: ") .. #waypoints .. " waypoints"
         else
             if #state.waypoints > 0 and not state.pathBlocked then return end
             clearPath()
@@ -644,7 +692,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             end
             if fallback then
                 state.fallbackGoal, state.fallbackUntil = fallback, os.clock() + 1.6
-                state.pathStatus = "Pathfinding: direct clear route"
+                state.pathStatus = "No full path: local recovery step"
             else
                 state.pathStatus = "Pathfinding: blocked, probing alternate step"
             end
@@ -664,6 +712,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         updateWaypointHighlight(state.currentWaypointIndex)
     end
     if not waypoint then
+        state.terrainRecovery = nil
         if #state.waypoints > 0 then clearPath() end
         if (goal - rootPart.Position).Magnitude <= CFG.DIRECT_PATH_DISTANCE
             and walkingSegmentClear(rootPart, goal, target) then
