@@ -52,6 +52,9 @@ local CFG = {
     MELEE_DANGER_DISTANCE = 11,
     RETREAT_RELEASE_MARGIN = 5,
     FARM_POSITION = "Nearest",
+    SMART_FARM = true,
+    GROUP_RADIUS = 6,
+    CLOSE_AOE_RANGE = 8,
 
     SHOW_WAYPOINTS = true,
     WAYPOINT_NODE_SIZE = 0.5,
@@ -898,6 +901,9 @@ local function restoreFacing()
 end
 
 local function faceEnemy(humanoid, rootPart, targetRoot)
+    if CFG.SMART_FARM and state.castAimTarget and os.clock() < (state.castAimUntil or 0) and isValidTarget(state.castAimTarget) then
+        targetRoot = getRootPart(state.castAimTarget)
+    end
     if facingHumanoid ~= humanoid or facingRoot ~= rootPart then
         restoreFacing()
         facingHumanoid, previousAutoRotate = humanoid, humanoid.AutoRotate
@@ -924,10 +930,72 @@ local function faceEnemy(humanoid, rootPart, targetRoot)
     end
 end
 
+local function spellUsable(snapshot, rootPart)
+    if FarmPlanner.profile(snapshot.name) == "self" then
+        for _, enemy in ipairs(state.nearbyEnemies) do
+            if isValidTarget(enemy.model) and (enemy.root.Position - rootPart.Position).Magnitude <= CFG.CLOSE_AOE_RANGE then
+                return true
+            end
+        end
+        return false
+    end
+    return true
+end
+
+local function prepareSpell(_, snapshot)
+    if not CFG.SMART_FARM then return true end
+    local character, humanoid, rootPart = getChar()
+    if not character or not humanoid or not rootPart then return false end
+    if not spellUsable(snapshot, rootPart) then return false end
+    local profile = FarmPlanner.profile(snapshot.name)
+    if profile ~= "splash" then return true end
+    local now = os.clock()
+    local plan = state.farmPlan
+    if not plan or now - plan.at >= 0.2 or not isValidTarget(plan.target) then
+        local candidates = {}
+        for _, model in ipairs(state.cachedTargets) do
+            if isValidTarget(model) then
+                local root = getRootPart(model)
+                local distance = (root.Position - rootPart.Position).Magnitude
+                if distance <= CFG.ATTACK_RANGE then
+                    table.insert(candidates, { model = model, position = root.Position, distance = distance })
+                end
+            end
+        end
+        table.sort(candidates, function(a, b) return a.distance < b.distance end)
+        local visible = {}
+        for _, candidate in ipairs(candidates) do
+            if #visible >= 16 then break end
+            if not hasBlockingRay(rootPart.Position, candidate.position, character, candidate.model) then table.insert(visible, candidate) end
+        end
+        local visibilityCache = {}
+        local best, count = FarmPlanner.select(visible, CFG.GROUP_RADIUS, function(a, b)
+            local cached = visibilityCache[a.model]
+            if cached and cached[b.model] ~= nil then return cached[b.model] end
+            local clear = not hasBlockingRay(a.position, b.position, character, a.model)
+            visibilityCache[a.model], visibilityCache[b.model] = visibilityCache[a.model] or {}, visibilityCache[b.model] or {}
+            visibilityCache[a.model][b.model], visibilityCache[b.model][a.model] = clear, clear
+            return clear
+        end)
+        plan = { at = now, target = best and best.model, count = count }
+        state.farmPlan = plan
+    end
+    local target = plan.target
+    if not isValidTarget(target) then return false end
+    local targetRoot = getRootPart(target)
+    if (targetRoot.Position - rootPart.Position).Magnitude > CFG.ATTACK_RANGE
+        or hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then return false end
+    state.castAimTarget, state.castAimUntil, state.groupCount = target, now + 0.35, plan.count
+    faceEnemy(humanoid, rootPart, targetRoot)
+    local delta = targetRoot.Position - rootPart.Position
+    delta = Vector3.new(delta.X, 0, delta.Z)
+    return delta.Magnitude < 0.1 or rootPart.CFrame.LookVector:Dot(delta.Unit) >= 0.9985
+end
+
 local function castSkill()
     if not CFG.AUTO_ABILITIES then return end
     local now = os.clock()
-    if abilities.TryCast(now, CFG.SKILL_COOLDOWN) then state.lastSkillTime = now end
+    if abilities.TryCast(now, CFG.SKILL_COOLDOWN, prepareSpell) then state.lastSkillTime = now end
 end
 
 local function stopMovement(humanoid, rootPart)
@@ -1061,6 +1129,7 @@ local function controllerTick()
     state.lastPlayerHealth = humanoid.Health
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
+        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.lastThreatPart = nil, nil
         state.status, state.targetName, state.targetDist = "Waiting for wave", "None", 0
@@ -1107,6 +1176,15 @@ local function controllerTick()
     end
     state.navigationPhase = "combat"
     faceEnemy(humanoid, rootPart, targetRoot)
+
+    if CFG.SMART_FARM and CFG.AUTO_ABILITIES and distance >= CFG.COMBAT_MIN_DISTANCE
+        and distance <= CFG.ATTACK_RANGE + 5 and FarmPlanner.coolingDown(abilities.Snapshot(now), function(snapshot)
+            return spellUsable(snapshot, rootPart)
+        end) then
+        state.status = "Holding range during cooldown"
+        stopMovement(humanoid, rootPart)
+        return
+    end
 
     if CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
         state.status = "Attacking " .. target.Name
@@ -1169,6 +1247,7 @@ local function setRunning(running)
     if state.closed or state.running == running then return end
     state.running = running
     if state.running then
+        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
         state.movementBlocked, state.lastSafetyScan, state.lastEscapePlan = false, -math.huge, -math.huge
@@ -1186,6 +1265,7 @@ local function setRunning(running)
         createWaypointFolder()
         state.pathStatus = "Pathfinding: active"
     else
+        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         restoreFacing()
         local _, humanoid, rootPart = getChar()
         if humanoid and rootPart then stopMovement(humanoid, rootPart) end
@@ -1212,6 +1292,7 @@ local function shutdown()
 end
 
 connect(player.CharacterAdded, function()
+    state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
     state.retreating = false
     state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
     state.movementBlocked, state.lastSafetyScan = false, -math.huge

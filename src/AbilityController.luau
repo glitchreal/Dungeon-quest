@@ -36,7 +36,7 @@ function Abilities.new(player, onConfirmed)
             refresh(now)
             return snapshots
         end,
-        TryCast = function(now, interval)
+        TryCast = function(now, interval, prepare)
             refresh(now)
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -49,7 +49,8 @@ function Abilities.new(player, onConfirmed)
                 local tool = slots[slot]
                 local snapshot = snapshots[slot]
                 local pending = tool and requests[tool]
-                if tool and snapshot.cooldown <= 0 and (not pending or now >= pending.retryAt) then
+                if tool and snapshot.cooldown <= 0 and (not pending or now >= pending.retryAt)
+                    and (not prepare or prepare(slot, snapshot)) then
                     local event = tool:FindFirstChild("localEvent")
                     local remote = remotes:FindFirstChild("abilityUsed")
                     if event and event:IsA("BindableEvent") and remote and remote:IsA("RemoteEvent") then

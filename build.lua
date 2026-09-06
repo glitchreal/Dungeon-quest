@@ -24,6 +24,7 @@ for _, route in ipairs({ "lobby", "dungeon" }) do
     if route == "dungeon" then
         table.insert(parts, module("ThreatGeometry", "src/ThreatGeometry.luau"))
         table.insert(parts, module("AbilityController", "src/AbilityController.luau"))
+        table.insert(parts, module("FarmPlanner", "src/FarmPlanner.luau"))
         table.insert(parts, "local function createController()\n" .. read("src/CombatController.luau") .. "\nend\n")
     end
     table.insert(parts, read(route == "lobby" and "src/Lobby.luau" or "src/Dungeon.luau"))

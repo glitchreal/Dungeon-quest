@@ -29,6 +29,7 @@ local C = {
     UpgradeStat = "Spell Power", AutoUpgrade = false,
     FarmPosition = "Nearest", Distance = 20, FarmSpeed = 16, FarmSpeedEnabled = false,
     StartDelay = 0, AutoDungeon = false, AutoAbilities = true, SpamAbilities = false, AutoReplay = false,
+    SmartFarm = true, GroupRadius = 6, CloseAoeRange = 8,
     DynamicDistance = false, AdaptiveSpacing = true, MeleeDistance = 8, Hover = false, HoverHeight = 5,
     AutoDodge = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
     KickOnJoin = false, AllowFriends = true, AllowedPlayers = "",
@@ -320,6 +321,9 @@ toggle(farm, "AutoDungeon", "Auto Dungeon", function(value) if not value then co
 toggle(farm, "AutoAbilities", "Auto Abilities")
 toggle(farm, "SpamAbilities", "Spam Abilities", nil, "Checks ready equipped abilities more often; game cooldowns still apply")
 toggle(farm, "AutoReplay", "Auto Replay Dungeon")
+toggle(farm, "SmartFarm", "Smart Farming", nil, "Aim supported splash spells at compact groups; preserve safety and nearest-enemy movement")
+slider(farm, "GroupRadius", "Grouping Radius", 3, 12)
+slider(farm, "CloseAoeRange", "Close AoE Distance", 4, 16)
 local helper = tabs.Farm:AddRightGroupbox("Helper", "shield")
 toggle(helper, "DynamicDistance", "Dynamic Distance")
 toggle(helper, "AdaptiveSpacing", "Adaptive Safety Spacing", nil, "Adds distance after taking damage and at low health; keeps your configured distance as the baseline")
@@ -338,6 +342,7 @@ label(dodge, "Limits", "3 studs maximum | 1 second cooldown\n2 dodges / 6 studs 
 local combat = tabs.Farm:AddRightGroupbox("Combat Status", "activity")
 label(combat, "CombatTarget", "Target: none")
 label(combat, "CombatHealth", "Target HP: -")
+label(combat, "FarmAim", "Splash group: -")
 label(combat, "AbilityQ", "Q: unequipped")
 label(combat, "AbilityE", "E: unequipped")
 label(combat, "Hazards", "Active attacks: 0")
@@ -642,6 +647,7 @@ local function slowTick(now)
     setLabel("CombatTarget", "Target: " .. (combatState.targetName or "none") .. " | " .. math.floor(combatState.targetDist or 0) .. " studs")
     local targetHumanoid = combatState.currentTarget and combatState.currentTarget:FindFirstChildOfClass("Humanoid")
     setLabel("CombatHealth", targetHumanoid and ("Target HP: " .. math.ceil(targetHumanoid.Health) .. "/" .. math.ceil(targetHumanoid.MaxHealth)) or "Target HP: -")
+    setLabel("FarmAim", C.SmartFarm and ("Last splash aim: " .. (combatState.groupCount or 0) .. " nearby enemies (estimate)") or "Smart farming: off")
     local abilityStatus = controller.AbilityStatus and controller.AbilityStatus() or {}
     for _, slot in ipairs({ "q", "e" }) do
         local ability = abilityStatus[slot]
@@ -712,6 +718,7 @@ connect(RunService.Heartbeat, function(dt)
     cfg.ATTACK_RANGE = math.max(26, distance + 3)
     cfg.FARM_POSITION, cfg.PRECAST_MARGIN = C.FarmPosition, C.SafetyDistance
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime
+    cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
     cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.05 or 0.2
     if C.TargetLine and root and targetRoot and controller.State.running then
         if not line or beamStart.Parent ~= root or beamEnd.Parent ~= targetRoot then

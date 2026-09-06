@@ -291,7 +291,7 @@ function Abilities.new(player, onConfirmed)
             refresh(now)
             return snapshots
         end,
-        TryCast = function(now, interval)
+        TryCast = function(now, interval, prepare)
             refresh(now)
             local character = player.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -304,7 +304,8 @@ function Abilities.new(player, onConfirmed)
                 local tool = slots[slot]
                 local snapshot = snapshots[slot]
                 local pending = tool and requests[tool]
-                if tool and snapshot.cooldown <= 0 and (not pending or now >= pending.retryAt) then
+                if tool and snapshot.cooldown <= 0 and (not pending or now >= pending.retryAt)
+                    and (not prepare or prepare(slot, snapshot)) then
                     local event = tool:FindFirstChild("localEvent")
                     local remote = remotes:FindFirstChild("abilityUsed")
                     if event and event:IsA("BindableEvent") and remote and remote:IsA("RemoteEvent") then
@@ -324,6 +325,51 @@ function Abilities.new(player, onConfirmed)
 end
 
 return Abilities
+
+end)()
+local FarmPlanner = (function()
+local Planner = {}
+
+-- Only confirmed ability types get special handling; unknown spells retain
+-- normal targeting. Grouping radius is a heuristic, not a claimed damage radius.
+function Planner.profile(name)
+    if name == "Fireball" or name == "Blue Fireball" then return "splash" end
+    if name == "Whirlwind" then return "self" end
+    return "target"
+end
+
+function Planner.select(candidates, radius, connected)
+    local best, bestCount, bestSpread = nil, 0, math.huge
+    local radiusSquared = radius * radius
+    for _, candidate in ipairs(candidates) do
+        local count, spread = 1, 0
+        for _, other in ipairs(candidates) do
+            if other ~= candidate then
+                local delta = other.position - candidate.position
+                local squared = delta:Dot(delta)
+                if squared <= radiusSquared and (not connected or connected(candidate, other)) then
+                    count, spread = count + 1, spread + squared
+                end
+            end
+        end
+        if count > bestCount or (count == bestCount and (spread < bestSpread
+            or (spread == bestSpread and (not best or candidate.distance < best.distance)))) then
+            best, bestCount, bestSpread = candidate, count, spread
+        end
+    end
+    return best, bestCount
+end
+
+function Planner.coolingDown(snapshots, usable)
+    local equipped = false
+    for _, snapshot in pairs(snapshots) do
+        equipped = true
+        if snapshot.cooldown <= 0 and (not usable or usable(snapshot)) then return false end
+    end
+    return equipped
+end
+
+return Planner
 
 end)()
 local function createController()
@@ -381,6 +427,9 @@ local CFG = {
     MELEE_DANGER_DISTANCE = 11,
     RETREAT_RELEASE_MARGIN = 5,
     FARM_POSITION = "Nearest",
+    SMART_FARM = true,
+    GROUP_RADIUS = 6,
+    CLOSE_AOE_RANGE = 8,
 
     SHOW_WAYPOINTS = true,
     WAYPOINT_NODE_SIZE = 0.5,
@@ -1227,6 +1276,9 @@ local function restoreFacing()
 end
 
 local function faceEnemy(humanoid, rootPart, targetRoot)
+    if CFG.SMART_FARM and state.castAimTarget and os.clock() < (state.castAimUntil or 0) and isValidTarget(state.castAimTarget) then
+        targetRoot = getRootPart(state.castAimTarget)
+    end
     if facingHumanoid ~= humanoid or facingRoot ~= rootPart then
         restoreFacing()
         facingHumanoid, previousAutoRotate = humanoid, humanoid.AutoRotate
@@ -1253,10 +1305,72 @@ local function faceEnemy(humanoid, rootPart, targetRoot)
     end
 end
 
+local function spellUsable(snapshot, rootPart)
+    if FarmPlanner.profile(snapshot.name) == "self" then
+        for _, enemy in ipairs(state.nearbyEnemies) do
+            if isValidTarget(enemy.model) and (enemy.root.Position - rootPart.Position).Magnitude <= CFG.CLOSE_AOE_RANGE then
+                return true
+            end
+        end
+        return false
+    end
+    return true
+end
+
+local function prepareSpell(_, snapshot)
+    if not CFG.SMART_FARM then return true end
+    local character, humanoid, rootPart = getChar()
+    if not character or not humanoid or not rootPart then return false end
+    if not spellUsable(snapshot, rootPart) then return false end
+    local profile = FarmPlanner.profile(snapshot.name)
+    if profile ~= "splash" then return true end
+    local now = os.clock()
+    local plan = state.farmPlan
+    if not plan or now - plan.at >= 0.2 or not isValidTarget(plan.target) then
+        local candidates = {}
+        for _, model in ipairs(state.cachedTargets) do
+            if isValidTarget(model) then
+                local root = getRootPart(model)
+                local distance = (root.Position - rootPart.Position).Magnitude
+                if distance <= CFG.ATTACK_RANGE then
+                    table.insert(candidates, { model = model, position = root.Position, distance = distance })
+                end
+            end
+        end
+        table.sort(candidates, function(a, b) return a.distance < b.distance end)
+        local visible = {}
+        for _, candidate in ipairs(candidates) do
+            if #visible >= 16 then break end
+            if not hasBlockingRay(rootPart.Position, candidate.position, character, candidate.model) then table.insert(visible, candidate) end
+        end
+        local visibilityCache = {}
+        local best, count = FarmPlanner.select(visible, CFG.GROUP_RADIUS, function(a, b)
+            local cached = visibilityCache[a.model]
+            if cached and cached[b.model] ~= nil then return cached[b.model] end
+            local clear = not hasBlockingRay(a.position, b.position, character, a.model)
+            visibilityCache[a.model], visibilityCache[b.model] = visibilityCache[a.model] or {}, visibilityCache[b.model] or {}
+            visibilityCache[a.model][b.model], visibilityCache[b.model][a.model] = clear, clear
+            return clear
+        end)
+        plan = { at = now, target = best and best.model, count = count }
+        state.farmPlan = plan
+    end
+    local target = plan.target
+    if not isValidTarget(target) then return false end
+    local targetRoot = getRootPart(target)
+    if (targetRoot.Position - rootPart.Position).Magnitude > CFG.ATTACK_RANGE
+        or hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then return false end
+    state.castAimTarget, state.castAimUntil, state.groupCount = target, now + 0.35, plan.count
+    faceEnemy(humanoid, rootPart, targetRoot)
+    local delta = targetRoot.Position - rootPart.Position
+    delta = Vector3.new(delta.X, 0, delta.Z)
+    return delta.Magnitude < 0.1 or rootPart.CFrame.LookVector:Dot(delta.Unit) >= 0.9985
+end
+
 local function castSkill()
     if not CFG.AUTO_ABILITIES then return end
     local now = os.clock()
-    if abilities.TryCast(now, CFG.SKILL_COOLDOWN) then state.lastSkillTime = now end
+    if abilities.TryCast(now, CFG.SKILL_COOLDOWN, prepareSpell) then state.lastSkillTime = now end
 end
 
 local function stopMovement(humanoid, rootPart)
@@ -1390,6 +1504,7 @@ local function controllerTick()
     state.lastPlayerHealth = humanoid.Health
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
+        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.lastThreatPart = nil, nil
         state.status, state.targetName, state.targetDist = "Waiting for wave", "None", 0
@@ -1436,6 +1551,15 @@ local function controllerTick()
     end
     state.navigationPhase = "combat"
     faceEnemy(humanoid, rootPart, targetRoot)
+
+    if CFG.SMART_FARM and CFG.AUTO_ABILITIES and distance >= CFG.COMBAT_MIN_DISTANCE
+        and distance <= CFG.ATTACK_RANGE + 5 and FarmPlanner.coolingDown(abilities.Snapshot(now), function(snapshot)
+            return spellUsable(snapshot, rootPart)
+        end) then
+        state.status = "Holding range during cooldown"
+        stopMovement(humanoid, rootPart)
+        return
+    end
 
     if CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
         state.status = "Attacking " .. target.Name
@@ -1498,6 +1622,7 @@ local function setRunning(running)
     if state.closed or state.running == running then return end
     state.running = running
     if state.running then
+        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
         state.movementBlocked, state.lastSafetyScan, state.lastEscapePlan = false, -math.huge, -math.huge
@@ -1515,6 +1640,7 @@ local function setRunning(running)
         createWaypointFolder()
         state.pathStatus = "Pathfinding: active"
     else
+        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         restoreFacing()
         local _, humanoid, rootPart = getChar()
         if humanoid and rootPart then stopMovement(humanoid, rootPart) end
@@ -1541,6 +1667,7 @@ local function shutdown()
 end
 
 connect(player.CharacterAdded, function()
+    state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
     state.retreating = false
     state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
     state.movementBlocked, state.lastSafetyScan = false, -math.huge
@@ -1616,6 +1743,7 @@ local C = {
     UpgradeStat = "Spell Power", AutoUpgrade = false,
     FarmPosition = "Nearest", Distance = 20, FarmSpeed = 16, FarmSpeedEnabled = false,
     StartDelay = 0, AutoDungeon = false, AutoAbilities = true, SpamAbilities = false, AutoReplay = false,
+    SmartFarm = true, GroupRadius = 6, CloseAoeRange = 8,
     DynamicDistance = false, AdaptiveSpacing = true, MeleeDistance = 8, Hover = false, HoverHeight = 5,
     AutoDodge = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
     KickOnJoin = false, AllowFriends = true, AllowedPlayers = "",
@@ -1907,6 +2035,9 @@ toggle(farm, "AutoDungeon", "Auto Dungeon", function(value) if not value then co
 toggle(farm, "AutoAbilities", "Auto Abilities")
 toggle(farm, "SpamAbilities", "Spam Abilities", nil, "Checks ready equipped abilities more often; game cooldowns still apply")
 toggle(farm, "AutoReplay", "Auto Replay Dungeon")
+toggle(farm, "SmartFarm", "Smart Farming", nil, "Aim supported splash spells at compact groups; preserve safety and nearest-enemy movement")
+slider(farm, "GroupRadius", "Grouping Radius", 3, 12)
+slider(farm, "CloseAoeRange", "Close AoE Distance", 4, 16)
 local helper = tabs.Farm:AddRightGroupbox("Helper", "shield")
 toggle(helper, "DynamicDistance", "Dynamic Distance")
 toggle(helper, "AdaptiveSpacing", "Adaptive Safety Spacing", nil, "Adds distance after taking damage and at low health; keeps your configured distance as the baseline")
@@ -1925,6 +2056,7 @@ label(dodge, "Limits", "3 studs maximum | 1 second cooldown\n2 dodges / 6 studs 
 local combat = tabs.Farm:AddRightGroupbox("Combat Status", "activity")
 label(combat, "CombatTarget", "Target: none")
 label(combat, "CombatHealth", "Target HP: -")
+label(combat, "FarmAim", "Splash group: -")
 label(combat, "AbilityQ", "Q: unequipped")
 label(combat, "AbilityE", "E: unequipped")
 label(combat, "Hazards", "Active attacks: 0")
@@ -2229,6 +2361,7 @@ local function slowTick(now)
     setLabel("CombatTarget", "Target: " .. (combatState.targetName or "none") .. " | " .. math.floor(combatState.targetDist or 0) .. " studs")
     local targetHumanoid = combatState.currentTarget and combatState.currentTarget:FindFirstChildOfClass("Humanoid")
     setLabel("CombatHealth", targetHumanoid and ("Target HP: " .. math.ceil(targetHumanoid.Health) .. "/" .. math.ceil(targetHumanoid.MaxHealth)) or "Target HP: -")
+    setLabel("FarmAim", C.SmartFarm and ("Last splash aim: " .. (combatState.groupCount or 0) .. " nearby enemies (estimate)") or "Smart farming: off")
     local abilityStatus = controller.AbilityStatus and controller.AbilityStatus() or {}
     for _, slot in ipairs({ "q", "e" }) do
         local ability = abilityStatus[slot]
@@ -2299,6 +2432,7 @@ connect(RunService.Heartbeat, function(dt)
     cfg.ATTACK_RANGE = math.max(26, distance + 3)
     cfg.FARM_POSITION, cfg.PRECAST_MARGIN = C.FarmPosition, C.SafetyDistance
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime
+    cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
     cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.05 or 0.2
     if C.TargetLine and root and targetRoot and controller.State.running then
         if not line or beamStart.Parent ~= root or beamEnd.Parent ~= targetRoot then

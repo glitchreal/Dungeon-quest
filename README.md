@@ -90,6 +90,18 @@ studs at low health; the larger buffer applies, rather than stacking both. It is
 enabled by default and can be disabled to keep exactly the configured spacing.
 Dynamic distance reads the currently equipped weapon, including mid-run changes.
 
+Smart Farming is enabled by default. For Fireball and Blue Fireball, it scores
+compact visible groups and temporarily aims at the best group member without
+changing the nearest enemy used for movement. It waits for the character to face
+that aim point before casting. Whirlwind is reserved for enemies within Close
+AoE Distance. Unknown abilities retain their normal targeting.
+
+During cooldowns, the bot holds a safe useful range instead of needlessly closing
+the gap; threat avoidance still takes priority. Grouping Radius and Close AoE
+Distance are adjustable estimates, not verified server damage radii. The group
+count in Combat Status estimates potential coverage and is not a confirmed hit
+counter. Smart Farming can be disabled to restore ordinary targeting.
+
 Automation, movement overrides, hover, and logging are off by default. Auto
 Dungeon enables combat; Auto Create Lobby and Auto Start Dungeon enable queueing.
 With `autoloadconfig = true`, existing settings are retained when reloading or
@@ -108,6 +120,7 @@ entry point; `src/Lobby.luau` and `src/Dungeon.luau` contain place-specific logi
 interfaces are in `src/ObsidianHub.luau`, `src/GameAdapter.luau`, and
 `src/HubLogic.luau`. Ready-slot casting is in `src/AbilityController.luau`, and
 collision/trajectory calculations are in `src/ThreatGeometry.luau`.
+`src/FarmPlanner.luau` contains group scoring and cooldown-farming policy.
 
 After changing source, rebuild and commit the generated scripts with it:
 
