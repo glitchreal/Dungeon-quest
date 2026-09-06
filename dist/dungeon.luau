@@ -571,7 +571,9 @@ local function trackInstance(instance)
     end
     if instance:IsA("BasePart") then
         local now = os.clock()
-        if not instance.CanCollide and (not state.waypointFolder or not instance:IsDescendantOf(state.waypointFolder)) then
+        local fullName = instance:GetFullName():lower()
+        local combatHitbox = fullName:find("hitbox", 1, true) or fullName:find("shot", 1, true)
+        if (not instance.CanCollide or combatHitbox) and (not state.waypointFolder or not instance:IsDescendantOf(state.waypointFolder)) then
             threatParts[instance] = { createdAt = now, lastPosition = instance.Position, lastAt = now }
         end
     end
@@ -1248,11 +1250,14 @@ local function refreshSafety(rootPart, now)
                 local velocity = part.AssemblyLinearVelocity
                 if velocity.Magnitude < 1 then velocity = (part.Position - sample.lastPosition) / elapsed end
                 local projectile = (name:find("projectile") or name:find("missile") or name:find("shot")) and velocity.Magnitude > 1
-                local named = part.Transparency < 0.95 and (name:find("hitbox") or name:find("precast") or name:find("telegraph") or name:find("warning") or name:find("danger") or name:find("attack"))
+                local named = name:find("hitbox", 1, true) or name:find("precast", 1, true) or name:find("telegraph", 1, true)
+                    or name:find("warning", 1, true) or name:find("danger", 1, true) or name:find("attack", 1, true)
                 local attributed = part:GetAttribute("Attack") == true or part:GetAttribute("Hitbox") == true or part:GetAttribute("Damage") ~= nil
                 local precast = part.Parent == Workspace and part.Anchored and not part.CanCollide
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
-                if not name:find("safespot") and (projectile or named or attributed or precast) then
+                local structuralHazard = (name:find("hitbox", 1, true) or name:find("shot", 1, true) or name:find("danger", 1, true))
+                    and not name:find("safespot", 1, true)
+                if structuralHazard or projectile or named or attributed or precast then
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
                     sample.zone = { frame = part.CFrame, size = part.Size, shape = shape,
                         velocity = velocity, lookahead = CFG.PROJECTILE_LOOKAHEAD, id = part }
