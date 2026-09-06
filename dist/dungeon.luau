@@ -442,7 +442,7 @@ local CFG = {
 
     STUCK_CHECK_INTERVAL = 0.35,
     STUCK_MOVE_THRESHOLD = 0.45,
-    STUCK_TIMEOUT = 1.4,
+    STUCK_TIMEOUT = 0.75,
     FAILED_PATH_COOLDOWN = 2.5,
     TARGET_SCAN_INTERVAL = 0.25,
     DODGE_COOLDOWN = 1,
@@ -913,6 +913,8 @@ local function issueMove(humanoid, position, mode, now)
                 humanoid:MoveTo(root.Position)
                 state.motionMode = "safety-hold"
                 state.movementBlocked = true
+                state.blockedByHazard = true
+                state.lastEscapePlan = -math.huge
                 state.safetyUntil = math.max(state.safetyUntil, now + 0.3)
                 state.lastMoveToCall = 0
                 return
@@ -928,6 +930,7 @@ local function issueMove(humanoid, position, mode, now)
             if not safeEnemyStep(root.Position, step) then
                 humanoid:MoveTo(root.Position)
                 state.motionMode, state.movementBlocked = "safety-hold", true
+                state.lastEscapePlan = -math.huge
                 state.lastMoveToCall = 0
                 return
             end
@@ -1514,6 +1517,10 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if clearance < 0 then state.retreating = true
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
+    if state.blockedByHazard then
+        state.escapeGoal = nil
+        state.lastEscapePlan = -math.huge
+    end
     if state.escapeGoal and now < (state.escapeUntil or 0) then
         if now - (state.lastEscapeCheck or 0) >= 0.2 then
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
@@ -1531,7 +1538,8 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         end
     end
     state.escapeGoal = nil
-    if risk == 0 and not state.retreating and not contactThreat and crowd >= crowdLimit and not state.movementBlocked then
+    if risk == 0 and not state.retreating and not contactThreat and crowd >= crowdLimit
+        and not state.movementBlocked and not state.blockedByHazard then
         if now < state.safetyUntil then
             state.status = "Holding safe position"
             stopMovement(humanoid, rootPart)
@@ -1550,7 +1558,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if now - state.lastEscapePlan < 0.05 then return true end
     state.lastEscapePlan = now
     local goal = findEscapeGoal(rootPart, targetRoot)
-    state.movementBlocked = false
+    state.movementBlocked, state.blockedByHazard = false, false
     if not goal then
         state.status = "Waiting for safe escape route"
         stopMovement(humanoid, rootPart)
