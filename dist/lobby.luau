@@ -274,6 +274,7 @@ local C = {
     FarmPosition = "Nearest", Distance = 20, FarmSpeed = 16, FarmSpeedEnabled = false,
     StartDelay = 0, AutoDungeon = false, AutoAbilities = true, SpamAbilities = false, AutoReplay = false,
     SmartFarm = true, GroupRadius = 6, CloseAoeRange = 8,
+    SpellRange = 26,
     DynamicDistance = false, AdaptiveSpacing = true, MeleeDistance = 8, Hover = false, HoverHeight = 5,
     AutoDodge = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
     KickOnJoin = false, AllowFriends = true, AllowedPlayers = "",
@@ -568,6 +569,7 @@ toggle(farm, "AutoReplay", "Auto Replay Dungeon")
 toggle(farm, "SmartFarm", "Smart Farming", nil, "Aim supported splash spells at compact groups; preserve safety and nearest-enemy movement")
 slider(farm, "GroupRadius", "Grouping Radius", 3, 12)
 slider(farm, "CloseAoeRange", "Close AoE Distance", 4, 16)
+slider(farm, "SpellRange", "Spell Range", 8, 100, 0, nil)
 local helper = tabs.Farm:AddRightGroupbox("Helper", "shield")
 toggle(helper, "DynamicDistance", "Dynamic Distance")
 toggle(helper, "AdaptiveSpacing", "Adaptive Safety Spacing", nil, "Adds distance after taking damage and at low health; keeps your configured distance as the baseline")
@@ -969,6 +971,7 @@ connect(RunService.Heartbeat, function(dt)
     cfg.HAZARD_MARGIN = math.max(6, C.SafetyDistance + 3)
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime
     cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
+    cfg.SPELL_RANGE_OVERRIDE = C.SpellRange
     cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.35 or 0.2
     if C.TargetLine and root and targetRoot and controller.State.running then
         if not line or beamStart.Parent ~= root or beamEnd.Parent ~= targetRoot then

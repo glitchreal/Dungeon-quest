@@ -106,6 +106,9 @@ hazards or escape movement. Hover is suppressed during active hazards so its
 vertical force cannot interfere with a dodge.
 The client does not expose exact ranges for every spell: the status readout marks
 missing ranges as estimated, and grouping/close-AoE sliders supply fallbacks.
+Spell Range is the fallback/override for moves without a verified range; metadata
+still wins when the game provides a positive range. It is adjustable from 8 to
+100 studs and does not increase server reach by itself.
 
 During cooldowns, the bot holds a safe useful range instead of needlessly closing
 the gap; threat avoidance still takes priority. Grouping Radius and Close AoE

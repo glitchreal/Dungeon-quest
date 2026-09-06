@@ -56,6 +56,7 @@ local CFG = {
     SMART_FARM = true,
     GROUP_RADIUS = 6,
     CLOSE_AOE_RANGE = 8,
+    SPELL_RANGE_OVERRIDE = 0,
 
     SHOW_WAYPOINTS = true,
     WAYPOINT_NODE_SIZE = 0.5,
@@ -1014,7 +1015,7 @@ local function spellUsable(snapshot, rootPart)
         end
         return false
     end
-    if profile.range and state.targetDist > profile.range then return false end
+    if state.targetDist > (profile.range or CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or CFG.ATTACK_RANGE) then return false end
     return true
 end
 
@@ -1024,7 +1025,7 @@ local function prepareSpell(_, snapshot)
     if not character or not humanoid or not rootPart then return false end
     if not spellUsable(snapshot, rootPart) then return false end
     local profile = FarmPlanner.profile(snapshot)
-    if profile.range and profile.mode == "target" and state.targetDist > profile.range then return false end
+    if profile.mode == "target" and state.targetDist > (profile.range or CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or CFG.ATTACK_RANGE) then return false end
     if profile.mode ~= "splash" then return true end
     local range, radius = profile.range or CFG.ATTACK_RANGE, profile.radius or CFG.GROUP_RADIUS
     local now = os.clock()
