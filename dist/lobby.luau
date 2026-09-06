@@ -584,7 +584,7 @@ toggle(helper, "KickOnJoin", "Kick On Player Join", nil, "Disconnects your own a
 toggle(helper, "AllowFriends", "Allow Friends")
 input(helper, "AllowedPlayers", "Allow Players", false)
 local dodge = tabs.Farm:AddRightGroupbox("Teleport Limits", "move-horizontal")
-label(dodge, "Limits", "4 studs maximum | 0.35 second cooldown\n4 dodges / 12 studs per 3 seconds")
+label(dodge, "Limits", "2 studs maximum | 0.5 second cooldown\n3 dodges / 6 studs per 3 seconds")
 local combat = tabs.Farm:AddRightGroupbox("Combat Status", "activity")
 label(combat, "CombatTarget", "Target: none")
 label(combat, "CombatHealth", "Target HP: -")
@@ -963,6 +963,14 @@ connect(RunService.Heartbeat, function(dt)
         local damage = controller.State.lastDamage
         local damageBuffer = damage and now - damage.at < 5 and 3 or 0
         distance = distance + math.max(healthBuffer, damageBuffer)
+    end
+    if C.SmartFarm and controller.AbilityStatus then
+        for _, snapshot in pairs(controller.AbilityStatus()) do
+            local profile = controller.AbilityProfile(snapshot)
+            if profile.mode == "target" or profile.mode == "splash" then
+                distance = math.min(distance, math.max(1, (profile.range or C.SpellRange) - 3))
+            end
+        end
     end
     cfg.COMBAT_DISTANCE = math.max(1, distance)
     cfg.COMBAT_MIN_DISTANCE, cfg.COMBAT_MAX_DISTANCE = math.max(0, distance - 3), distance + 3

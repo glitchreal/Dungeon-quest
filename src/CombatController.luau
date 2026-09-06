@@ -504,9 +504,11 @@ local function issueMove(humanoid, position, mode, now)
             local delta = position - root.Position
             local nextPosition = delta.Magnitude > 12 and root.Position + delta.Unit * 12 or position
             if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.HAZARD_MARGIN) then
-                -- Keep the existing walking command while the next safe goal is
-                -- calculated; MoveTo(root.Position) causes visible stop-start lag.
+                humanoid:MoveTo(root.Position)
+                state.motionMode = "safety-hold"
                 state.movementBlocked = true
+                state.blockedByHazard = true
+                state.lastMoveToCall = 0
                 return
             end
         end
@@ -833,8 +835,8 @@ local function refreshSafety(rootPart, now)
             local playerBody = model and Players:GetPlayerFromCharacter(model)
             if not playerBody and distance < CFG.THREAT_RADIUS + part.Size.Magnitude then
                 local name = part:GetFullName():lower()
-                local damageContainer = name:find("damageparts", 1, true) or name:find("hitboxes", 1, true)
-                    or name:find("hazards", 1, true) or name:find("telegraphs", 1, true)
+                local damageContainer = part.Transparency < 0.95 and (name:find("damageparts", 1, true)
+                    or name:find("hitboxes", 1, true) or name:find("hazards", 1, true) or name:find("telegraphs", 1, true))
                 local elapsed = math.max(0.001, now - sample.lastAt)
                 local velocity = part.AssemblyLinearVelocity
                 if velocity.Magnitude < 1 then velocity = (part.Position - sample.lastPosition) / elapsed end
@@ -872,21 +874,20 @@ local function findEscapeGoal(rootPart, targetRoot)
     params.RespectCanCollide = true
     local floor = Workspace:Raycast(rootPart.Position, Vector3.new(0, -10, 0), params)
     if not floor then return nil end
-    local best, bestScore = nil, -math.huge
+    local candidates = {}
     local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     local originalCrowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
-    local radii = originalRisk > 0 and { 40, 32, 24, 16, 10, 5 } or { 14, 8, 3 }
-    local angleSteps = originalRisk > 0 and 32 or 16
+    local radii = originalRisk > 0 and { 5, 10, 18, 28, 40 } or { 3, 8, 14 }
+    local angleSteps = 16
     for _, radius in ipairs(radii) do
         for i = 0, angleSteps - 1 do
             local angle = i * math.pi * 2 / angleSteps
             local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
-            if safeEnemyStep(rootPart.Position, candidate)
-                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN) then
+            do
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                 local crowd = crowdDistance(candidate)
-                local hazardClearance = math.huge
+                local hazardClearance = 12
                 for _, activeZone in ipairs(state.activeZones) do
                     hazardClearance = math.min(hazardClearance, ThreatGeometry.clearance(activeZone, candidate, CFG.HAZARD_MARGIN))
                 end
@@ -894,20 +895,24 @@ local function findEscapeGoal(rootPart, targetRoot)
                     and ((originalCrowd >= crowdLimit and not state.retreating) or crowd > originalCrowd + 0.25) then
                     local targetDistance = (candidate - targetRoot.Position).Magnitude
                     local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
-                    local score = hazardClearance * 20 + math.min(crowd, 28) * 2
-                    if originalRisk == 0 then
-                        score = score - math.abs(targetDistance - desiredDistance) * 0.1
-                    else
-                        score = score + radius * 0.5
-                    end
-                    if score > bestScore and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
-                        best, bestScore = candidate, score
-                    end
+                    local score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
+                        - radius * 2 - math.abs(targetDistance - desiredDistance)
+                        - math.max(0, targetDistance - CFG.ATTACK_RANGE) * 4
+                    table.insert(candidates, { position = candidate, score = score })
                 end
             end
         end
     end
-    return best
+    table.sort(candidates, function(a, b) return a.score > b.score end)
+    for i = 1, math.min(16, #candidates) do
+        local candidate = candidates[i].position
+        if safeEnemyStep(rootPart.Position, candidate)
+            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
+            and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
+            return candidate
+        end
+    end
+    return nil
 end
 
 local function findEmergencySideStep(rootPart, target)
@@ -1167,9 +1172,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             issueMove(humanoid, separation, "evade", now)
             return true
         end
-        state.status = "Breaking melee contact"
-        humanoid:MoveTo(rootPart.Position)
-        return true
+        -- A blocked backward step still permits a lateral escape search.
     end
     if state.blockedByHazard then
         state.escapeGoal = nil
@@ -1332,15 +1335,6 @@ local function controllerTick()
     state.navigationPhase = "combat"
     faceEnemy(humanoid, rootPart, targetRoot)
 
-    if CFG.SMART_FARM and CFG.AUTO_ABILITIES and distance >= CFG.COMBAT_MIN_DISTANCE
-        and distance <= CFG.ATTACK_RANGE + 5 and FarmPlanner.coolingDown(abilities.Snapshot(now), function(snapshot)
-            return spellUsable(snapshot, rootPart)
-        end) then
-        state.status = "Holding range during cooldown"
-        stopMovement(humanoid, rootPart)
-        return
-    end
-
     if CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
         state.status = "Attacking " .. target.Name
         -- Keep a small combat orbit while casting so a target in range does not
@@ -1348,7 +1342,8 @@ local function controllerTick()
         local offset = rootPart.Position - targetRoot.Position
         local flat = Vector3.new(offset.X, 0, offset.Z)
         if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
-        local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+        local tangent = Vector3.new(-flat.Z, 0, flat.X).Unit * state.dodgeSide * 4
+        local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE + tangent, character, target)
         if (desiredPosition - rootPart.Position).Magnitude > 1 then
             followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
         end

@@ -55,7 +55,7 @@ teleporting. Right Shift toggles the menu.
 
 Eligibility uses the real game level and owned keys, including higher-level
 content. Cosmetic spoofing does not change eligibility. Teleport dodges are capped
-at 3 studs, one second apart, and two dodges/six studs per rolling three seconds.
+at 2 studs, half a second apart, and three dodges/six studs per rolling three seconds.
 Those same shared limits also apply to emergency dodges from incoming regular
 enemies; a visible attack marker is no longer required for close melee danger.
 Retreat stays active until predicted separation clears an additional five-stud
