@@ -847,8 +847,11 @@ local function refreshSafety(rootPart, now)
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
                 if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer) then
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
+                    local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+                    local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
                     sample.zone = { frame = part.CFrame, size = part.Size, shape = shape,
-                        velocity = velocity, lookahead = CFG.PROJECTILE_LOOKAHEAD, id = part }
+                        velocity = velocity, moving = not projectile and moving,
+                        lookahead = projectile and CFG.PROJECTILE_LOOKAHEAD or 0.5, id = part }
                     sample.lastActive = now
                     table.insert(zones, sample.zone)
                 elseif sample.zone and now - (sample.lastActive or 0) < 0.35 then

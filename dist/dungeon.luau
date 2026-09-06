@@ -212,16 +212,25 @@ end
 function Geometry.clearance(zone, position, margin)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
+    if zone.moving and zone.shape == "Block" then
+        -- Enclose the observed translation, including generic moving precasts
+        -- whose instance names do not identify them as projectiles.
+        local travel = zone.frame:VectorToObjectSpace(zone.velocity) * zone.lookahead
+        point = point - travel * 0.5
+        half = half + Vector3.new(math.abs(travel.X), math.abs(travel.Y), math.abs(travel.Z)) * 0.5
+    end
     if zone.shape == "Cylinder" then
-        return math.max(math.abs(point.X) - half.X - 4,
-            Vector2.new(point.Y, point.Z).Magnitude - math.max(half.Y, half.Z) - margin)
+        local height = math.abs(point.X) - half.X - 4
+        if height > 0 then return height end
+        return Vector2.new(point.Y, point.Z).Magnitude - math.max(half.Y, half.Z) - margin
     end
     if zone.shape == "Projectile" then
         return Geometry.segmentDistance(position, zone.frame.Position, zone.frame.Position + zone.velocity * zone.lookahead)
             - math.max(half.X, half.Y, half.Z) - margin
     end
-    return math.max(math.abs(point.X) - half.X - margin,
-        math.abs(point.Y) - half.Y - 4, math.abs(point.Z) - half.Z - margin)
+    local height = math.abs(point.Y) - half.Y - 4
+    if height > 0 then return height end
+    return math.max(math.abs(point.X) - half.X - margin, math.abs(point.Z) - half.Z - margin)
 end
 
 function Geometry.risk(zones, position, margin)
@@ -1268,8 +1277,11 @@ local function refreshSafety(rootPart, now)
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
                 if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer) then
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
+                    local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+                    local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
                     sample.zone = { frame = part.CFrame, size = part.Size, shape = shape,
-                        velocity = velocity, lookahead = CFG.PROJECTILE_LOOKAHEAD, id = part }
+                        velocity = velocity, moving = not projectile and moving,
+                        lookahead = projectile and CFG.PROJECTILE_LOOKAHEAD or 0.5, id = part }
                     sample.lastActive = now
                     table.insert(zones, sample.zone)
                 elseif sample.zone and now - (sample.lastActive or 0) < 0.35 then
