@@ -1138,6 +1138,23 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         end
         return
     end
+    -- Pathfinding often emits dense nodes around corners. Once the immediate
+    -- segment is clear, aim farther ahead so MoveTo does not look like tiny
+    -- stop-start steps at every node.
+    local lookaheadIndex = state.currentWaypointIndex
+    for candidateIndex = state.currentWaypointIndex + 1, math.min(#state.waypoints, state.currentWaypointIndex + 3) do
+        local candidate = state.waypoints[candidateIndex]
+        if hasBlockingRay(rootPart.Position + Vector3.new(0, 2, 0), candidate.Position + Vector3.new(0, 2, 0), rootPart.Parent, target)
+            or not walkingSegmentClear(rootPart, candidate.Position, target) then
+            break
+        end
+        lookaheadIndex = candidateIndex
+    end
+    if lookaheadIndex > state.currentWaypointIndex then
+        state.currentWaypointIndex = lookaheadIndex
+        waypoint = state.waypoints[lookaheadIndex]
+        updateWaypointHighlight(lookaheadIndex)
+    end
     if hasBlockingRay(rootPart.Position + Vector3.new(0, 2, 0), waypoint.Position + Vector3.new(0, 2, 0), rootPart.Parent, target) then
         -- A path can become stale or can thread a child part that the navmesh
         -- did not include. Reject that segment before MoveTo pins the player
