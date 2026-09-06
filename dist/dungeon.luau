@@ -1294,12 +1294,20 @@ local function findEscapeGoal(rootPart, targetRoot)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN) then
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                 local crowd = crowdDistance(candidate)
+                local hazardClearance = math.huge
+                for _, activeZone in ipairs(state.activeZones) do
+                    hazardClearance = math.min(hazardClearance, ThreatGeometry.clearance(activeZone, candidate, CFG.HAZARD_MARGIN))
+                end
                 if (originalRisk == 0 or risk < originalRisk - 0.1)
                     and ((originalCrowd >= crowdLimit and not state.retreating) or crowd > originalCrowd + 0.25) then
                     local targetDistance = (candidate - targetRoot.Position).Magnitude
                     local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
-                    local score = -risk * 100 + math.min(crowd, 28) * 2 - math.abs(targetDistance - desiredDistance) * 0.1
-                        + (state.retreating and radius * 0.2 or -radius * 0.05)
+                    local score = hazardClearance * 20 + math.min(crowd, 28) * 2
+                    if originalRisk == 0 then
+                        score = score - math.abs(targetDistance - desiredDistance) * 0.1
+                    else
+                        score = score + radius * 0.5
+                    end
                     if score > bestScore and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
                         best, bestScore = candidate, score
                     end
