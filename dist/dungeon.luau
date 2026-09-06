@@ -1762,7 +1762,15 @@ local function controllerTick()
 
     if CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
         state.status = "Attacking " .. target.Name
-        stopMovement(humanoid, rootPart)
+        -- Keep a small combat orbit while casting so a target in range does not
+        -- turn the character into a stationary hitbox.
+        local offset = rootPart.Position - targetRoot.Position
+        local flat = Vector3.new(offset.X, 0, offset.Z)
+        if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
+        local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+        if (desiredPosition - rootPart.Position).Magnitude > 1 then
+            followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
+        end
         castSkill()
         return
     end
