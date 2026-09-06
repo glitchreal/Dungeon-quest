@@ -36,11 +36,11 @@ local CFG = {
     STUCK_TIMEOUT = 0.75,
     FAILED_PATH_COOLDOWN = 2.5,
     TARGET_SCAN_INTERVAL = 0.25,
-    DODGE_COOLDOWN = 1,
-    DODGE_LATERAL_DISTANCE = 3,
+    DODGE_COOLDOWN = 0.35,
+    DODGE_LATERAL_DISTANCE = 4,
     DODGE_WINDOW = 3,
-    DODGE_MAX_PER_WINDOW = 2,
-    DODGE_DISTANCE_BUDGET = 6,
+    DODGE_MAX_PER_WINDOW = 4,
+    DODGE_DISTANCE_BUDGET = 12,
     DODGE_SAME_THREAT_COOLDOWN = 3,
     THREAT_RADIUS = 90,
     PROJECTILE_LOOKAHEAD = 1.35,
@@ -941,6 +941,11 @@ local function canTeleportDodge(now, distance, threat)
     return spent + distance <= CFG.DODGE_DISTANCE_BUDGET + 0.001
 end
 
+local function effectiveSpellRange(profile)
+    -- Positive game metadata is authoritative; the UI value fills only unknown ranges.
+    return profile.range or (CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE) or CFG.ATTACK_RANGE
+end
+
 local function performDodgeTeleport(humanoid, rootPart, destination, target, threat, now)
     if not destination or humanoid.FloorMaterial == Enum.Material.Air then return false end
     local delta = destination - rootPart.Position
@@ -1025,7 +1030,7 @@ local function spellUsable(snapshot, rootPart)
         end
         return false
     end
-    if state.targetDist > (profile.range or CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or CFG.ATTACK_RANGE) then return false end
+    if state.targetDist > effectiveSpellRange(profile) then return false end
     return true
 end
 
@@ -1035,7 +1040,7 @@ local function prepareSpell(_, snapshot)
     if not character or not humanoid or not rootPart then return false end
     if not spellUsable(snapshot, rootPart) then return false end
     local profile = FarmPlanner.profile(snapshot)
-    if profile.mode == "target" and state.targetDist > (profile.range or CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or CFG.ATTACK_RANGE) then return false end
+    if profile.mode == "target" and state.targetDist > effectiveSpellRange(profile) then return false end
     if profile.mode ~= "splash" then return true end
     local range, radius = profile.range or CFG.ATTACK_RANGE, profile.radius or CFG.GROUP_RADIUS
     local now = os.clock()
