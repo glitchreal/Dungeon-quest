@@ -877,9 +877,11 @@ local function findEscapeGoal(rootPart, targetRoot)
     local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     local originalCrowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
-    for _, radius in ipairs({ 14, 8, 3 }) do
-        for i = 0, 15 do
-            local angle = i * math.pi / 8
+    local radii = originalRisk > 0 and { 40, 32, 24, 16, 10, 5 } or { 14, 8, 3 }
+    local angleSteps = originalRisk > 0 and 32 or 16
+    for _, radius in ipairs(radii) do
+        for i = 0, angleSteps - 1 do
+            local angle = i * math.pi * 2 / angleSteps
             local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
             if safeEnemyStep(rootPart.Position, candidate)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN) then
