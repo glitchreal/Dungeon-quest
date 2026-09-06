@@ -49,6 +49,7 @@ local CFG = {
     THREAT_MAX_AGE = 2,
     AUTO_ABILITIES = true,
     AUTO_DODGE = true,
+    TELEPORT_DODGE = false,
     REACTION_TIME = 0.05,
     MELEE_DANGER_DISTANCE = 11,
     RETREAT_RELEASE_MARGIN = 5,
@@ -503,13 +504,9 @@ local function issueMove(humanoid, position, mode, now)
             local delta = position - root.Position
             local nextPosition = delta.Magnitude > 12 and root.Position + delta.Unit * 12 or position
             if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.HAZARD_MARGIN) then
-                humanoid:MoveTo(root.Position)
-                state.motionMode = "safety-hold"
+                -- Keep the existing walking command while the next safe goal is
+                -- calculated; MoveTo(root.Position) causes visible stop-start lag.
                 state.movementBlocked = true
-                state.blockedByHazard = true
-                state.lastEscapePlan = -math.huge
-                state.safetyUntil = math.max(state.safetyUntil, now + 0.3)
-                state.lastMoveToCall = 0
                 return
             end
         end
@@ -1042,7 +1039,7 @@ local function prepareSpell(_, snapshot)
     local profile = FarmPlanner.profile(snapshot)
     if profile.mode == "target" and state.targetDist > effectiveSpellRange(profile) then return false end
     if profile.mode ~= "splash" then return true end
-    local range, radius = profile.range or CFG.ATTACK_RANGE, profile.radius or CFG.GROUP_RADIUS
+    local range, radius = effectiveSpellRange(profile), profile.radius or CFG.GROUP_RADIUS
     local now = os.clock()
     local plan = state.farmPlan
     if not plan or plan.spell ~= snapshot.name or plan.range ~= range or plan.radius ~= radius
@@ -1090,8 +1087,6 @@ end
 local function castSkill()
     if not CFG.AUTO_ABILITIES then return end
     local now = os.clock()
-    if CFG.AUTO_DODGE and (#state.activeZones > 0 or state.motionMode == "evade"
-        or state.motionMode == "safety-hold" or state.motionMode == "hazard-escape") then return end
     if abilities.TryCast(now, CFG.SKILL_COOLDOWN, prepareSpell) then state.lastSkillTime = now end
 end
 
@@ -1126,7 +1121,7 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now)
     if delta.Magnitude < 0.5 then return end
     local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
     if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return end
-    performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
+    if CFG.TELEPORT_DODGE then performDodgeTeleport(humanoid, rootPart, step, target, threat, now) end
 end
 
 local function forceSeparationGoal(rootPart, targetRoot, target)
@@ -1207,7 +1202,6 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if zone then
         state.observedThreats[zone.id] = state.observedThreats[zone.id] or now
         if now - state.observedThreats[zone.id] < CFG.REACTION_TIME then
-            stopMovement(humanoid, rootPart)
             state.status = "Reacting to attack"
             return true
         end
@@ -1248,6 +1242,7 @@ local function controllerTick()
     end
 
     local now = os.clock()
+    CFG.ATTACK_RANGE = CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or 26
     if CFG.SMART_FARM then
         local snapshots = abilities.Snapshot(now)
         for _, snapshot in pairs(snapshots) do

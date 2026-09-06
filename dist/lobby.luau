@@ -966,7 +966,6 @@ connect(RunService.Heartbeat, function(dt)
     end
     cfg.COMBAT_DISTANCE = math.max(1, distance)
     cfg.COMBAT_MIN_DISTANCE, cfg.COMBAT_MAX_DISTANCE = math.max(0, distance - 3), distance + 3
-    cfg.ATTACK_RANGE = math.max(26, distance + 3)
     cfg.FARM_POSITION, cfg.PRECAST_MARGIN = C.FarmPosition, C.SafetyDistance
     cfg.HAZARD_MARGIN = math.max(6, C.SafetyDistance + 3)
     cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime

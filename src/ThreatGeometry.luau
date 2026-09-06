@@ -36,13 +36,25 @@ end
 
 function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
     local steps = math.max(1, math.ceil((endPosition - startPosition).Magnitude * 2))
-    for _, zone in ipairs(zones) do
-        local previous = Geometry.clearance(zone, startPosition, margin)
-        for i = 1, steps do
-            local clearance = Geometry.clearance(zone, startPosition:Lerp(endPosition, i / steps), margin)
-            if clearance < math.min(0, previous) - 0.02 then return false end
-            previous = clearance
+    local initial = {}
+    local previousRisk = 0
+    for index, zone in ipairs(zones) do
+        local clearance = Geometry.clearance(zone, startPosition, margin)
+        initial[index] = clearance
+        if clearance < 0 then previousRisk = previousRisk + 1 + clearance * clearance end
+    end
+    -- Overlapping telegraphs can require moving toward one edge while escaping
+    -- the others. Reject new hazards, but judge existing overlaps together.
+    for i = 1, steps do
+        local position = startPosition:Lerp(endPosition, i / steps)
+        local risk = 0
+        for index, zone in ipairs(zones) do
+            local clearance = Geometry.clearance(zone, position, margin)
+            if initial[index] >= 0 and clearance < -0.02 then return false end
+            if clearance < 0 then risk = risk + 1 + clearance * clearance end
         end
+        if risk > previousRisk + 0.02 then return false end
+        previousRisk = risk
     end
     return true
 end
