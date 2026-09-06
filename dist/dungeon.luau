@@ -632,6 +632,29 @@ pcall(function()
     table.insert(connections, connection)
 end)
 
+pcall(function()
+    local storage = game:GetService("ReplicatedStorage")
+    local remotes = storage:FindFirstChild("remotes")
+    local remote = remotes and remotes:FindFirstChild("aquaticBossSpecficEvents")
+    local templates = storage:FindFirstChild("enemyProjectiles")
+    local template = templates and templates:FindFirstChild("firstBossLaserPrecast")
+    local marker = template and template:FindFirstChild("precast")
+    local syncModule = storage:FindFirstChild("timeSync")
+    if not remote or not marker or not template.PrimaryPart or not syncModule then return end
+    local timeSync = require(syncModule)
+    local offset = template.PrimaryPart.CFrame:ToObjectSpace(marker.CFrame)
+    local size = marker.Size
+    connect(remote.OnClientEvent, function(action, data)
+        if state.closed or action ~= "first boss laser shot" or type(data) ~= "table"
+            or type(data[2]) ~= "number" or typeof(data[3]) ~= "CFrame" then return end
+        local remaining = data[2] - timeSync:GetTime()
+        if remaining < 0 or remaining > 30 then return end
+        table.insert(announcedZones, { frame = data[3] * offset, size = size, shape = "Block",
+            expires = os.clock() + remaining + 0.2, id = {} })
+        state.lastSafetyScan = -math.huge
+    end)
+end)
+
 local function getChar()
     local character = player.Character
     if not character then return nil, nil, nil end
@@ -1273,7 +1296,9 @@ local function refreshSafety(rootPart, now)
                 local projectile = (name:find("projectile") or name:find("missile") or name:find("shot")) and velocity.Magnitude > 1
                 local named = part.Transparency < 0.95 and (name:find("hitbox") or name:find("precast") or name:find("telegraph") or name:find("warning") or name:find("danger") or name:find("attack"))
                 local attributed = part:GetAttribute("Attack") == true or part:GetAttribute("Hitbox") == true or part:GetAttribute("Damage") ~= nil
-                local precast = part.Parent == Workspace and part.Anchored and not part.CanCollide
+                local floorMarker = part:IsA("Part") and ((part.Shape == Enum.PartType.Block and part.Size.Y <= 4)
+                    or (part.Shape == Enum.PartType.Cylinder and part.Size.X <= 4))
+                local precast = floorMarker and part.Parent == Workspace and part.Anchored and not part.CanCollide
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
                 if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer) then
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
