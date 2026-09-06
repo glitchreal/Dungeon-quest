@@ -16,8 +16,9 @@ if not route then
     return
 end
 
-if env.DQObsidianLoading then return end
+if env.DQObsidianLoading and env.DQObsidianLoaderJob == game.JobId then return end
 env.DQObsidianLoading = true
+env.DQObsidianLoaderJob = game.JobId
 env.DQObsidianLoaderURL = ROOT .. "main.luau"
 local ok, err = pcall(function()
     local source = game:HttpGet(ROOT .. "dist/" .. route .. ".luau")
@@ -26,6 +27,7 @@ local ok, err = pcall(function()
     entry()
 end)
 env.DQObsidianLoading = nil
+env.DQObsidianLoaderJob = nil
 if not ok then
     warn("[DungeonQuest] Could not load " .. route .. ": " .. tostring(err))
 end
