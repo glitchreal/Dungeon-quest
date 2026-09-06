@@ -833,6 +833,8 @@ local function refreshSafety(rootPart, now)
             local playerBody = model and Players:GetPlayerFromCharacter(model)
             if not playerBody and distance < CFG.THREAT_RADIUS + part.Size.Magnitude then
                 local name = part:GetFullName():lower()
+                local damageContainer = name:find("damageparts", 1, true) or name:find("hitboxes", 1, true)
+                    or name:find("hazards", 1, true) or name:find("telegraphs", 1, true)
                 local elapsed = math.max(0.001, now - sample.lastAt)
                 local velocity = part.AssemblyLinearVelocity
                 if velocity.Magnitude < 1 then velocity = (part.Position - sample.lastPosition) / elapsed end
@@ -841,7 +843,7 @@ local function refreshSafety(rootPart, now)
                 local attributed = part:GetAttribute("Attack") == true or part:GetAttribute("Hitbox") == true or part:GetAttribute("Damage") ~= nil
                 local precast = part.Parent == Workspace and part.Anchored and not part.CanCollide
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
-                if not name:find("safespot") and (projectile or named or attributed or precast) then
+                if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer) then
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
                     sample.zone = { frame = part.CFrame, size = part.Size, shape = shape,
                         velocity = velocity, lookahead = CFG.PROJECTILE_LOOKAHEAD, id = part }
