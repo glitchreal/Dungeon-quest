@@ -89,6 +89,10 @@ Adaptive Safety Spacing adds three studs briefly after a hit and up to eight
 studs at low health; the larger buffer applies, rather than stacking both. It is
 enabled by default and can be disabled to keep exactly the configured spacing.
 Dynamic distance reads the currently equipped weapon, including mid-run changes.
+Recognized ranged ability descriptions override a physical weapon's melee
+distance: physical scaling does not imply a close-range spell. Adaptive spacing
+also adds up to eight studs for faster pursuers and nearby crowd pressure.
+Faster pursuers trigger melee-dodge consideration earlier, under the same limits.
 
 Smart Farming is enabled by default and profiles equipped moves from tool
 attributes, value fields, ability types, and inventory descriptions. It handles

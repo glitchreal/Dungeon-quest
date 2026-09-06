@@ -369,7 +369,10 @@ function Planner.profile(snapshot)
     elseif shape == "self" or description:find("around you", 1, true) or description:find("around yourself", 1, true) then mode = "self"
     elseif shape == "splash" or shape == "area" or radius or description:find("explod", 1, true)
         or description:find("nearby enemies", 1, true) then mode = "splash" end
-    return { mode = mode, range = range, radius = radius, verifiedRange = range ~= nil }
+    local ranged = mode == "splash" or description:find("shoot", 1, true) ~= nil
+        or description:find("throw", 1, true) ~= nil or description:find("projectile", 1, true) ~= nil
+        or shape == "projectile" or shape == "ranged"
+    return { mode = mode, range = range, radius = radius, verifiedRange = range ~= nil, ranged = ranged }
 end
 
 function Planner.select(candidates, radius, connected)
@@ -1482,7 +1485,10 @@ local function meleeThreat(rootPart)
             local offset = rootPart.Position - enemy.root.Position
             local closing = offset.Magnitude > 0.01 and enemy.velocity:Dot(offset.Unit) or 0
             local limit = math.max(CFG.MELEE_DANGER_DISTANCE, math.min(18, math.max(enemy.root.Size.X, enemy.root.Size.Z) * 0.5 + 6))
-            if distance < closest and (distance <= limit or distance - math.max(0, closing) * 0.25 <= limit) then
+            local humanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
+            local speedDeficit = math.max(0, closing - (humanoid and humanoid.WalkSpeed or 16))
+            local warningDistance = math.min(6, speedDeficit * 0.5)
+            if distance < closest and (distance <= limit + warningDistance or distance - math.max(0, closing) * 0.25 <= limit) then
                 threat, closest = enemy.model, distance
             end
         end
@@ -2537,7 +2543,13 @@ connect(RunService.Heartbeat, function(dt)
                 break
             end
         end
-        distance = melee and C.MeleeDistance or C.Standoff
+        local rangedAbility = false
+        if C.AutoAbilities and controller.AbilityStatus and controller.AbilityProfile then
+            for _, snapshot in pairs(controller.AbilityStatus()) do
+                if controller.AbilityProfile(snapshot).ranged then rangedAbility = true; break end
+            end
+        end
+        distance = melee and not rangedAbility and C.MeleeDistance or C.Standoff
     end
     if C.AdaptiveSpacing and humanoid and humanoid.Health > 0 and humanoid.MaxHealth > 0 then
         local missing = 1 - humanoid.Health / humanoid.MaxHealth
@@ -2545,6 +2557,16 @@ connect(RunService.Heartbeat, function(dt)
         local damage = controller.State.lastDamage
         local damageBuffer = damage and now - damage.at < 5 and 3 or 0
         distance = distance + math.max(healthBuffer, damageBuffer)
+        local fastest, count = 0, 0
+        for _, enemy in ipairs(controller.State.nearbyEnemies or {}) do
+            if enemy.root.Parent then
+                fastest = math.max(fastest, enemy.velocity.Magnitude)
+                count = count + 1
+            end
+        end
+        local pressure = math.min(8, math.max(0, fastest - humanoid.WalkSpeed) * 0.75 + math.max(0, count - 2))
+        distance = distance + pressure
+        controller.State.pressureBuffer = pressure
     end
     cfg.COMBAT_DISTANCE = math.max(1, distance)
     cfg.COMBAT_MIN_DISTANCE, cfg.COMBAT_MAX_DISTANCE = math.max(0, distance - 3), distance + 3

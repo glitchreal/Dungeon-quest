@@ -1073,7 +1073,10 @@ local function meleeThreat(rootPart)
             local offset = rootPart.Position - enemy.root.Position
             local closing = offset.Magnitude > 0.01 and enemy.velocity:Dot(offset.Unit) or 0
             local limit = math.max(CFG.MELEE_DANGER_DISTANCE, math.min(18, math.max(enemy.root.Size.X, enemy.root.Size.Z) * 0.5 + 6))
-            if distance < closest and (distance <= limit or distance - math.max(0, closing) * 0.25 <= limit) then
+            local humanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
+            local speedDeficit = math.max(0, closing - (humanoid and humanoid.WalkSpeed or 16))
+            local warningDistance = math.min(6, speedDeficit * 0.5)
+            if distance < closest and (distance <= limit + warningDistance or distance - math.max(0, closing) * 0.25 <= limit) then
                 threat, closest = enemy.model, distance
             end
         end

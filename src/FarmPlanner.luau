@@ -20,7 +20,10 @@ function Planner.profile(snapshot)
     elseif shape == "self" or description:find("around you", 1, true) or description:find("around yourself", 1, true) then mode = "self"
     elseif shape == "splash" or shape == "area" or radius or description:find("explod", 1, true)
         or description:find("nearby enemies", 1, true) then mode = "splash" end
-    return { mode = mode, range = range, radius = radius, verifiedRange = range ~= nil }
+    local ranged = mode == "splash" or description:find("shoot", 1, true) ~= nil
+        or description:find("throw", 1, true) ~= nil or description:find("projectile", 1, true) ~= nil
+        or shape == "projectile" or shape == "ranged"
+    return { mode = mode, range = range, radius = radius, verifiedRange = range ~= nil, ranged = ranged }
 end
 
 function Planner.select(candidates, radius, connected)
