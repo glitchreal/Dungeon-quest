@@ -656,6 +656,23 @@ pcall(function()
     local offset = template.PrimaryPart.CFrame:ToObjectSpace(marker.CFrame)
     local size = marker.Size
     connect(remote.OnClientEvent, function(action, data)
+        if not state.closed and type(data) == "table"
+            and (action == "first boss moving orb" or action == "last boss moving orb") then
+            local orb = templates:FindFirstChild(action == "first boss moving orb" and "firstBossMoveOrb" or "finalBossOrbShot")
+            if not orb or not orb:IsA("BasePart") or typeof(data[1]) ~= "CFrame"
+                or type(data[2]) ~= "number" or type(data[3]) ~= "number"
+                or type(data[4]) ~= "number" or type(data[5]) ~= "number" or data[5] <= 0 then return end
+            local serverNow, now = timeSync:GetTime(), os.clock()
+            local remaining = data[3] - serverNow
+            if remaining < 0 or remaining > 30 then return end
+            table.insert(announcedZones, { frame = data[1], origin = data[1], size = orb.Size,
+                shape = "Projectile", velocity = data[1].LookVector * (data[4] / data[5]),
+                starts = now + data[2] - serverNow, duration = data[5],
+                travel = data[1].LookVector * data[4], lookahead = CFG.PROJECTILE_LOOKAHEAD,
+                expires = now + remaining + 0.2, id = {}, name = action })
+            state.lastSafetyScan = -math.huge
+            return
+        end
         if state.closed or action ~= "first boss laser shot" or type(data) ~= "table"
             or type(data[2]) ~= "number" or typeof(data[3]) ~= "CFrame" then return end
         local remaining = data[2] - timeSync:GetTime()
@@ -1281,6 +1298,10 @@ local function refreshSafety(rootPart, now)
     state.nearbyEnemies = enemies
     for i = #announcedZones, 1, -1 do
         local zone = announcedZones[i]
+        if zone.origin then
+            zone.frame = zone.origin + zone.travel * math.clamp((now - zone.starts) / zone.duration, 0, 1)
+            zone.lookahead = math.min(CFG.PROJECTILE_LOOKAHEAD, math.max(0, zone.starts + zone.duration - now))
+        end
         if zone.expires < now then table.remove(announcedZones, i)
         elseif (zone.frame.Position - rootPart.Position).Magnitude <= CFG.THREAT_RADIUS + zone.size.Magnitude then
             table.insert(zones, zone)
