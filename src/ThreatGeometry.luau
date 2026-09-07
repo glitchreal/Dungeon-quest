@@ -10,6 +10,14 @@ end
 function Geometry.clearance(zone, position, margin)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
+    if zone.shape == "ProtectorSmash" then
+        local height = math.abs(point.Y) - half.Y - 4
+        if height > 0 then return height end
+        local forward = -point.Z
+        local width = zone.startWidth * 0.5 + math.clamp(forward + 5, 0, zone.travelDistance) * 0.5
+        return math.max(math.abs(point.X) - width - margin,
+            -forward - 5 - margin, forward - zone.travelDistance - 5 - margin)
+    end
     if zone.moving and zone.shape == "Block" then
         -- Enclose the observed translation, including generic moving precasts
         -- whose instance names do not identify them as projectiles.

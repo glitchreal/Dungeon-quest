@@ -212,6 +212,14 @@ end
 function Geometry.clearance(zone, position, margin)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
+    if zone.shape == "ProtectorSmash" then
+        local height = math.abs(point.Y) - half.Y - 4
+        if height > 0 then return height end
+        local forward = -point.Z
+        local width = zone.startWidth * 0.5 + math.clamp(forward + 5, 0, zone.travelDistance) * 0.5
+        return math.max(math.abs(point.X) - width - margin,
+            -forward - 5 - margin, forward - zone.travelDistance - 5 - margin)
+    end
     if zone.moving and zone.shape == "Block" then
         -- Enclose the observed translation, including generic moving precasts
         -- whose instance names do not identify them as projectiles.
@@ -656,6 +664,12 @@ pcall(function()
     local offset = template.PrimaryPart.CFrame:ToObjectSpace(marker.CFrame)
     local size = marker.Size
     connect(remote.OnClientEvent, function(action, data)
+        if not state.closed and action == "second boss show damage parts" then
+            state.lastSafetyScan = -math.huge
+            state.escapeGoal = nil
+            state.lastEscapePlan = -math.huge
+            return
+        end
         if not state.closed and type(data) == "table"
             and (action == "first boss moving orb" or action == "last boss moving orb") then
             local orb = templates:FindFirstChild(action == "first boss moving orb" and "firstBossMoveOrb" or "finalBossOrbShot")
@@ -1203,7 +1217,16 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             and walkingSegmentClear(rootPart, goal, target) then
             issueMove(humanoid, goal, mode, now)
         else
-            humanoid:MoveTo(rootPart.Position)
+            if now - (state.lastPendingStep or -math.huge) >= 0.2 then
+                state.lastPendingStep = now
+                local fallback = chooseFallbackStep(rootPart, goal, target)
+                if fallback then
+                    state.fallbackGoal, state.fallbackUntil = fallback, now + 0.6
+                    issueMove(humanoid, fallback, mode, now)
+                else
+                    humanoid:MoveTo(rootPart.Position)
+                end
+            end
         end
         return
     end
@@ -1276,6 +1299,14 @@ local function refreshSafety(rootPart, now)
     if now - state.lastSafetyScan < 0.1 then return end
     state.lastSafetyScan = now
     local zones, enemies = {}, {}
+    -- These sections are created with the map and activated much later. They
+    -- must remain discoverable after the transient effect index has aged out.
+    local protectorFloor = Workspace:FindFirstChild("secondBossDamageParts")
+    if protectorFloor then
+        for _, part in ipairs(protectorFloor:GetChildren()) do
+            if part:IsA("BasePart") and not threatParts[part] then trackInstance(part) end
+        end
+    end
     for _, model in ipairs(state.cachedTargets) do
         if isValidTarget(model) then
             local root = getRootPart(model)
@@ -1320,6 +1351,10 @@ local function refreshSafety(rootPart, now)
             local playerBody = model and Players:GetPlayerFromCharacter(model)
             if not playerBody and distance < CFG.THREAT_RADIUS + part.Size.Magnitude then
                 local name = part:GetFullName():lower()
+                local smashBox = part.Name == "precast" and part.Size.Y == 1 and part.Size.Z == 10
+                    and part.Size.X >= 10 and part.Size.X <= 150 and part.Parent:FindFirstChild("hitBox")
+                local protectorSmash = smashBox and smashBox:IsA("BasePart") and smashBox.Size.Y == 150
+                    and smashBox.Size.X == part.Size.X and smashBox.Size.Z == 10
                 local damageContainer = part.Transparency < 0.95 and (name:find("damageparts", 1, true)
                     or name:find("hitboxes", 1, true) or name:find("hazards", 1, true) or name:find("telegraphs", 1, true))
                 local elapsed = math.max(0.001, now - sample.lastAt)
@@ -1332,13 +1367,18 @@ local function refreshSafety(rootPart, now)
                     or (part.Shape == Enum.PartType.Cylinder and part.Size.X <= 4))
                 local precast = floorMarker and part.Parent == Workspace and part.Anchored and not part.CanCollide
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
-                if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer) then
+                if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer or protectorSmash) then
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
                     local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
                     local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
                     sample.zone = { frame = part.CFrame, size = part.Size, shape = shape,
                         velocity = velocity, moving = not projectile and moving,
                         lookahead = projectile and CFG.PROJECTILE_LOOKAHEAD or 0.5, id = part }
+                    if protectorSmash then
+                        local travel = 150 - part.Size.X
+                        sample.zone = { frame = smashBox.CFrame, size = Vector3.new(150, 150, travel * 2 + 10),
+                            shape = "ProtectorSmash", startWidth = part.Size.X, travelDistance = travel, id = part }
+                    end
                     sample.lastActive = now
                     table.insert(zones, sample.zone)
                 elseif sample.zone and now - (sample.lastActive or 0) < 0.35 then
@@ -1366,6 +1406,28 @@ local function findEscapeGoal(rootPart, targetRoot)
     if not floor then return nil end
     local candidates = {}
     local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
+    if targetRoot.Parent.Name == "Ancient Temple Protector" and originalRisk > 0 then
+        local right = targetRoot.CFrame.RightVector
+        right = Vector3.new(right.X, 0, right.Z)
+        if right.Magnitude > 0.01 then
+            right = right.Unit
+            local relative = rootPart.Position - targetRoot.Position
+            local side = relative:Dot(right) >= 0 and 1 or -1
+            -- Leave the smash laterally before following the rear combat goal.
+            -- Prefer the side we already occupy to avoid crossing the boss.
+            for _, radius in ipairs({ 5, 10, 18, 28, 40 }) do
+                for _, direction in ipairs({ side, -side }) do
+                    local candidate = rootPart.Position + right * radius * direction
+                    if ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN) < originalRisk - 0.1
+                        and safeEnemyStep(rootPart.Position, candidate)
+                        and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
+                        and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
+                        return candidate
+                    end
+                end
+            end
+        end
+    end
     local originalCrowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     local radii = originalRisk > 0 and { 5, 10, 18, 28, 40 } or { 3, 8, 14 }
@@ -1847,7 +1909,8 @@ local function controllerTick()
     state.navigationPhase = "combat"
     faceEnemy(humanoid, rootPart, targetRoot)
 
-    if CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
+    local protectorRear = target.Name == "Ancient Temple Protector"
+    if not protectorRear and CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
         state.status = "Attacking " .. target.Name
         -- Keep a small combat orbit while casting so a target in range does not
         -- turn the character into a stationary hitbox.
@@ -1865,12 +1928,25 @@ local function controllerTick()
 
     local offset = rootPart.Position - targetRoot.Position
     local flat = Vector3.new(offset.X, 0, offset.Z)
-    if CFG.FARM_POSITION == "Behind" then flat = -targetRoot.CFrame.LookVector
+    if protectorRear or CFG.FARM_POSITION == "Behind" then flat = -targetRoot.CFrame.LookVector
     elseif CFG.FARM_POSITION == "Front" then flat = targetRoot.CFrame.LookVector
     elseif CFG.FARM_POSITION == "Left" then flat = -targetRoot.CFrame.RightVector
     elseif CFG.FARM_POSITION == "Right" then flat = targetRoot.CFrame.RightVector end
     flat = Vector3.new(flat.X, 0, flat.Z)
     if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
+    if protectorRear then
+        local radial = Vector3.new(offset.X, 0, offset.Z)
+        if radial.Magnitude > 0.1 then
+            radial = radial.Unit
+            local rear = flat.Unit
+            local angle = math.acos(math.clamp(radial:Dot(rear), -1, 1))
+            if angle > math.pi / 6 then
+                local cross = radial:Cross(rear).Y
+                local direction = cross >= 0 and 1 or -1
+                flat = CFrame.fromAxisAngle(Vector3.yAxis, direction * math.pi / 6):VectorToWorldSpace(radial)
+            end
+        end
+    end
     local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
     if (Vector3.new(desiredPosition.X - rootPart.Position.X, 0, desiredPosition.Z - rootPart.Position.Z)).Magnitude < 2 then
         stopMovement(humanoid, rootPart)
