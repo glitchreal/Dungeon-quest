@@ -50,8 +50,6 @@ local CFG = {
     AUTO_ABILITIES = true,
     AUTO_DODGE = true,
     TELEPORT_DODGE = true,
-    PROTECTOR_REPOSITION_DISTANCE = 180,
-    PROTECTOR_REPOSITION_COOLDOWN = 2,
     REACTION_TIME = 0.05,
     MELEE_DANGER_DISTANCE = 11,
     RETREAT_RELEASE_MARGIN = 5,
@@ -958,27 +956,39 @@ local function findEscapeGoal(rootPart, targetRoot)
     local floor = Workspace:Raycast(rootPart.Position, Vector3.new(0, -10, 0), params)
     if not floor then return nil end
     local candidates = {}
-    local originalRisk, incomingZone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
-    if targetRoot.Parent.Name == "Ancient Temple Protector" and originalRisk > 0 then
-        local attackFrame = incomingZone and incomingZone.shape == "ProtectorSmash" and incomingZone.frame or targetRoot.CFrame
-        local right = attackFrame.RightVector
-        right = Vector3.new(right.X, 0, right.Z)
-        if right.Magnitude > 0.01 then
-            right = right.Unit
-            local relative = rootPart.Position - attackFrame.Position
-            local side = relative:Dot(right) >= 0 and 1 or -1
-            -- Leave the smash laterally before following the rear combat goal.
-            -- Prefer the side we already occupy to avoid crossing the boss.
-            for _, radius in ipairs({ 5, 10, 18, 28, 40 }) do
-                for _, direction in ipairs({ side, -side }) do
-                    local candidate = rootPart.Position + right * radius * direction
-                    if ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN) < originalRisk - 0.1
-                        and safeEnemyStep(rootPart.Position, candidate)
-                        and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
-                        and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
-                        return candidate
+    local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
+    if targetRoot.Parent.Name == "Ancient Temple Protector" then
+        local toward = targetRoot.Position - rootPart.Position
+        toward = Vector3.new(toward.X, 0, toward.Z)
+        local originalDistance = toward.Magnitude
+        if originalDistance > 0.1 then
+            toward = toward.Unit
+            local lateral = Vector3.new(-toward.Z, 0, toward.X)
+            local best, bestScore, bestSide
+            for _, radius in ipairs({ 5, 10, 18 }) do
+                for _, angle in ipairs({ math.pi / 6, math.pi / 3, math.pi * 0.47 }) do
+                    for _, side in ipairs({ state.protectorOrbitSide or 1, -(state.protectorOrbitSide or 1) }) do
+                        local candidate = rootPart.Position + (toward * math.cos(angle) + lateral * math.sin(angle) * side) * radius
+                        local offset = candidate - targetRoot.Position
+                        local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
+                        local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                        local progress = originalDistance - distance
+                        local score = -risk * 1000 + progress * 10 - radius
+                            + (side == state.protectorOrbitSide and 1 or 0)
+                        if distance >= CFG.COMBAT_MIN_DISTANCE and progress >= 0
+                            and (originalRisk == 0 and risk == 0 or risk < originalRisk - 0.1)
+                            and (not bestScore or score > bestScore)
+                            and safeEnemyStep(rootPart.Position, candidate)
+                            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
+                            and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
+                            best, bestScore, bestSide = candidate, score, side
+                        end
                     end
                 end
+            end
+            if best then
+                state.protectorOrbitSide = bestSide
+                return best
             end
         end
     end
@@ -1279,66 +1289,12 @@ local function forceSeparationGoal(rootPart, targetRoot, target)
     return nil
 end
 
-local function repositionBehindProtector(humanoid, rootPart, target, targetRoot, now)
-    if target.Name ~= "Ancient Temple Protector" or not CFG.TELEPORT_DODGE
-        or now - (state.lastProtectorReposition or -math.huge) < CFG.PROTECTOR_REPOSITION_COOLDOWN then return false end
-    local incoming
-    for _, zone in ipairs(state.activeZones) do
-        if zone.shape == "ProtectorSmash"
-            and ThreatGeometry.clearance(zone, rootPart.Position, CFG.HAZARD_MARGIN) < 0 then
-            incoming = zone
-            break
-        end
-    end
-    if not incoming then return false end
-    local rear = -targetRoot.CFrame.LookVector
-    rear = Vector3.new(rear.X, 0, rear.Z).Unit
-    local right = Vector3.new(-rear.Z, 0, rear.X)
-    local distance = math.max(16, math.min(CFG.COMBAT_DISTANCE, CFG.ATTACK_RANGE - 3))
-    local params = buildRaycastParams(rootPart.Parent, target)
-    params.RespectCanCollide = true
-    local overlap = OverlapParams.new()
-    overlap.FilterType = Enum.RaycastFilterType.Exclude
-    overlap.FilterDescendantsInstances = params.FilterDescendantsInstances
-    overlap.RespectCanCollide = true
-    for _, lateral in ipairs({ 0, 8, -8, 16, -16 }) do
-        local desired = targetRoot.Position + rear * distance + right * lateral
-        local ground = Workspace:Raycast(desired + Vector3.new(0, 10, 0), Vector3.new(0, -60, 0), params)
-        if ground and ground.Normal.Y >= 0.65 and not ground.Instance.Name:lower():find("lava", 1, true) then
-            local destination = ground.Position + Vector3.new(0, humanoid.HipHeight + rootPart.Size.Y * 0.5, 0)
-            local delta = destination - rootPart.Position
-            if delta.Magnitude > 2 and delta.Magnitude <= CFG.PROTECTOR_REPOSITION_DISTANCE
-                and math.abs(delta.Y) <= 8
-                and ThreatGeometry.risk(state.activeZones, destination, CFG.HAZARD_MARGIN) == 0
-                and enemyClearance(destination) >= 0
-                and not hasBlockingRay(rootPart.Position, destination, rootPart.Parent, target)
-                and #Workspace:GetPartBoundsInBox(CFrame.new(destination), Vector3.new(4, 4, 4), overlap) == 0 then
-                -- This boss-specific teleport intentionally skips the attack's
-                -- swept path. Its landing and solid obstacles remain checked.
-                clearPath()
-                rootPart.CFrame = CFrame.lookAt(destination, Vector3.new(targetRoot.Position.X, destination.Y, targetRoot.Position.Z))
-                rootPart.AssemblyLinearVelocity = Vector3.zero
-                humanoid:MoveTo(destination)
-                state.lastProtectorReposition = now
-                state.protectorReposition = { at = now, distance = delta.Magnitude, destination = destination }
-                state.dodgeCount = state.dodgeCount + 1
-                state.motionGoal, state.fallbackGoal, state.escapeGoal = nil, nil, nil
-                state.movementBlocked, state.blockedByHazard, state.retreating = false, false, false
-                state.motionMode, state.status = "dodge", "Repositioned behind Protector"
-                state.lastPosition, state.stuckStartTime = destination, 0
-                return true
-            end
-        end
-    end
-    return false
-end
 
 local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if not CFG.AUTO_DODGE then
         state.escapeGoal, state.lastThreatPart, state.movementBlocked, state.retreating = nil, nil, false, false
         return false
     end
-    if repositionBehindProtector(humanoid, rootPart, target, targetRoot, now) then return true end
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     state.lastThreatPart = zone and zone.id
     local crowd = crowdDistance(rootPart.Position)
@@ -1565,13 +1521,8 @@ local function controllerTick()
         local radial = Vector3.new(offset.X, 0, offset.Z)
         if radial.Magnitude > 0.1 then
             radial = radial.Unit
-            local rear = flat.Unit
-            local angle = math.acos(math.clamp(radial:Dot(rear), -1, 1))
-            if angle > math.pi / 6 then
-                local cross = radial:Cross(rear).Y
-                local direction = cross >= 0 and 1 or -1
-                flat = CFrame.fromAxisAngle(Vector3.yAxis, direction * math.pi / 6):VectorToWorldSpace(radial)
-            end
+            state.protectorOrbitSide = state.protectorOrbitSide or 1
+            flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi / 6):VectorToWorldSpace(radial)
         end
     end
     local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
@@ -1580,7 +1531,8 @@ local function controllerTick()
         if distance <= CFG.ATTACK_RANGE then castSkill() end
         return
     end
-    state.status = distance > CFG.COMBAT_MAX_DISTANCE and "Moving to " .. target.Name or "Creating space from " .. target.Name
+    state.status = protectorRear and "Circling Protector in spell range"
+        or (distance > CFG.COMBAT_MAX_DISTANCE and "Moving to " .. target.Name or "Creating space from " .. target.Name)
     followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
     updateProgress(humanoid, rootPart, desiredPosition, target, now)
     if distance <= CFG.ATTACK_RANGE then castSkill() end
@@ -1700,6 +1652,7 @@ local function watchHealth(character)
 end
 
 connect(player.CharacterAdded, function(character)
+    state.protectorOrbitSide = nil
     state.threatReactionAt = nil
     state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
     state.retreating = false

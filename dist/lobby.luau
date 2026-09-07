@@ -584,7 +584,7 @@ toggle(helper, "KickOnJoin", "Kick On Player Join", nil, "Disconnects your own a
 toggle(helper, "AllowFriends", "Allow Friends")
 input(helper, "AllowedPlayers", "Allow Players", false)
 local dodge = tabs.Farm:AddRightGroupbox("Teleport Limits", "move-horizontal")
-label(dodge, "Limits", "Normal: 2 studs | 3 dodges / 3 seconds\nProtector: up to 180 studs | 2 seconds")
+label(dodge, "Limits", "2 studs maximum | 0.5 second cooldown\n3 dodges / 6 studs per 3 seconds")
 local combat = tabs.Farm:AddRightGroupbox("Combat Status", "activity")
 label(combat, "CombatTarget", "Target: none")
 label(combat, "CombatHealth", "Target HP: -")

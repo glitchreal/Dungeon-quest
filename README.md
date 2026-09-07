@@ -56,9 +56,10 @@ teleporting. Right Shift toggles the menu.
 Eligibility uses the real game level and owned keys, including higher-level
 content. Cosmetic spoofing does not change eligibility. Normal teleport dodges are capped
 at 2 studs, half a second apart, and three dodges/six studs per rolling three seconds.
-The Protector-specific response approaches his flank. If an incoming smash blocks
-that approach, it permits a checked teleport behind him up to 180 studs,
-with a two-second cooldown. This requested exception is not verified anti-cheat safe.
+The Protector-specific response approaches his flank, keeps circling in spell
+range, and prefers inward-diagonal escapes that close distance while reducing
+danger. It retains the normal short teleport limits. Emergency outward routes
+remain a fallback when no checked inward route is available.
 Those same shared limits also apply to emergency dodges from incoming regular
 enemies; a visible attack marker is no longer required for close melee danger.
 Retreat stays active until predicted separation clears an additional five-stud
