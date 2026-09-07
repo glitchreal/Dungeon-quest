@@ -58,8 +58,9 @@ content. Cosmetic spoofing does not change eligibility. Normal teleport dodges a
 at 2 studs, half a second apart, and three dodges/six studs per rolling three seconds.
 The Protector-specific response approaches his flank, keeps circling in spell
 range, and prefers inward-diagonal escapes that close distance while reducing
-danger. It retains the normal short teleport limits. Emergency outward routes
-remain a fallback when no checked inward route is available.
+danger. It retains the normal short teleport limits. Sideways and backward
+detours remain available around corners; reachable exits and recent destination
+history help avoid repeatedly choosing a dead end.
 Those same shared limits also apply to emergency dodges from incoming regular
 enemies; a visible attack marker is no longer required for close melee danger.
 Retreat stays active until predicted separation clears an additional five-stud

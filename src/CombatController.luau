@@ -965,29 +965,50 @@ local function findEscapeGoal(rootPart, targetRoot)
             toward = toward.Unit
             local lateral = Vector3.new(-toward.Z, 0, toward.X)
             local best, bestScore, bestSide
+            local now = os.clock()
+            state.protectorEscapeVisits = state.protectorEscapeVisits or {}
+            for key, at in pairs(state.protectorEscapeVisits) do
+                if now - at >= 12 then state.protectorEscapeVisits[key] = nil end
+            end
             for _, radius in ipairs({ 5, 10, 18 }) do
-                for _, angle in ipairs({ math.pi / 6, math.pi / 3, math.pi * 0.47 }) do
+                for _, angle in ipairs({ math.pi / 6, math.pi / 3, math.pi / 2, math.pi * 2 / 3, math.pi }) do
                     for _, side in ipairs({ state.protectorOrbitSide or 1, -(state.protectorOrbitSide or 1) }) do
                         local candidate = rootPart.Position + (toward * math.cos(angle) + lateral * math.sin(angle) * side) * radius
                         local offset = candidate - targetRoot.Position
                         local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
                         local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                         local progress = originalDistance - distance
+                        local key = math.floor(candidate.X / 6) .. ":" .. math.floor(candidate.Z / 6)
                         local score = -risk * 1000 + progress * 10 - radius
                             + (side == state.protectorOrbitSide and 1 or 0)
-                        if distance >= CFG.COMBAT_MIN_DISTANCE and progress >= 0
+                            - (state.protectorEscapeVisits[key] and 150 or 0)
+                        if distance >= CFG.COMBAT_MIN_DISTANCE
                             and (originalRisk == 0 and risk == 0 or risk < originalRisk - 0.1)
-                            and (not bestScore or score > bestScore)
+                            and (not bestScore or score + 80 > bestScore)
                             and safeEnemyStep(rootPart.Position, candidate)
                             and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
                             and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
-                            best, bestScore, bestSide = candidate, score, side
+                            local exits = 0
+                            for _, direction in ipairs({ toward, -toward, lateral, -lateral }) do
+                                local exit = candidate + direction * 6
+                                local support = Workspace:Raycast(exit + Vector3.new(0, 3, 0), Vector3.new(0, -9, 0), params)
+                                if support and support.Normal.Y >= 0.55
+                                    and not Workspace:Raycast(candidate, direction * 6, params)
+                                    and ThreatGeometry.segmentSafe(state.activeZones, candidate, exit, CFG.HAZARD_MARGIN) then
+                                    exits = exits + 1
+                                end
+                            end
+                            score = score + exits * 20
+                            if not bestScore or score > bestScore then
+                                best, bestScore, bestSide = candidate, score, side
+                            end
                         end
                     end
                 end
             end
             if best then
                 state.protectorOrbitSide = bestSide
+                state.protectorEscapeVisits[math.floor(best.X / 6) .. ":" .. math.floor(best.Z / 6)] = now
                 return best
             end
         end
@@ -1653,6 +1674,7 @@ end
 
 connect(player.CharacterAdded, function(character)
     state.protectorOrbitSide = nil
+    state.protectorEscapeVisits = nil
     state.threatReactionAt = nil
     state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
     state.retreating = false
