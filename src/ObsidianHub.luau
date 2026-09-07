@@ -340,7 +340,7 @@ toggle(helper, "KickOnJoin", "Kick On Player Join", nil, "Disconnects your own a
 toggle(helper, "AllowFriends", "Allow Friends")
 input(helper, "AllowedPlayers", "Allow Players", false)
 local dodge = tabs.Farm:AddRightGroupbox("Teleport Limits", "move-horizontal")
-label(dodge, "Limits", "2 studs maximum | 0.5 second cooldown\n3 dodges / 6 studs per 3 seconds")
+label(dodge, "Limits", "Normal: 2 studs | 3 dodges / 3 seconds\nProtector nearby: up to 60 studs | 2 seconds")
 local combat = tabs.Farm:AddRightGroupbox("Combat Status", "activity")
 label(combat, "CombatTarget", "Target: none")
 label(combat, "CombatHealth", "Target HP: -")
@@ -720,6 +720,7 @@ connect(RunService.Heartbeat, function(dt)
         local damageBuffer = damage and now - damage.at < 5 and 3 or 0
         distance = distance + math.max(healthBuffer, damageBuffer)
     end
+    if target and target.Name == "Ancient Temple Protector" then distance = 16 end
     if C.SmartFarm and controller.AbilityStatus then
         if C.AdaptiveSpacing and targetRoot then
             local contactDistance = math.max(cfg.MELEE_DANGER_DISTANCE or 11,

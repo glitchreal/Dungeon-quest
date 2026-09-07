@@ -50,6 +50,8 @@ local CFG = {
     AUTO_ABILITIES = true,
     AUTO_DODGE = true,
     TELEPORT_DODGE = true,
+    PROTECTOR_REPOSITION_DISTANCE = 60,
+    PROTECTOR_REPOSITION_COOLDOWN = 2,
     REACTION_TIME = 0.05,
     MELEE_DANGER_DISTANCE = 11,
     RETREAT_RELEASE_MARGIN = 5,
@@ -1277,11 +1279,67 @@ local function forceSeparationGoal(rootPart, targetRoot, target)
     return nil
 end
 
+local function repositionBehindProtector(humanoid, rootPart, target, targetRoot, now)
+    if target.Name ~= "Ancient Temple Protector" or not CFG.TELEPORT_DODGE
+        or (Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)).Magnitude > 40
+        or now - (state.lastProtectorReposition or -math.huge) < CFG.PROTECTOR_REPOSITION_COOLDOWN then return false end
+    local incoming
+    for _, zone in ipairs(state.activeZones) do
+        if zone.shape == "ProtectorSmash"
+            and ThreatGeometry.clearance(zone, rootPart.Position, CFG.HAZARD_MARGIN) < 0 then
+            incoming = zone
+            break
+        end
+    end
+    if not incoming then return false end
+    local rear = -targetRoot.CFrame.LookVector
+    rear = Vector3.new(rear.X, 0, rear.Z).Unit
+    local right = Vector3.new(-rear.Z, 0, rear.X)
+    local distance = math.max(16, math.min(CFG.COMBAT_DISTANCE, CFG.ATTACK_RANGE - 3))
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    local overlap = OverlapParams.new()
+    overlap.FilterType = Enum.RaycastFilterType.Exclude
+    overlap.FilterDescendantsInstances = params.FilterDescendantsInstances
+    overlap.RespectCanCollide = true
+    for _, lateral in ipairs({ 0, 8, -8, 16, -16 }) do
+        local desired = targetRoot.Position + rear * distance + right * lateral
+        local ground = Workspace:Raycast(desired + Vector3.new(0, 10, 0), Vector3.new(0, -60, 0), params)
+        if ground and ground.Normal.Y >= 0.65 and not ground.Instance.Name:lower():find("lava", 1, true) then
+            local destination = ground.Position + Vector3.new(0, humanoid.HipHeight + rootPart.Size.Y * 0.5, 0)
+            local delta = destination - rootPart.Position
+            if delta.Magnitude > 2 and delta.Magnitude <= CFG.PROTECTOR_REPOSITION_DISTANCE
+                and math.abs(delta.Y) <= 8
+                and ThreatGeometry.risk(state.activeZones, destination, CFG.HAZARD_MARGIN) == 0
+                and enemyClearance(destination) >= 0
+                and not hasBlockingRay(rootPart.Position, destination, rootPart.Parent, target)
+                and #Workspace:GetPartBoundsInBox(CFrame.new(destination), Vector3.new(4, 4, 4), overlap) == 0 then
+                -- This boss-specific teleport intentionally skips the attack's
+                -- swept path. Its landing and solid obstacles remain checked.
+                clearPath()
+                rootPart.CFrame = CFrame.lookAt(destination, Vector3.new(targetRoot.Position.X, destination.Y, targetRoot.Position.Z))
+                rootPart.AssemblyLinearVelocity = Vector3.zero
+                humanoid:MoveTo(destination)
+                state.lastProtectorReposition = now
+                state.protectorReposition = { at = now, distance = delta.Magnitude, destination = destination }
+                state.dodgeCount = state.dodgeCount + 1
+                state.motionGoal, state.fallbackGoal, state.escapeGoal = nil, nil, nil
+                state.movementBlocked, state.blockedByHazard, state.retreating = false, false, false
+                state.motionMode, state.status = "dodge", "Repositioned behind Protector"
+                state.lastPosition, state.stuckStartTime = destination, 0
+                return true
+            end
+        end
+    end
+    return false
+end
+
 local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if not CFG.AUTO_DODGE then
         state.escapeGoal, state.lastThreatPart, state.movementBlocked, state.retreating = nil, nil, false, false
         return false
     end
+    if repositionBehindProtector(humanoid, rootPart, target, targetRoot, now) then return true end
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     state.lastThreatPart = zone and zone.id
     local crowd = crowdDistance(rootPart.Position)
@@ -1433,6 +1491,16 @@ local function controllerTick()
         state.lastProgressDistance, state.stuckStartTime = math.huge, 0
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
+    local protectorRear = target.Name == "Ancient Temple Protector"
+    local protectorApproach
+    if protectorRear then
+        local offset = rootPart.Position - targetRoot.Position
+        if Vector3.new(offset.X, 0, offset.Z).Magnitude > 40 then
+            local side = offset:Dot(targetRoot.CFrame.RightVector) >= 0 and 1 or -1
+            protectorApproach = groundPosition(targetRoot.Position + targetRoot.CFrame.RightVector * side * 24
+                - targetRoot.CFrame.LookVector * 16, character, target)
+        end
+    end
     state.prevHealth[target] = targetHumanoid.Health
     refreshSafety(rootPart, now)
     if handleSafety(humanoid, rootPart, target, targetRoot, now) then
@@ -1454,14 +1522,22 @@ local function controllerTick()
         state.lastThreatPart, state.dodgeGoal = nil, nil
         restoreFacing()
         state.status = "Routing around obstacle to " .. target.Name
-        followGoal(humanoid, rootPart, targetRoot.Position, "approach", now, target)
-        updateProgress(humanoid, rootPart, targetRoot.Position, target, now)
+        local approachGoal = protectorApproach or (protectorRear
+            and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target)) or targetRoot.Position
+        followGoal(humanoid, rootPart, approachGoal, "approach", now, target)
+        updateProgress(humanoid, rootPart, approachGoal, target, now)
         return
     end
     state.navigationPhase = "combat"
     faceEnemy(humanoid, rootPart, targetRoot)
 
-    local protectorRear = target.Name == "Ancient Temple Protector"
+    if protectorApproach then
+        state.status = "Approaching Protector flank"
+        followGoal(humanoid, rootPart, protectorApproach, "approach", now, target)
+        updateProgress(humanoid, rootPart, protectorApproach, target, now)
+        if distance <= CFG.ATTACK_RANGE then castSkill() end
+        return
+    end
     if not protectorRear and CFG.FARM_POSITION == "Nearest" and distance >= CFG.COMBAT_MIN_DISTANCE and distance <= CFG.COMBAT_MAX_DISTANCE then
         state.status = "Attacking " .. target.Name
         -- Keep a small combat orbit while casting so a target in range does not
