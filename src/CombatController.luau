@@ -956,13 +956,14 @@ local function findEscapeGoal(rootPart, targetRoot)
     local floor = Workspace:Raycast(rootPart.Position, Vector3.new(0, -10, 0), params)
     if not floor then return nil end
     local candidates = {}
-    local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
+    local originalRisk, incomingZone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     if targetRoot.Parent.Name == "Ancient Temple Protector" and originalRisk > 0 then
-        local right = targetRoot.CFrame.RightVector
+        local attackFrame = incomingZone and incomingZone.shape == "ProtectorSmash" and incomingZone.frame or targetRoot.CFrame
+        local right = attackFrame.RightVector
         right = Vector3.new(right.X, 0, right.Z)
         if right.Magnitude > 0.01 then
             right = right.Unit
-            local relative = rootPart.Position - targetRoot.Position
+            local relative = rootPart.Position - attackFrame.Position
             local side = relative:Dot(right) >= 0 and 1 or -1
             -- Leave the smash laterally before following the rear combat goal.
             -- Prefer the side we already occupy to avoid crossing the boss.
