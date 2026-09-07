@@ -1367,18 +1367,41 @@ local function findEscapeGoal(rootPart, targetRoot)
                     local score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
                         - radius * 2 - math.abs(targetDistance - desiredDistance)
                         - math.max(0, targetDistance - CFG.ATTACK_RANGE) * 4
-                    table.insert(candidates, { position = candidate, score = score })
+                    table.insert(candidates, { position = candidate, score = score, risk = risk, radius = radius })
                 end
             end
         end
     end
     table.sort(candidates, function(a, b) return a.score > b.score end)
-    for i = 1, math.min(16, #candidates) do
-        local candidate = candidates[i].position
+    local checked = {}
+    local function valid(entry)
+        checked[entry] = true
+        local candidate = entry.position
         if safeEnemyStep(rootPart.Position, candidate)
             and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
             and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
             return candidate
+        end
+    end
+    for i = 1, math.min(16, #candidates) do
+        local candidate = valid(candidates[i])
+        if candidate then return candidate end
+    end
+    -- Clear endpoints can all be unreachable inside overlapping attacks.
+    -- Reserve bounded checks for short steps that reduce current exposure.
+    if originalRisk > 0 then
+        table.sort(candidates, function(a, b)
+            if a.radius ~= b.radius then return a.radius < b.radius end
+            return a.risk < b.risk
+        end)
+        local attempts = 0
+        for _, entry in ipairs(candidates) do
+            if not checked[entry] then
+                attempts = attempts + 1
+                local candidate = valid(entry)
+                if candidate then return candidate end
+                if attempts >= 16 then break end
+            end
         end
     end
     return nil
@@ -1391,8 +1414,9 @@ local function findEmergencySideStep(rootPart, target)
         for index = 0, 15 do
             local angle = index * math.pi / 8
             local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
-            if ThreatGeometry.risk(state.activeZones, candidate, CFG.PRECAST_MARGIN) == 0
+            if ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN) == 0
                 and safeEnemyStep(rootPart.Position, candidate)
+                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
                 and walkingSegmentClear(rootPart, candidate, target, params) then
                 return candidate
             end
@@ -1928,6 +1952,23 @@ local function watchHealth(character)
             state.lastDamage = { amount = previous - health, at = os.clock(), health = health,
                 mode = state.motionMode, status = state.status, hazards = #state.activeZones,
                 distance = state.targetDist }
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if root then
+                local nearby = {}
+                for _, zone in ipairs(state.activeZones) do
+                    table.insert(nearby, {
+                        name = typeof(zone.id) == "Instance" and zone.id:GetFullName() or "Announced telegraph",
+                        clearance = ThreatGeometry.clearance(zone, root.Position, 0),
+                        position = zone.frame.Position, size = zone.size, shape = zone.shape,
+                    })
+                end
+                table.sort(nearby, function(a, b) return a.clearance < b.clearance end)
+                while #nearby > 4 do table.remove(nearby) end
+                state.lastDamage.position = root.Position
+                state.lastDamage.goal = state.escapeGoal
+                state.lastDamage.speed = humanoid.WalkSpeed
+                state.lastDamage.nearestHazards = nearby
+            end
             warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f)", state.damageEvents, previous, health))
         end
         previous = health
