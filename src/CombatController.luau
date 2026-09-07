@@ -50,7 +50,7 @@ local CFG = {
     AUTO_ABILITIES = true,
     AUTO_DODGE = true,
     TELEPORT_DODGE = true,
-    PROTECTOR_REPOSITION_DISTANCE = 60,
+    PROTECTOR_REPOSITION_DISTANCE = 180,
     PROTECTOR_REPOSITION_COOLDOWN = 2,
     REACTION_TIME = 0.05,
     MELEE_DANGER_DISTANCE = 11,
@@ -1281,7 +1281,6 @@ end
 
 local function repositionBehindProtector(humanoid, rootPart, target, targetRoot, now)
     if target.Name ~= "Ancient Temple Protector" or not CFG.TELEPORT_DODGE
-        or (Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)).Magnitude > 40
         or now - (state.lastProtectorReposition or -math.huge) < CFG.PROTECTOR_REPOSITION_COOLDOWN then return false end
     local incoming
     for _, zone in ipairs(state.activeZones) do
