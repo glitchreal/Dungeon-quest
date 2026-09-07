@@ -604,6 +604,18 @@ local humanoidModels = {}
 -- lets the dodge check remain cheap and catches indicators created under Workspace.
 local threatParts = {}
 local announcedZones = {}
+local aquaticLineTemplates = {}
+do
+    local templates = game:GetService("ReplicatedStorage"):FindFirstChild("enemyProjectiles")
+    for _, name in ipairs({ "firstBossRightHandShot", "secondBossRandomLine" }) do
+        local model = templates and templates:FindFirstChild(name)
+        local warning = model and model:FindFirstChild("precast")
+        local hitbox = model and model:FindFirstChild("hitBox")
+        if warning and warning:IsA("BasePart") and hitbox and hitbox:IsA("BasePart") then
+            table.insert(aquaticLineTemplates, { name = name, warningSize = warning.Size, hitboxSize = hitbox.Size })
+        end
+    end
+end
 local function trackInstance(instance)
     if instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
         humanoidModels[instance] = instance.Parent
@@ -862,6 +874,7 @@ end
 hasBlockingRay = function(origin, destination, character, target)
     local direction = destination - origin
     local params = buildRaycastParams(character, target)
+    params.RespectCanCollide = true
     for _ = 1, 6 do
         local hit = Workspace:Raycast(origin, direction, params)
         if not hit then return false end
@@ -1355,6 +1368,21 @@ local function refreshSafety(rootPart, now)
                     and part.Size.X >= 10 and part.Size.X <= 150 and part.Parent:FindFirstChild("hitBox")
                 local protectorSmash = smashBox and smashBox:IsA("BasePart") and smashBox.Size.Y == 150
                     and smashBox.Size.X == part.Size.X and smashBox.Size.Z == 10
+                local lineBox, lineName
+                local dungeonName = Workspace:FindFirstChild("dungeonName")
+                if part.Name == "precast" and dungeonName and dungeonName.Value == "Aquatic Temple" then
+                    local hitbox = part.Parent:FindFirstChild("hitBox")
+                    if hitbox and hitbox:IsA("BasePart") then
+                        for _, template in ipairs(aquaticLineTemplates) do
+                            if (part.Size - template.warningSize).Magnitude < 0.05
+                                and (hitbox.Size - template.hitboxSize).Magnitude < 0.05 then
+                                sample.lineVisible = sample.lineVisible or part.Transparency < 0.95
+                                if sample.lineVisible then lineBox, lineName = hitbox, template.name end
+                                break
+                            end
+                        end
+                    end
+                end
                 local damageContainer = part.Transparency < 0.95 and (name:find("damageparts", 1, true)
                     or name:find("hitboxes", 1, true) or name:find("hazards", 1, true) or name:find("telegraphs", 1, true))
                 local elapsed = math.max(0.001, now - sample.lastAt)
@@ -1367,7 +1395,7 @@ local function refreshSafety(rootPart, now)
                     or (part.Shape == Enum.PartType.Cylinder and part.Size.X <= 4))
                 local precast = floorMarker and part.Parent == Workspace and part.Anchored and not part.CanCollide
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
-                if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer or protectorSmash) then
+                if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer or protectorSmash or lineBox) then
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
                     local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
                     local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
@@ -1378,6 +1406,9 @@ local function refreshSafety(rootPart, now)
                         local travel = 150 - part.Size.X
                         sample.zone = { frame = smashBox.CFrame, size = Vector3.new(150, 150, travel * 2 + 10),
                             shape = "ProtectorSmash", startWidth = part.Size.X, travelDistance = travel, id = part }
+                    elseif lineBox then
+                        sample.zone = { frame = lineBox.CFrame, size = lineBox.Size, shape = "Block",
+                            id = part, kind = "AquaticDelayedLine", name = lineName }
                     end
                     sample.lastActive = now
                     table.insert(zones, sample.zone)
