@@ -1494,7 +1494,10 @@ local function spellUsable(snapshot, rootPart)
     local humanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
     if profile.mode == "heal" then return humanoid and humanoid.Health < humanoid.MaxHealth * 0.85 end
     if profile.mode == "shield" then return state.retreating or #state.activeZones > 0 end
-    if profile.mode == "buff" then return #state.nearbyEnemies > 0 end
+    if profile.mode == "buff" then
+        return #state.nearbyEnemies > 0 or state.retreating or state.motionMode == "evade"
+            or state.motionMode == "safety-hold" or state.lastThreatPart ~= nil
+    end
     if profile.mode == "self" then
         for _, enemy in ipairs(state.nearbyEnemies) do
             if isValidTarget(enemy.model) and (enemy.root.Position - rootPart.Position).Magnitude <= (profile.radius or profile.range or CFG.CLOSE_AOE_RANGE) then
@@ -1775,6 +1778,11 @@ local function controllerTick()
     refreshSafety(rootPart, now)
     if handleSafety(humanoid, rootPart, target, targetRoot, now) then
         state.navigationPhase = "evade"
+        if CFG.AUTO_ABILITIES and CFG.SMART_FARM then
+            abilities.TryCast(now, CFG.SKILL_COOLDOWN, function(slot, snapshot)
+                return FarmPlanner.profile(snapshot).mode == "buff" and prepareSpell(slot, snapshot)
+            end)
+        end
         faceEnemy(humanoid, rootPart, targetRoot)
         if distance <= CFG.ATTACK_RANGE and not hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then castSkill() end
         return
