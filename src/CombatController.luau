@@ -955,8 +955,10 @@ local function refreshSafety(rootPart, now)
                         lookahead = projectile and CFG.PROJECTILE_LOOKAHEAD or 0.5, id = part }
                     if protectorSmash then
                         local travel = 150 - part.Size.X
+                        local humanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
                         sample.zone = { frame = smashBox.CFrame, size = Vector3.new(150, 150, travel * 2 + 10),
-                            shape = "ProtectorSmash", startWidth = part.Size.X, travelDistance = travel, id = part }
+                            shape = "ProtectorSmash", startWidth = part.Size.X, travelDistance = travel, id = part,
+                            forecastAge = now - sample.createdAt, walkSpeed = humanoid and humanoid.WalkSpeed or 16 }
                     elseif lineBox then
                         sample.zone = { frame = lineBox.CFrame, size = lineBox.Size, shape = "Block",
                             id = part, kind = "AquaticDelayedLine", name = lineName }

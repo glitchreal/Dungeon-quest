@@ -7,16 +7,20 @@ function Geometry.segmentDistance(position, startPosition, endPosition)
     return (position - (startPosition + delta * fraction)).Magnitude
 end
 
-function Geometry.clearance(zone, position, margin)
+function Geometry.clearance(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
     if zone.shape == "ProtectorSmash" then
         local height = math.abs(point.Y) - half.Y - 4
         if height > 0 then return height end
         local forward = -point.Z
-        local width = zone.startWidth * 0.5 + math.clamp(forward + 5, 0, zone.travelDistance) * 0.5
+        local travel = zone.travelDistance
+        if zone.forecastAge then
+            travel = math.min(travel, math.max(0, zone.forecastAge + 0.25 + (arrivalTime or 0)) * 50)
+        end
+        local width = zone.startWidth * 0.5 + math.clamp(forward + 5, 0, travel) * 0.5
         return math.max(math.abs(point.X) - width - margin,
-            -forward - 5 - margin, forward - zone.travelDistance - 5 - margin)
+            -forward - 5 - margin, forward - travel - 5 - margin)
     end
     if zone.moving and zone.shape == "Block" then
         -- Enclose the observed translation, including generic moving precasts
@@ -63,7 +67,8 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
         end
     end
     if #relevant == 0 then return true end
-    local steps = math.max(1, math.ceil((endPosition - startPosition).Magnitude * 2))
+    local length = (endPosition - startPosition).Magnitude
+    local steps = math.max(1, math.ceil(length * 2))
     local initial = {}
     local previousRisk = 0
     for index, zone in ipairs(relevant) do
@@ -77,7 +82,7 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
         local position = startPosition:Lerp(endPosition, i / steps)
         local risk = 0
         for index, zone in ipairs(relevant) do
-            local clearance = Geometry.clearance(zone, position, margin)
+            local clearance = Geometry.clearance(zone, position, margin, length * i / steps / math.max(1, zone.walkSpeed or 16))
             if initial[index] >= 0 and clearance < -0.02 then return false end
             if clearance < 0 then risk = risk + 1 + clearance * clearance end
         end
