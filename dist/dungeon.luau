@@ -201,6 +201,7 @@ return Adapter
 end)()
 local ThreatGeometry = (function()
 local Geometry = {}
+local BASE_MARGIN = 4
 
 function Geometry.segmentDistance(position, startPosition, endPosition)
     local delta = endPosition - startPosition
@@ -213,7 +214,7 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
     if zone.shape == "ProtectorSmash" then
-        local height = math.abs(point.Y) - half.Y - 4
+        local height = math.abs(point.Y) - half.Y - BASE_MARGIN
         if height > 0 then return height end
         local forward = -point.Z
         local travel = zone.travelDistance
@@ -232,7 +233,7 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
         half = half + Vector3.new(math.abs(travel.X), math.abs(travel.Y), math.abs(travel.Z)) * 0.5
     end
     if zone.shape == "Cylinder" then
-        local height = math.abs(point.X) - half.X - 4
+        local height = math.abs(point.X) - half.X - BASE_MARGIN
         if height > 0 then return height end
         return Vector2.new(point.Y, point.Z).Magnitude - math.max(half.Y, half.Z) - margin
     end
@@ -240,7 +241,7 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
         return Geometry.segmentDistance(position, zone.frame.Position, zone.frame.Position + zone.velocity * zone.lookahead)
             - math.max(half.X, half.Y, half.Z) - margin
     end
-    local height = math.abs(point.Y) - half.Y - 4
+    local height = math.abs(point.Y) - half.Y - BASE_MARGIN
     if height > 0 then return height end
     return math.max(math.abs(point.X) - half.X - margin, math.abs(point.Z) - half.Z - margin)
 end
@@ -292,6 +293,19 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
         previousRisk = risk
     end
     return true
+
+-- Adaptive safety spacing: adds margin based on recent hit and health.
+-- 3 studs briefly after a hit, up to 8 studs at low health.
+-- The larger buffer applies, rather than stacking both.
+-- Enable by passing true as the third parameter, or disable with false.
+function Geometry.adaptiveSafetyMargin(timeSinceHit, healthPercentage, adaptive)
+    if adaptive == false then return 0 end
+    local recentHit = timeSinceHit and timeSinceHit < 1.0
+    local lowHealth = healthPercentage and healthPercentage < 0.3
+    local bonus = 0
+    if recentHit then bonus = 3 end
+    if lowHealth then bonus = math.max(bonus, 8 * (1 - healthPercentage / 0.3)) end
+    return bonus
 end
 
 return Geometry
