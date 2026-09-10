@@ -170,6 +170,7 @@ local humanoidModels = {}
 local threatParts = {}
 local announcedZones = {}
 local safeSpots = {}
+local beamParts = {}
 local loggedThreats = setmetatable({}, { __mode = "k" })
 local aquaticLineTemplates = {}
 do
@@ -187,6 +188,9 @@ local function trackInstance(instance)
     if instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
         humanoidModels[instance] = instance.Parent
     end
+    if instance:IsA("Beam") then
+        beamParts[instance] = true
+    end
     if instance:IsA("BasePart") then
         local now = os.clock()
         if not instance.CanCollide and (not state.waypointFolder or not instance:IsDescendantOf(state.waypointFolder)) then
@@ -203,6 +207,7 @@ connect(Workspace.DescendantRemoving, function(instance)
     local sample = threatParts[instance]
     if sample and sample.zone then sample.removedAt = os.clock() else threatParts[instance] = nil end
     safeSpots[instance] = nil
+    beamParts[instance] = nil
     humanoidModels[instance] = nil
 end)
 for _, instance in ipairs(Workspace:GetDescendants()) do trackInstance(instance) end
@@ -1005,7 +1010,7 @@ local function refreshSafety(rootPart, now)
                     local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
                     local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
                     sample.zone = { frame = part.CFrame, size = part.Size, shape = shape,
-                        velocity = velocity, moving = not projectile and moving,
+                        velocity = velocity, moving = not projectile and moving, live = true,
                         lookahead = projectile and CFG.PROJECTILE_LOOKAHEAD or 0.5, id = part }
                     if protectorSmash then
                         local travel = 150 - part.Size.X
@@ -1023,6 +1028,17 @@ local function refreshSafety(rootPart, now)
                     table.insert(zones, sample.zone)
                 elseif now - sample.createdAt > CFG.THREAT_MAX_AGE then
                     threatParts[part] = nil
+                end
+                -- Homing/expanding rectangles: re-snapshot frame, size, and a
+                -- speed-scaled lookahead every scan. Frozen snapshots go stale
+                -- within a frame against parts that chase and grow.
+                if sample.zone and sample.zone.live then
+                    sample.zone.frame = part.CFrame
+                    sample.zone.size = part.Size
+                    sample.zone.velocity = velocity
+                    local hSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+                    sample.zone.moving = hSpeed > 2 and hSpeed < 160
+                    sample.zone.lookahead = math.clamp(hSpeed / 40, 0.5, 1.5)
                 end
                 sample.lastPosition, sample.lastAt = part.Position, now
             elseif now - sample.createdAt > CFG.THREAT_MAX_AGE and not sample.zone then
@@ -1502,6 +1518,29 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     end
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     state.lastThreatPart = zone and zone.id
+    -- Jump-over: thin homing rectangles are cleared by leaving the ground as
+    -- they pass under. Only when the zone top is within jump apex (~6 studs)
+    -- so tall smash volumes never trigger it.
+    if now - (state.lastJumpAt or -math.huge) >= 0.4 and humanoid.FloorMaterial ~= Enum.Material.Air then
+        for _, activeZone in ipairs(state.activeZones) do
+            if activeZone.live and activeZone.velocity then
+                local top = activeZone.frame.Position.Y + activeZone.size.Y * 0.5
+                if top - rootPart.Position.Y < 2 then
+                    local toPlayer = rootPart.Position - activeZone.frame.Position
+                    if toPlayer.Magnitude > 0.01 then
+                        local closing = activeZone.velocity:Dot(toPlayer.Unit)
+                        local clearanceNow = ThreatGeometry.clearance(activeZone, rootPart.Position, 0)
+                        if closing > 4 and clearanceNow / closing < 0.4 then
+                            humanoid.Jump = true
+                            state.lastJumpAt = now
+                            logThreat("jump", activeZone.shape or "?")
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
     local crowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     local clearance = enemyClearance(rootPart.Position)
