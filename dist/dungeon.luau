@@ -2035,10 +2035,11 @@ end
 
 -- Protector windup tell: hands rest at body level; a fast raise starts the
 -- smash volley. A freshly started animation track on the boss counts too.
--- Returns true on the tick the tell is detected.
-local function protectorWindup(target, now)
+-- So does the boss snapping to face the player (the slam aims at whoever it
+-- faces). Returns true on the tick the tell is detected.
+local function protectorWindup(target, targetRoot, rootPart, now)
     if not target or target.Name ~= "Ancient Temple Protector" then
-        state.windHands, state.windTracks = nil, nil
+        state.windHands, state.windTracks, state.faceHist = nil, nil, nil
         return false
     end
     local humanoid = target:FindFirstChildOfClass("Humanoid")
@@ -2055,6 +2056,24 @@ local function protectorWindup(target, now)
         end
         state.windTracks = nowSeen
         if fresh and seen then return true end
+    end
+    -- Facing snap: the slam aims at whoever it faces. Was looking away
+    -- (>40deg sometime in the last 1.2s), now dead-on (<15deg).
+    if targetRoot and rootPart then
+        local facing = targetRoot.CFrame.LookVector
+        facing = Vector3.new(facing.X, 0, facing.Z)
+        local toPlayer = rootPart.Position - targetRoot.Position
+        toPlayer = Vector3.new(toPlayer.X, 0, toPlayer.Z)
+        if facing.Magnitude > 0.01 and toPlayer.Magnitude > 0.01 then
+            local ang = math.acos(math.clamp(facing.Unit:Dot(toPlayer.Unit), -1, 1))
+            local hist = state.faceHist or {}
+            table.insert(hist, { at = now, ang = ang })
+            while hist[1] and now - hist[1].at > 1.2 do table.remove(hist, 1) end
+            state.faceHist = hist
+            local was = math.huge
+            for _, h in ipairs(hist) do was = math.min(was, h.ang) end
+            if ang < 0.26 and was > 0.7 then return true end
+        end
     end
     local left = target:FindFirstChild("leftHandModel")
     local right = target:FindFirstChild("rightHandModel")
@@ -2179,7 +2198,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     -- a few sideways studs exit; from far away no windup is survivable.
     -- Yields to real corridors the moment their parts materialize.
     if target.Name == "Ancient Temple Protector" then
-        if protectorWindup(target, now) then
+        if protectorWindup(target, targetRoot, rootPart, now) then
             state.smashStrafeUntil = now + 1.6
             logThreat("windup", "hand raise")
         end
@@ -2236,13 +2255,15 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             -- Survival-margin escapes already accepted crossing exposure at
             -- selection time; re-validating the strict segment would jitter
             -- between cells instead of committing to the least-bad one.
+            -- They also bypass issueMove's guards, which would otherwise
+            -- freeze the walk mid-escape (safety-hold inside a hitbox).
             if contMargin >= CFG.HAZARD_MARGIN
                 and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, contMargin) then
                 state.escapeGoal = nil
             else
             state.status = state.escapeReason or "Avoiding nearby enemies"
             dodgeAlongEscape(humanoid, rootPart, state.escapeGoal, target, zone and zone.id or contactThreat, now)
-            issueMove(humanoid, state.escapeGoal, "evade", now)
+            issueMove(humanoid, state.escapeGoal, "evade", now, contMargin < CFG.HAZARD_MARGIN)
             return true
             end
         end
@@ -2602,6 +2623,21 @@ local function controllerTick()
         holdDistance = 13
     end
     local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * holdDistance, character, target)
+    -- Idle creep (Protector): with no active threats, blink small steps
+    -- toward the hold instead of only walking. Closes distance between
+    -- volleys so the fight happens at sidestep range, not cross-arena.
+    -- Budget + same-threat cooldown bound it; dodges always win ties.
+    if protectorRear and #state.activeZones == 0 then
+        local creepDelta = desiredPosition - rootPart.Position
+        if creepDelta.Magnitude > 15 then
+            local step = rootPart.Position + creepDelta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, creepDelta.Magnitude)
+            if safeEnemyStep(rootPart.Position, step)
+                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, step, CFG.HAZARD_MARGIN)
+                and walkingSegmentClear(rootPart, step, target) then
+                performDodgeTeleport(humanoid, rootPart, step, target, "creep", now)
+            end
+        end
+    end
     if (Vector3.new(desiredPosition.X - rootPart.Position.X, 0, desiredPosition.Z - rootPart.Position.Z)).Magnitude < 2 then
         stopMovement(humanoid, rootPart)
         if distance <= CFG.ATTACK_RANGE then castSkill() end
