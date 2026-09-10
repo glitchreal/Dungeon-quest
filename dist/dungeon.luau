@@ -1172,6 +1172,26 @@ end
 
 local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not goal then return end
+    -- Gap jumps: dungeon bridges break into jumpable platforms. When grounded
+    -- with no floor just ahead but a landing in jump reach, hop the gap while
+    -- running at it. Ignores water so wading stays on foot.
+    if humanoid.FloorMaterial ~= Enum.Material.Air then
+        local toGoal = goal - rootPart.Position
+        local flat = Vector3.new(toGoal.X, 0, toGoal.Z)
+        if flat.Magnitude >= 3 then
+            local dir = flat.Unit
+            local params = buildRaycastParams(rootPart.Parent, target)
+            params.IgnoreWater = true
+            local edge = Workspace:Raycast(rootPart.Position + dir * 3 + Vector3.new(0, 2, 0), Vector3.new(0, -14, 0), params)
+            if not edge then
+                local land = Workspace:Raycast(rootPart.Position + dir * 10 + Vector3.new(0, 2, 0), Vector3.new(0, -14, 0), params)
+                if land and math.abs(land.Position.Y - rootPart.Position.Y) < 6
+                    and not land.Instance.Name:lower():find("lava", 1, true) then
+                    humanoid.Jump = true
+                end
+            end
+        end
+    end
     if state.terrainRecovery and #state.waypoints > 0 then
         goal, mode = state.terrainRecovery, "terrain-recovery"
     end
@@ -2375,7 +2395,10 @@ local function controllerTick()
                 -- with the real route elsewhere. Short pacing never finds the
                 -- door; long biased steps with visit memory do. The 2s
                 -- re-probe above resumes the advance when a route opens.
-                local angle = math.random() * math.pi * 2
+                -- Bias toward the target's bearing: doors/triggers lie that
+                -- way far more often than behind us.
+                local bearing = math.atan2(targetRoot.Position.Z - rootPart.Position.Z, targetRoot.Position.X - rootPart.Position.X)
+                local angle = bearing + (math.random() * 2.4 - 1.2)
                 local goal = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 55
                 local far = groundPosition(goal, character, target)
                 -- Stride the full distance when the corridor is open; probe
