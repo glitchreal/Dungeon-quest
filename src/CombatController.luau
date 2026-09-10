@@ -898,7 +898,11 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     -- Path waypoints are grounded positions while HumanoidRootPart is elevated
     -- by the hip height. Compare XZ distance so a small height delta cannot pin
     -- the controller on the first waypoint of a bridge or stair transition.
-    while waypoint and (Vector3.new(rootPart.Position.X - waypoint.Position.X, 0, rootPart.Position.Z - waypoint.Position.Z)).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD do
+    -- But require rough height agreement too: on staircases stacked waypoints
+    -- share one XZ, and skipping them all strands the bot walking in place.
+    while waypoint
+        and (Vector3.new(rootPart.Position.X - waypoint.Position.X, 0, rootPart.Position.Z - waypoint.Position.Z)).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD
+        and math.abs(rootPart.Position.Y - waypoint.Position.Y) <= 6 do
         state.currentWaypointIndex = state.currentWaypointIndex + 1
         waypoint = state.waypoints[state.currentWaypointIndex]
         updateWaypointHighlight(state.currentWaypointIndex)
