@@ -1143,17 +1143,18 @@ local function chooseFallbackStep(rootPart, goal, target)
     return best
 end
 
-local function findRecoveryPath(rootPart, goal, target)
+local function findRecoveryPath(rootPart, goal, target, minRise)
     local params = buildRaycastParams(rootPart.Parent, target)
     params.RespectCanCollide = true
     local start = rootPart.Position
+    minRise = minRise or 4
     local candidates = {}
     for _, radius in ipairs({ 24, 48, 64 }) do
         for index = 0, 11 do
             local angle = index * math.pi / 6
             local sample = start + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
             local hit = Workspace:Raycast(sample + Vector3.new(0, 60, 0), Vector3.new(0, -100, 0), params)
-            if hit and hit.Normal.Y > 0.65 and hit.Position.Y > start.Y + 4
+            if hit and hit.Normal.Y > 0.65 and hit.Position.Y > start.Y + minRise
                 and not hit.Instance.Name:lower():find("lava", 1, true) then
                 table.insert(candidates, hit.Position + Vector3.new(0, 2.5, 0))
             end
@@ -1364,6 +1365,7 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
         state.stuckStartTime = 0
         state.lastProgressDistance = distance
         state.lastProgressAt = now
+        state.routeFails = 0
         return false
     end
     state.stuckCount = state.stuckCount + 1
@@ -2272,23 +2274,53 @@ local function controllerTick()
         state.navigationPhase = "approach"
         state.lastThreatPart, state.dodgeGoal = nil, nil
         restoreFacing()
-        -- Unreachable far target (locked door, unspawned wave): holding and
-        -- wandering beats ramming the wall forever. Resume when it closes in.
-        if distance > 50 then
-            if (state.routeFails or 0) > 8 then
-                if not state.wanderGoal or now > (state.wanderUntil or 0)
-                    or (state.wanderGoal - rootPart.Position).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD then
-                    local angle = math.random() * math.pi * 2
-                    local goal = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 14
-                    state.wanderGoal = chooseFallbackStep(rootPart, goal, target) or groundPosition(goal, character, target)
-                    state.wanderUntil = now + 4
-                end
-                state.status = "Holding for wave/door: " .. target.Name
-                if state.wanderGoal then issueMove(humanoid, state.wanderGoal, "hold", now) end
-                if distance <= CFG.ATTACK_RANGE then castSkill() end
+        -- Target on a higher level: the flat navmesh route walks underneath
+        -- and never climbs. Chain upward recovery steps toward the target
+        -- until the height gap closes.
+        if targetRoot.Position.Y - rootPart.Position.Y > 8 and now - (state.lastClimbTry or -math.huge) >= 2.5 then
+            state.lastClimbTry = now
+            local climbPath, climbPoints, higher = findRecoveryPath(rootPart, targetRoot.Position, target, 2.5)
+            if higher and climbPath and climbPoints then
+                clearPath()
+                state.terrainRecovery = higher
+                state.pathObject = climbPath
+                state.pathBlocked = false
+                state.pathGoal, state.pathMode = higher, "terrain-recovery"
+                state.motionGoal, state.motionGoalMode = higher, "terrain-recovery"
+                state.waypoints = climbPoints
+                state.currentWaypointIndex = 1
+                state.pathStatus = "Climbing to " .. target.Name
+                state.status = state.pathStatus
+                updateProgress(humanoid, rootPart, higher, target, now)
                 return
             end
-        else
+        end
+        -- Unreachable far target (locked door, unspawned wave): holding and
+        -- wandering beats ramming the wall forever. Resume when it closes in.
+        if distance > 50 and (state.routeFails or 0) > 20 then
+            -- Re-probe periodically: an opened door makes the far target
+            -- reachable again, which resumes the advance below.
+            if now - (state.lastHoldProbe or -math.huge) >= 2 then
+                state.lastHoldProbe = now
+                if walkingSegmentClear(rootPart, targetRoot.Position, target) then
+                    state.routeFails = 0
+                    state.wanderGoal = nil
+                end
+            end
+        end
+        if distance > 50 and (state.routeFails or 0) > 20 then
+            if not state.wanderGoal or now > (state.wanderUntil or 0)
+                or (state.wanderGoal - rootPart.Position).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD then
+                local angle = math.random() * math.pi * 2
+                local goal = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 14
+                state.wanderGoal = chooseFallbackStep(rootPart, goal, target) or groundPosition(goal, character, target)
+                state.wanderUntil = now + 4
+            end
+            state.status = "Holding for wave/door: " .. target.Name
+            if state.wanderGoal then issueMove(humanoid, state.wanderGoal, "hold", now) end
+            if distance <= CFG.ATTACK_RANGE then castSkill() end
+            return
+        elseif distance <= 50 then
             state.routeFails = 0
             state.wanderGoal = nil
         end
