@@ -433,8 +433,24 @@ local function getClosestEnemy(rootPart, now)
             end
         end
     end
+    local previousLock = state.lockedTarget
     state.lockedTarget = closest and closest.model
-    return state.lockedTarget, closest and closest.distance or CFG.DETECTION_RADIUS
+    local pickDist = closest and closest.distance or CFG.DETECTION_RADIUS
+    -- Hysteresis: two far targets in opposite directions flip-flop the lock
+    -- every step and the bot paces between them forever. Only switch when the
+    -- challenger is clearly closer or the lock is invalid/gone.
+    if previousLock and previousLock ~= state.lockedTarget and isValidTarget(previousLock)
+        and previousLock:IsDescendantOf(Workspace) then
+        local lockedRoot = getRootPart(previousLock)
+        if lockedRoot then
+            local lockedDist = (rootPart.Position - lockedRoot.Position).Magnitude
+            if lockedDist <= pickDist + 20 and lockedDist <= CFG.DETECTION_RADIUS then
+                state.lockedTarget = previousLock
+                return previousLock, lockedDist
+            end
+        end
+    end
+    return state.lockedTarget, pickDist
 end
 
 local function buildRaycastParams(character, target)
