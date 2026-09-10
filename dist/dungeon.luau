@@ -1259,7 +1259,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     end
     state.directTravel = false
 
-    local shouldRepath = state.pathBlocked or #state.waypoints == 0 or not state.pathGoal or (goal - state.pathGoal).Magnitude > 6
+    local shouldRepath = state.pathBlocked or #state.waypoints == 0 or not state.pathGoal or (goal - state.pathGoal).Magnitude > 12
     if shouldRepath and not state.pathPending and now - state.pathUpdateTime >= CFG.PATH_UPDATE_INTERVAL and (goal - rootPart.Position).Magnitude > CFG.WAYPOINT_REACH_THRESHOLD then
         state.pathUpdateTime = now
         state.pathPending = true
@@ -1334,6 +1334,22 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     end
 
     local waypoint = state.waypoints[state.currentWaypointIndex]
+    -- Watchdog: a waypoint we fail to close on for 4s is skipped, not rammed
+    -- forever. Deterministic repaths regenerate the same stuck point, so
+    -- skipping is what breaks the loop. Progress refreshes the window.
+    if waypoint then
+        local flatDist = (Vector3.new(rootPart.Position.X - waypoint.Position.X, 0, rootPart.Position.Z - waypoint.Position.Z)).Magnitude
+        if state.watchWp ~= waypoint then
+            state.watchWp, state.watchSince, state.watchDist, state.watchSkips = waypoint, now, flatDist, 0
+        elseif now - state.watchSince >= 4 and flatDist > state.watchDist - 1 and (state.watchSkips or 0) < 4 then
+            state.watchSkips = (state.watchSkips or 0) + 1
+            state.currentWaypointIndex = state.currentWaypointIndex + 1
+            state.watchWp, state.watchSince = nil, 0
+            waypoint = state.waypoints[state.currentWaypointIndex]
+        elseif flatDist < state.watchDist - 1 then
+            state.watchSince, state.watchDist = now, flatDist
+        end
+    end
     -- Path waypoints are grounded positions while HumanoidRootPart is elevated
     -- by the hip height. Compare XZ distance so a small height delta cannot pin
     -- the controller on the first waypoint of a bridge or stair transition.
