@@ -1771,13 +1771,20 @@ local function findEscapeGoal(rootPart, targetRoot)
             local angle = i * math.pi * 2 / angleSteps
             local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
             do
+                -- Hard no-back rule (Protector): never even consider an escape
+                -- that ends meaningfully farther from the boss. Scoring bias
+                -- alone loses to risk terms; this is a filter.
+                local backOk = true
+                if isProt then
+                    backOk = (candidate - targetRoot.Position).Magnitude <= originalDist + 8
+                end
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                 local crowd = crowdDistance(candidate)
                 local hazardClearance = 12
                 for _, activeZone in ipairs(state.activeZones) do
                     hazardClearance = math.min(hazardClearance, ThreatGeometry.clearance(activeZone, candidate, CFG.HAZARD_MARGIN))
                 end
-                if (originalRisk == 0 or risk < originalRisk - 0.1)
+                if backOk and (originalRisk == 0 or risk < originalRisk - 0.1)
                     and ((originalCrowd >= crowdLimit and not state.retreating) or crowd > originalCrowd + 0.25) then
                     local targetDistance = (candidate - targetRoot.Position).Magnitude
                     local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
@@ -2161,6 +2168,33 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     end
 end
 
+-- Protector separation goes sideways, never backward. Radial escapes back
+-- the bot into the arena pit/edge and strand every fight at range, which is
+-- exactly where the slam one-shots it.
+local function protectorLateralSeparation(rootPart, targetRoot, target)
+    local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
+    if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) else away = away.Unit end
+    local tangent = Vector3.new(-away.Z, 0, away.X)
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    local ground = Workspace:Raycast(rootPart.Position, Vector3.new(0, -10, 0), params)
+    if not ground then return nil end
+    local best, bestScore
+    for _, side in ipairs({ 1, -1 }) do
+        for _, distance in ipairs({ 6, 10 }) do
+            local candidate = groundPosition(rootPart.Position + tangent * side * distance, rootPart.Parent, target)
+            if walkingSegmentClear(rootPart, candidate, target, params, ground)
+                and safeEnemyStep(rootPart.Position, candidate)
+                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN) then
+                local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                local score = risk * 1000 + distance
+                if not bestScore or score < bestScore then best, bestScore = candidate, score end
+            end
+        end
+    end
+    return best
+end
+
 local function forceSeparationGoal(rootPart, targetRoot, target)
     local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
     if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) else away = away.Unit end
@@ -2210,12 +2244,21 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local crowd = crowdDistance(rootPart.Position)
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     local clearance = enemyClearance(rootPart.Position)
-    if clearance < 0 then state.retreating = true
+    local isProt = target.Name == "Ancient Temple Protector"
+    -- No crowd-retreats against the Protector: backing off for spacing is
+    -- what walks the fight backward into the pit and strands it at range.
+    -- Zones and real contact still dodge; spacing alone never retreats.
+    if clearance < 0 and not isProt then state.retreating = true
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
     local contactDistance = (targetRoot.Position - rootPart.Position).Magnitude
     if contactThreat and (contactThreat == target or contactDistance <= CFG.MELEE_DANGER_DISTANCE) then
-        local separation = forceSeparationGoal(rootPart, targetRoot, target)
+        local separation = nil
+        if isProt then
+            separation = protectorLateralSeparation(rootPart, targetRoot, target)
+        else
+            separation = forceSeparationGoal(rootPart, targetRoot, target)
+        end
         state.retreating = true
         if separation then
             clearPath()
