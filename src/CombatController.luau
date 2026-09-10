@@ -677,6 +677,16 @@ end
 
 local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not goal then return end
+    -- Flying targets bob up and down; a climb goal set during an upward bob
+    -- goes stale when the target comes back down. Drop it instead of pacing
+    -- between tiers.
+    if state.terrainRecovery and target and target.Parent then
+        local targetRoot = getRootPart(target)
+        if targetRoot and targetRoot.Position.Y - rootPart.Position.Y < 4 then
+            state.terrainRecovery = nil
+            clearPath()
+        end
+    end
     -- Gap jumps: dungeon bridges break into jumpable platforms. When grounded
     -- with no floor just ahead but a landing in jump reach, hop the gap while
     -- running at it. Ignores water so wading stays on foot.
