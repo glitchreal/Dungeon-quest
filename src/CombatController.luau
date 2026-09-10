@@ -1472,8 +1472,31 @@ local function stopMovement(humanoid, rootPart)
     clearPath()
 end
 
-local function meleeThreat(rootPart)
-    local threat, closest = nil, math.huge
+-- Protector windup tell: hands rest at body level; a fast raise starts the
+-- smash volley. Returns true on the tick the raise is detected.
+local function protectorWindup(target, now)
+    if not target or target.Name ~= "Ancient Temple Protector" then
+        state.windHands = nil
+        return false
+    end
+    local left = target:FindFirstChild("leftHandModel")
+    local right = target:FindFirstChild("rightHandModel")
+    if not (left and right) then return false end
+    local ly, ry
+    pcall(function()
+        ly = left:GetPivot().Position.Y
+        ry = right:GetPivot().Position.Y
+    end)
+    if not (ly and ry) then return false end
+    local sample = state.windHands
+    state.windHands = { at = now, ly = ly, ry = ry }
+    if not sample then return false end
+    local dt = now - sample.at
+    if dt < 0.15 or dt > 1.0 then return false end
+    return math.max(ly - sample.ly, ry - sample.ry) > 5
+end
+
+local function meleeThreat(rootPart)    local threat, closest = nil, math.huge
     for _, enemy in ipairs(state.nearbyEnemies) do
         if enemy.root.Parent then
             local distance = (enemy.root.Position - rootPart.Position).Magnitude
@@ -1573,6 +1596,38 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             return true
         end
         -- A blocked backward step still permits a lateral escape search.
+    end
+    -- Smash-windup strafe: on the hand raise, hug close (~10 studs) and walk
+    -- perpendicular early, like the corridor isn't there yet. Near the origin
+    -- a few sideways studs exit; from far away no windup is survivable.
+    -- Yields to real corridors the moment their parts materialize.
+    if target.Name == "Ancient Temple Protector" and contactDistance < 45 then
+        if protectorWindup(target, now) then
+            state.smashStrafeUntil = now + 1.4
+            logThreat("windup", "hand raise")
+        end
+        if state.smashStrafeUntil and now < state.smashStrafeUntil then
+            local smashLive = false
+            for _, activeZone in ipairs(state.activeZones) do
+                if activeZone.shape == "ProtectorSmash" then smashLive = true break end
+            end
+            if not smashLive then
+                local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
+                if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) else away = away.Unit end
+                state.protectorOrbitSide = state.protectorOrbitSide or 1
+                local tangent = Vector3.new(-away.Z, 0, away.X) * state.protectorOrbitSide
+                local goal = groundPosition(targetRoot.Position + away * 10.5 + tangent * 10, rootPart.Parent, target)
+                clearPath()
+                state.escapeGoal, state.escapeUntil = goal, now + 0.4
+                state.escapeMargin = CFG.HAZARD_MARGIN
+                state.escapeStartRisk = risk
+                state.escapeReason = "Strafing smash windup"
+                state.status = state.escapeReason
+                dodgeAlongEscape(humanoid, rootPart, goal, target, "windup" .. math.floor(now * 10), now)
+                issueMove(humanoid, goal, "evade", now)
+                return true
+            end
+        end
     end
     if state.blockedByHazard then
         state.escapeGoal = nil
