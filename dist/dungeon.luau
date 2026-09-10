@@ -1401,7 +1401,13 @@ local function refreshSafety(rootPart, now)
                 velocity = Vector3.new(velocity.X, 0, velocity.Z)
                 if velocity.Magnitude > 40 then velocity = velocity.Unit * 40 end
                 state.enemyMotion[model] = { at = now, position = root.Position }
-                local radius = math.max(math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22), math.min(22, math.max(root.Size.X, root.Size.Z) * 0.5 + 8))
+                -- Honest body radius: half the footprint plus a small buffer.
+                -- The old floor (combat distance) flagged every enemy within
+                -- 16+ studs as a crowd threat, so the bot backed away from
+                -- anything that approached and never held DPS range on bosses.
+                -- Real contact is still covered by the melee-threat response.
+                local footprint = math.max(root.Size.X, root.Size.Z) * 0.5
+                local radius = math.min(22, math.max(6, footprint + 5))
                 table.insert(enemies, { model = model, root = root, distance = distance, velocity = velocity, radius = radius })
             end
         end
@@ -1687,6 +1693,14 @@ local function findLeastBadStep(rootPart, target)
     -- the walk relaxes.
     local params = buildRaycastParams(rootPart.Parent, target)
     params.RespectCanCollide = true
+    -- Anchor escapes to the boss: without a distance term the gradient walks
+    -- away from everything, backing out of DPS range forever. Penalize steps
+    -- that leave a 34-stud leash on the target.
+    local bossPosition
+    if target and target.Parent then
+        local bossRoot = getRootPart(target)
+        if bossRoot then bossPosition = bossRoot.Position end
+    end
     local best, bestScore
     for _, radius in ipairs({ 3, 6, 10 }) do
         for index = 0, 15 do
@@ -1696,6 +1710,9 @@ local function findLeastBadStep(rootPart, target)
                 and safeEnemyStep(rootPart.Position, candidate) then
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, 2)
                 local score = risk * 1000 + radius
+                if bossPosition then
+                    score = score + math.max(0, (candidate - bossPosition).Magnitude - 34) * 3
+                end
                 if not bestScore or score < bestScore then best, bestScore = candidate, score end
             end
         end
@@ -1921,7 +1938,11 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now)
     if delta.Magnitude < 0.5 then return end
     local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
     if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return end
-    if CFG.TELEPORT_DODGE then performDodgeTeleport(humanoid, rootPart, step, target, threat, now) end
+    -- Teleport budget is reserved for telegraphed attacks (zone parts and
+    -- announcements). Melee separation walks: spending the 3-per-3s budget
+    -- dodging bodies leaves nothing for the one-shot windup that follows.
+    local telegraphed = not (typeof(threat) == "Instance" and threat:IsA("Model"))
+    if telegraphed and CFG.TELEPORT_DODGE then performDodgeTeleport(humanoid, rootPart, step, target, threat, now) end
 end
 
 local function forceSeparationGoal(rootPart, targetRoot, target)
