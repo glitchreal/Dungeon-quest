@@ -1490,6 +1490,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             clearPath()
             state.escapeGoal, state.escapeUntil = separation, now + 1.25
             state.escapeMargin = CFG.HAZARD_MARGIN
+            state.escapeStartRisk = risk
             state.escapeClear, state.lastEscapeCheck = true, now
             state.escapeReason = "Breaking melee contact"
             state.status = state.escapeReason
@@ -1513,10 +1514,15 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
             state.lastEscapeCheck = now
         end
-        if (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
-            and state.escapeClear
-            and safeEnemyStep(rootPart.Position, state.escapeGoal)
-            and (crowd >= crowdLimit or crowdDistance(state.escapeGoal) > crowd) then
+        -- Commit to the escape walk: the plan was validated at selection and
+        -- replans correct course within a fraction of a second. Re-validating
+        -- strict per-tick checks is what used to freeze the character
+        -- (safety-hold) inside resolving hitboxes. Only abort into something
+        -- much worse than when the plan was made.
+        if risk > (state.escapeStartRisk or 0) + 2.5 then
+            state.escapeGoal = nil
+        elseif (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
+            and state.escapeClear then
             local contMargin = state.escapeMargin or CFG.HAZARD_MARGIN
             -- Survival-margin escapes already accepted crossing exposure at
             -- selection time; re-validating the strict segment would jitter
@@ -1555,6 +1561,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 clearPath()
                 state.escapeGoal, state.escapeUntil = backup, now + 0.8
                 state.escapeMargin = 2
+                state.escapeStartRisk = risk
                 state.escapeClear, state.lastEscapeCheck = true, now
                 state.escapeReason = "Cutting through weakest exposure"
                 state.status = state.escapeReason
@@ -1572,6 +1579,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
     state.escapeMargin = CFG.HAZARD_MARGIN
+    state.escapeStartRisk = risk
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
     dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now)
@@ -1635,6 +1643,20 @@ local function controllerTick()
         stopMovement(humanoid, rootPart)
         state.pathStatus = "Pathfinding: waiting for next wave"
         return
+    end
+
+    -- Burn phase: while the Protector lives, it is the only target. Chasing
+    -- adds walks the bot across resolving volleys for no damage gain.
+    if target.Name ~= "Ancient Temple Protector" then
+        for _, model in ipairs(state.cachedTargets) do
+            if model.Name == "Ancient Temple Protector" and isValidTarget(model) and model:IsDescendantOf(Workspace) then
+                target = model
+                state.lockedTarget = model
+                local bossRoot = getRootPart(model)
+                if bossRoot then distance = (bossRoot.Position - rootPart.Position).Magnitude end
+                break
+            end
+        end
     end
 
     local targetHumanoid, targetRoot = target:FindFirstChildOfClass("Humanoid"), getRootPart(target)
