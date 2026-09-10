@@ -1889,8 +1889,15 @@ local function controllerTick()
         restoreFacing()
         -- Target on a higher level: the flat navmesh route walks underneath
         -- and never climbs. Chain upward recovery steps toward the target
-        -- until the height gap closes.
-        if targetRoot.Position.Y - rootPart.Position.Y > 8 and now - (state.lastClimbTry or -math.huge) >= 2.5 then
+        -- until the height gap closes. Gated on SUSTAINED elevation so flying
+        -- trash bobbing up and down doesn't yo-yo the bot up every slope.
+        local climbDy = targetRoot.Position.Y - rootPart.Position.Y
+        if climbDy > 12 then
+            state.climbDySince = state.climbDySince or now
+        else
+            state.climbDySince = nil
+        end
+        if state.climbDySince and now - state.climbDySince >= 3 and now - (state.lastClimbTry or -math.huge) >= 2.5 then
             state.lastClimbTry = now
             local climbPath, climbPoints, higher = findRecoveryPath(rootPart, targetRoot.Position, target, 2.5)
             if higher and climbPath and climbPoints then
