@@ -1002,7 +1002,12 @@ local function walkingSegmentClear(rootPart, destination, target, params, startF
         local sample = startPosition + flat * (i / steps)
         sample = Vector3.new(sample.X, previousY + 6, sample.Z)
         local ground = Workspace:Raycast(sample, Vector3.new(0, -12, 0), params)
-        if not ground or ground.Normal.Y < 0.55 or math.abs(ground.Position.Y - previousY) > 2 then return false end
+        if not ground or ground.Normal.Y < 0.55 then return false end
+        -- Asymmetric steps: climbing more than ~2.5 needs stairs or a jump,
+        -- but stepping DOWN is just falling. Allow drops up to 6 so slab
+        -- edges and tiers stay walkable; anything deeper risks a pit trap.
+        local dy = ground.Position.Y - previousY
+        if dy > 2.5 or dy < -6 then return false end
         if ground.Instance.Name:lower():find("lava", 1, true) and not startFloor.Instance.Name:lower():find("lava", 1, true) then return false end
         previousY = ground.Position.Y
     end
