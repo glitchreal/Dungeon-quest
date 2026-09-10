@@ -1526,8 +1526,8 @@ local function protectorWindup(target, now)
     state.windHands = { at = now, ly = ly, ry = ry }
     if not sample then return false end
     local dt = now - sample.at
-    if dt < 0.15 or dt > 1.0 then return false end
-    return math.max(ly - sample.ly, ry - sample.ry) > 5
+    if dt < 0.12 or dt > 2.0 then return false end
+    return math.max(ly - sample.ly, ry - sample.ry) > 4
 end
 
 local function meleeThreat(rootPart)    local threat, closest = nil, math.huge
@@ -1635,9 +1635,9 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     -- perpendicular early, like the corridor isn't there yet. Near the origin
     -- a few sideways studs exit; from far away no windup is survivable.
     -- Yields to real corridors the moment their parts materialize.
-    if target.Name == "Ancient Temple Protector" and contactDistance < 45 then
+    if target.Name == "Ancient Temple Protector" then
         if protectorWindup(target, now) then
-            state.smashStrafeUntil = now + 1.4
+            state.smashStrafeUntil = now + 1.6
             logThreat("windup", "hand raise")
         end
         if state.smashStrafeUntil and now < state.smashStrafeUntil then
@@ -1645,12 +1645,15 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             for _, activeZone in ipairs(state.activeZones) do
                 if activeZone.shape == "ProtectorSmash" then smashLive = true break end
             end
-            if not smashLive then
+            if not smashLive and contactDistance < 120 then
+                -- Sidestep in place: hold the current radius, move purely
+                -- perpendicular. Dashing to the boss from range crosses the
+                -- very corridors forming around you.
                 local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
                 if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) else away = away.Unit end
                 state.protectorOrbitSide = state.protectorOrbitSide or 1
                 local tangent = Vector3.new(-away.Z, 0, away.X) * state.protectorOrbitSide
-                local goal = groundPosition(targetRoot.Position + away * 10.5 + tangent * 10, rootPart.Parent, target)
+                local goal = groundPosition(rootPart.Position + tangent * 14, rootPart.Parent, target)
                 clearPath()
                 state.escapeGoal, state.escapeUntil = goal, now + 0.4
                 state.escapeMargin = CFG.HAZARD_MARGIN
