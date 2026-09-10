@@ -1306,6 +1306,9 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
                 state.lastPendingStep = now
                 local fallback = chooseFallbackStep(rootPart, goal, target)
                 if fallback then
+                    if (goal - rootPart.Position).Magnitude > 50 then
+                        state.routeFails = (state.routeFails or 0) + 1
+                    end
                     state.fallbackGoal, state.fallbackUntil = fallback, now + 0.6
                     issueMove(humanoid, fallback, mode, now)
                 else
@@ -1370,6 +1373,7 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
     state.stuckRetries = state.stuckRetries + 1
     state.stuckStartTime = now
     state.stuckCount = 0
+    state.routeFails = (state.routeFails or 0) + 1
     clearPath()
     local recovery = chooseRecoveryGoal(rootPart, goal, target)
     if recovery then
@@ -2235,6 +2239,7 @@ local function controllerTick()
             state.pathUpdateTime = 0
         end
         state.lastProgressDistance, state.stuckStartTime = math.huge, 0
+        state.routeFails, state.wanderGoal = 0, nil
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
     local protectorRear = target.Name == "Ancient Temple Protector"
@@ -2267,6 +2272,26 @@ local function controllerTick()
         state.navigationPhase = "approach"
         state.lastThreatPart, state.dodgeGoal = nil, nil
         restoreFacing()
+        -- Unreachable far target (locked door, unspawned wave): holding and
+        -- wandering beats ramming the wall forever. Resume when it closes in.
+        if distance > 50 then
+            if (state.routeFails or 0) > 8 then
+                if not state.wanderGoal or now > (state.wanderUntil or 0)
+                    or (state.wanderGoal - rootPart.Position).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD then
+                    local angle = math.random() * math.pi * 2
+                    local goal = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 14
+                    state.wanderGoal = chooseFallbackStep(rootPart, goal, target) or groundPosition(goal, character, target)
+                    state.wanderUntil = now + 4
+                end
+                state.status = "Holding for wave/door: " .. target.Name
+                if state.wanderGoal then issueMove(humanoid, state.wanderGoal, "hold", now) end
+                if distance <= CFG.ATTACK_RANGE then castSkill() end
+                return
+            end
+        else
+            state.routeFails = 0
+            state.wanderGoal = nil
+        end
         state.status = "Routing around obstacle to " .. target.Name
         local approachGoal = protectorApproach or (protectorRear
             and groundPosition(targetRoot.Position + targetRoot.CFrame.RightVector
@@ -2381,6 +2406,7 @@ local function setRunning(running)
         state.motionGoal, state.motionGoalMode, state.motionMode = nil, nil, "idle"
         state.fallbackGoal, state.fallbackUntil = nil, 0
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0
+        state.routeFails, state.wanderGoal, state.wanderUntil = 0, nil, 0
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
         createWaypointFolder()
