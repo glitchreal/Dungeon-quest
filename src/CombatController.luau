@@ -1855,9 +1855,13 @@ local function controllerTick()
                 return
             end
         end
-        -- Unreachable far target (locked door, unspawned wave): holding and
-        -- wandering beats ramming the wall forever. Resume when it closes in.
-        if distance > 50 and (state.routeFails or 0) > 20 then
+        -- Unreachable target (locked door, unspawned wave, or geometry we
+        -- cannot close on): holding and wandering beats ramming forever.
+        -- Far targets hold after ~20 failures; close ones only after ~40, so
+        -- ordinary approaches never park within sight of the enemy.
+        local holdFails = state.routeFails or 0
+        local shouldHold = holdFails > 20 and (distance > 50 or holdFails > 40)
+        if shouldHold then
             -- Re-probe periodically: an opened door makes the far target
             -- reachable again, which resumes the advance below.
             if now - (state.lastHoldProbe or -math.huge) >= 2 then
@@ -1865,10 +1869,11 @@ local function controllerTick()
                 if walkingSegmentClear(rootPart, targetRoot.Position, target) then
                     state.routeFails = 0
                     state.wanderGoal = nil
+                    shouldHold = (state.routeFails or 0) > 20 and (distance > 50 or (state.routeFails or 0) > 40)
                 end
             end
         end
-        if distance > 50 and (state.routeFails or 0) > 20 then
+        if shouldHold then
             if not state.wanderGoal or now > (state.wanderUntil or 0)
                 or (state.wanderGoal - rootPart.Position).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD then
                 -- Far wander (55 studs): dungeon rooms are gated by inviswalls
@@ -1888,7 +1893,7 @@ local function controllerTick()
             if state.wanderGoal then issueMove(humanoid, state.wanderGoal, "hold", now) end
             if distance <= CFG.ATTACK_RANGE then castSkill() end
             return
-        elseif distance <= 50 then
+        elseif distance <= 50 and (state.routeFails or 0) < 40 then
             state.routeFails = 0
             state.wanderGoal = nil
         end
