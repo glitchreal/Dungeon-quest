@@ -2439,7 +2439,7 @@ local function controllerTick()
         -- until the height gap closes. Gated on SUSTAINED elevation so flying
         -- trash bobbing up and down doesn't yo-yo the bot up every slope.
         local climbDy = targetRoot.Position.Y - rootPart.Position.Y
-        if climbDy > 12 then
+        if climbDy > 8 then
             state.climbDySince = state.climbDySince or now
         else
             state.climbDySince = nil
