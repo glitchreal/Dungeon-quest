@@ -1723,39 +1723,58 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         end
         -- A blocked backward step still permits a lateral escape search.
     end
-    -- Smash-windup strafe: on the hand raise, hug close (~10 studs) and walk
-    -- perpendicular early, like the corridor isn't there yet. Near the origin
-    -- a few sideways studs exit; from far away no windup is survivable.
-    -- Yields to real corridors the moment their parts materialize.
+    -- Smash response (Protector only): the slam is a full-arena expanding
+    -- rectangle wall. Backing away corners you against the arena edge, so
+    -- this does the opposite: phase 1 closes distance toward the boss while
+    -- the rectangles are small, phase 2 strafes the side with more open
+    -- space. Regular attacks keep the normal backward dodge below; only
+    -- Smash behaves this way (attack-dependent dodge direction).
     if target.Name == "Ancient Temple Protector" then
         if protectorWindup(target, targetRoot, rootPart, now) then
-            state.smashStrafeUntil = now + 1.6
-            logThreat("windup", "hand raise")
+            state.smashStrafeUntil = now + 2.2
+            logThreat("windup", "smash")
         end
         if state.smashStrafeUntil and now < state.smashStrafeUntil then
-            local smashLive = false
-            for _, activeZone in ipairs(state.activeZones) do
-                if activeZone.shape == "ProtectorSmash" then smashLive = true break end
+            local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
+            local dist = away.Magnitude
+            if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) else away = away.Unit end
+            local goal
+            if dist > 22 then
+                -- Phase 1: close distance fast while rectangles are small.
+                local toward = Vector3.new(-away.X, 0, -away.Z)
+                goal = rootPart.Position + toward * math.min(14, dist - 18)
+            else
+                -- Phase 2: strafe whichever side has more open space.
+                local tangent = Vector3.new(-away.Z, 0, away.X)
+                local bestSide, bestScore
+                for _, side in ipairs({ 1, -1 }) do
+                    local probe = rootPart.Position + tangent * side * 12
+                    local probeRisk = ThreatGeometry.risk(state.activeZones, probe, 2)
+                    local wallParams = buildRaycastParams(rootPart.Parent, target)
+                    wallParams.RespectCanCollide = true
+                    local wall = Workspace:Raycast(rootPart.Position, tangent * side * 20, wallParams)
+                    local score = probeRisk * 100 + (wall and (20 - (wall.Position - rootPart.Position).Magnitude) * 10 or 0)
+                    if not bestScore or score < bestScore then
+                        bestScore, bestSide = score, side
+                    end
+                end
+                bestSide = bestSide or 1
+                goal = rootPart.Position + tangent * bestSide * 14
             end
-            if not smashLive and contactDistance < 120 then
-                -- Sidestep in place: hold the current radius, move purely
-                -- perpendicular. Dashing to the boss from range crosses the
-                -- very corridors forming around you.
-                local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
-                if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) else away = away.Unit end
-                state.protectorOrbitSide = state.protectorOrbitSide or 1
-                local tangent = Vector3.new(-away.Z, 0, away.X) * state.protectorOrbitSide
-                local goal = groundPosition(rootPart.Position + tangent * 14, rootPart.Parent, target)
+            goal = groundPosition(goal, rootPart.Parent, target)
+            if walkingSegmentClear(rootPart, goal, target)
+                and safeEnemyStep(rootPart.Position, goal) then
                 clearPath()
-                state.escapeGoal, state.escapeUntil = goal, now + 0.4
+                state.escapeGoal, state.escapeUntil = goal, now + 0.5
                 state.escapeMargin = CFG.HAZARD_MARGIN
                 state.escapeStartRisk = risk
-                state.escapeReason = "Strafing smash windup"
+                state.escapeReason = dist > 22 and "Closing on smash windup" or "Strafing smash by open space"
                 state.status = state.escapeReason
-                dodgeAlongEscape(humanoid, rootPart, goal, target, "windup" .. math.floor(now * 10), now, true)
+                dodgeAlongEscape(humanoid, rootPart, goal, target, "smash" .. math.floor(now * 10), now, true)
                 issueMove(humanoid, goal, "evade", now)
                 return true
             end
+            -- No valid smash goal: fall through to the regular escape logic.
         end
     end
     if state.blockedByHazard then
