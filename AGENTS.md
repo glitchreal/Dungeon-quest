@@ -9,5 +9,7 @@
 - The user does not want extra test runs solely for committing. Do not add a
   pre-commit test gate. Use focused verification only when the implementation
   change itself warrants it.
-- Preserve level checks, short teleport limits, target-facing behavior, and
-  settings continuation through the main loader after teleporting.
+- Preserve level checks, target-facing behavior, and settings continuation
+  through the main loader after teleporting. Dodge teleports stay tactical
+  (8 studs max per blink, budgeted per rolling window) — never large snaps,
+  which trip the game's movement anticheat.

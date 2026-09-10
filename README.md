@@ -55,7 +55,7 @@ teleporting. Right Shift toggles the menu.
 
 Eligibility uses the real game level and owned keys, including higher-level
 content. Cosmetic spoofing does not change eligibility. Normal teleport dodges are capped
-at 2 studs, half a second apart, and three dodges/six studs per rolling three seconds.
+at 8 studs, half a second apart, and three dodges/eighteen studs per rolling three seconds.
 The Protector-specific response approaches his flank, keeps circling in spell
 range, and prefers inward-diagonal escapes that close distance while reducing
 danger. It retains the normal short teleport limits. Sideways and backward
