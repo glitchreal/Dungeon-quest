@@ -2330,7 +2330,7 @@ local function controllerTick()
             state.pathUpdateTime = 0
         end
         state.lastProgressDistance, state.stuckStartTime = math.huge, 0
-        state.routeFails, state.wanderGoal = 0, nil
+        state.routeFails, state.wanderGoal, state.wallSide = 0, nil, nil
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
     -- Doomed round: same target for 3 minutes with zero kills and zero damage
@@ -2431,21 +2431,31 @@ local function controllerTick()
         if shouldHold then
             if not state.wanderGoal or now > (state.wanderUntil or 0)
                 or (state.wanderGoal - rootPart.Position).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD then
-                -- Far wander (55 studs): dungeon rooms are gated by inviswalls
-                -- with the real route elsewhere. Short pacing never finds the
-                -- door; long biased steps with visit memory do. The 2s
-                -- re-probe above resumes the advance when a route opens.
-                -- Bias toward the target's bearing: doors/triggers lie that
-                -- way far more often than behind us.
+                -- Wall-follow: the target sits behind a wall and pacing into
+                -- it loops forever. Walk ALONG the wall on a fixed side;
+                -- doors, stairs and ramps are found by traversal, and the 2s
+                -- re-probe resumes the advance when the ray clears. The fixed
+                -- side is the whole trick: never flip-flop.
                 local bearing = math.atan2(targetRoot.Position.Z - rootPart.Position.Z, targetRoot.Position.X - rootPart.Position.X)
-                local angle = bearing + (math.random() * 1.4 - 0.7)
-                local goal = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 55
-                local far = groundPosition(goal, character, target)
-                -- Stride the full distance when the corridor is open; probe
-                -- short steps when walled in.
-                state.wanderGoal = (walkingSegmentClear(rootPart, far, target) and far)
-                    or chooseFallbackStep(rootPart, goal, target) or far
-                state.wanderUntil = now + 8
+                state.wallSide = state.wallSide or (math.random() < 0.5 and 1 or -1)
+                local wallGoal
+                for _, side in ipairs({ state.wallSide, -state.wallSide }) do
+                    local tangent = Vector3.new(-math.sin(bearing), 0, math.cos(bearing)) * side
+                    local forward = Vector3.new(math.cos(bearing), 0, math.sin(bearing))
+                    local goal = rootPart.Position + (tangent * 0.92 + forward * 0.39).Unit * 26
+                    local candidate = groundPosition(goal, character, target)
+                    if walkingSegmentClear(rootPart, candidate, target) then
+                        wallGoal = candidate
+                        state.wallSide = side
+                        break
+                    end
+                end
+                if not wallGoal then
+                    local goal = rootPart.Position + Vector3.new(math.cos(bearing), 0, math.sin(bearing)) * 20
+                    wallGoal = chooseFallbackStep(rootPart, goal, target)
+                end
+                state.wanderGoal = wallGoal
+                state.wanderUntil = now + 6
             end
             state.status = "Holding for wave/door: " .. target.Name
             if state.wanderGoal then issueMove(humanoid, state.wanderGoal, "hold", now) end
@@ -2570,6 +2580,7 @@ local function setRunning(running)
         state.fallbackGoal, state.fallbackUntil = nil, 0
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0
         state.routeFails, state.wanderGoal, state.wanderUntil = 0, nil, 0
+        state.wallSide = nil
         state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
