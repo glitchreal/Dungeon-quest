@@ -1887,6 +1887,7 @@ local function controllerTick()
         end
         state.lastProgressDistance, state.stuckStartTime = math.huge, 0
         state.routeFails, state.wanderGoal, state.wallSide = 0, nil, nil
+        state.wallVisits, state.wallFlips = {}, 0
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
     -- Doomed round: same target for 3 minutes with zero kills and zero damage
@@ -1990,27 +1991,57 @@ local function controllerTick()
                 -- Wall-follow: the target sits behind a wall and pacing into
                 -- it loops forever. Walk ALONG the wall on a fixed side;
                 -- doors, stairs and ramps are found by traversal, and the 2s
-                -- re-probe resumes the advance when the ray clears. The fixed
-                -- side is the whole trick: never flip-flop.
+                -- re-probe resumes the advance when the ray clears. Fixed
+                -- side plus visited-ground memory is what breaks circles:
+                -- flipping sides or re-walking fresh ground is penalized.
                 local bearing = math.atan2(targetRoot.Position.Z - rootPart.Position.Z, targetRoot.Position.X - rootPart.Position.X)
                 state.wallSide = state.wallSide or (math.random() < 0.5 and 1 or -1)
-                local wallGoal
+                state.wallVisits = state.wallVisits or {}
+                for key, at in pairs(state.wallVisits) do
+                    if now - at > 45 then state.wallVisits[key] = nil end
+                end
+                local function visitPenalty(pos)
+                    local penalty = 0
+                    for key in pairs(state.wallVisits) do
+                        local cx, cz = key:match("([^:]+):([^:]+)")
+                        cx, cz = tonumber(cx), tonumber(cz)
+                        if cx and cz then
+                            local d = (Vector3.new(pos.X, 0, pos.Z) - Vector3.new(cx, 0, cz)).Magnitude
+                            if d < 14 then penalty = penalty + (14 - d) * 6 end
+                        end
+                    end
+                    return penalty
+                end
+                local bestGoal, bestScore, bestSide
                 for _, side in ipairs({ state.wallSide, -state.wallSide }) do
                     local tangent = Vector3.new(-math.sin(bearing), 0, math.cos(bearing)) * side
                     local forward = Vector3.new(math.cos(bearing), 0, math.sin(bearing))
                     local goal = rootPart.Position + (tangent * 0.92 + forward * 0.39).Unit * 26
                     local candidate = groundPosition(goal, character, target)
                     if walkingSegmentClear(rootPart, candidate, target) then
-                        wallGoal = candidate
-                        state.wallSide = side
-                        break
+                        local score = (side == state.wallSide and 0 or 60) + visitPenalty(candidate)
+                        if not bestScore or score < bestScore then
+                            bestScore, bestSide, bestGoal = score, side, candidate
+                        end
                     end
                 end
-                if not wallGoal then
+                if bestGoal then
+                    -- Only adopt a flipped side after repeated forced flips;
+                    -- a single blocked pick must not reverse the whole traverse.
+                    if bestSide ~= state.wallSide then
+                        state.wallFlips = (state.wallFlips or 0) + 1
+                        if state.wallFlips >= 3 then
+                            state.wallSide, state.wallFlips = bestSide, 0
+                        end
+                    else
+                        state.wallFlips = 0
+                    end
+                    state.wallVisits[math.floor(bestGoal.X / 7) .. ":" .. math.floor(bestGoal.Z / 7)] = now
+                    state.wanderGoal = bestGoal
+                else
                     local goal = rootPart.Position + Vector3.new(math.cos(bearing), 0, math.sin(bearing)) * 20
-                    wallGoal = chooseFallbackStep(rootPart, goal, target)
+                    state.wanderGoal = chooseFallbackStep(rootPart, goal, target)
                 end
-                state.wanderGoal = wallGoal
                 state.wanderUntil = now + 6
             end
             state.status = "Holding for wave/door: " .. target.Name
@@ -2136,7 +2167,7 @@ local function setRunning(running)
         state.fallbackGoal, state.fallbackUntil = nil, 0
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0
         state.routeFails, state.wanderGoal, state.wanderUntil = 0, nil, 0
-        state.wallSide = nil
+        state.wallSide, state.wallVisits, state.wallFlips = nil, {}, 0
         state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
