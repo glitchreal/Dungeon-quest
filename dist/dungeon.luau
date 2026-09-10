@@ -1093,43 +1093,47 @@ local function safeEnemyStep(startPosition, endPosition)
     return true
 end
 
+-- Steering uses Humanoid:Move (a continuous direction vector) instead of
+-- MoveTo (re-issued goals with internal timeouts and arrival behavior that
+-- read as stutter). Callers keep managing goals; this only turns them into
+-- smooth per-tick direction.
 local function issueMove(humanoid, position, mode, now, bypass)
-    if not bypass and CFG.AUTO_DODGE and #state.activeZones > 0 then
-        local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
-        if root then
-            local delta = position - root.Position
-            local nextPosition = delta.Magnitude > 12 and root.Position + delta.Unit * 12 or position
-            if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.HAZARD_MARGIN) then
-                humanoid:MoveTo(root.Position)
-                state.motionMode = "safety-hold"
-                state.movementBlocked = true
-                state.blockedByHazard = true
-                state.lastMoveToCall = 0
-                return
-            end
+    local character = humanoid.Parent
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not bypass and CFG.AUTO_DODGE and root and #state.activeZones > 0 then
+        local delta = position - root.Position
+        local nextPosition = delta.Magnitude > 12 and root.Position + delta.Unit * 12 or position
+        if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.HAZARD_MARGIN) then
+            humanoid:Move(Vector3.zero)
+            state.motionMode = "safety-hold"
+            state.movementBlocked = true
+            state.blockedByHazard = true
+            state.lastMoveToCall = 0
+            return
         end
     end
-    if not bypass and CFG.AUTO_DODGE and #state.nearbyEnemies > 0 then
-        local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
-        if root then
-            local delta = position - root.Position
-            local reach = math.max(3, humanoid.WalkSpeed * 0.3)
-            local step = delta.Magnitude > reach and root.Position + delta.Unit * reach or position
-            if not safeEnemyStep(root.Position, step) then
-                humanoid:MoveTo(root.Position)
-                state.motionMode, state.movementBlocked = "safety-hold", true
-                state.lastEscapePlan = -math.huge
-                state.lastMoveToCall = 0
-                return
-            end
+    if not bypass and CFG.AUTO_DODGE and root and #state.nearbyEnemies > 0 then
+        local delta = position - root.Position
+        local reach = math.max(3, humanoid.WalkSpeed * 0.3)
+        local step = delta.Magnitude > reach and root.Position + delta.Unit * reach or position
+        if not safeEnemyStep(root.Position, step) then
+            humanoid:Move(Vector3.zero)
+            state.motionMode, state.movementBlocked = "safety-hold", true
+            state.lastEscapePlan = -math.huge
+            state.lastMoveToCall = 0
+            return
         end
     end
-    local changed = state.motionMode ~= mode or (position - state.lastMoveToPosition).Magnitude > 0.75
-    if changed or now - state.lastMoveToCall >= CFG.MOVETO_REFRESH_INTERVAL then
-        humanoid:MoveTo(position)
-        state.lastMoveToCall = now
-        state.lastMoveToPosition = position
+    if not root then return end
+    local delta = Vector3.new(position.X - root.Position.X, 0, position.Z - root.Position.Z)
+    if delta.Magnitude < 0.75 then
+        humanoid:Move(Vector3.zero)
+        state.motionMode = mode
+        return
     end
+    humanoid:Move(delta.Unit, false)
+    state.lastMoveToCall = now
+    state.lastMoveToPosition = position
     state.motionMode = mode
 end
 
@@ -1375,7 +1379,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
                     state.fallbackGoal, state.fallbackUntil = fallback, now + 0.6
                     issueMove(humanoid, fallback, mode, now)
                 else
-                    humanoid:MoveTo(rootPart.Position)
+                    humanoid:Move(Vector3.zero)
                 end
             end
         end
@@ -1903,7 +1907,6 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     rootPart.CFrame = rootPart.CFrame + delta
     table.insert(state.dodgeHistory, { at = now, distance = delta.Magnitude })
     logThreat("tp", { distance = math.floor(delta.Magnitude * 10) / 10 })
-    state.dodgedThreats[threat] = now
     state.lastDodgeTime = now
     state.safetyUntil = now + 0.75
     state.dodgeCount = state.dodgeCount + 1
@@ -1911,7 +1914,8 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     clearPath()
     state.motionGoal = nil
     state.fallbackGoal, state.fallbackUntil = nil, 0
-    humanoid:MoveTo(destination)
+    -- No MoveTo here: steering is continuous (Humanoid:Move) and the caller
+    -- issues direction on the same tick.
     state.motionMode = "dodge"
     state.lastPosition, state.stuckStartTime = destination, 0
     return true
@@ -2042,7 +2046,7 @@ end
 
 local function stopMovement(humanoid, rootPart)
     if state.motionMode == "hold" and not state.motionGoal then return end
-    humanoid:MoveTo(rootPart.Position)
+    humanoid:Move(Vector3.zero)
     state.motionMode = "hold"
     state.motionGoal = nil
     state.fallbackGoal, state.fallbackUntil = nil, 0
@@ -2123,7 +2127,7 @@ local function meleeThreat(rootPart)    local threat, closest = nil, math.huge
     return threat
 end
 
-local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now)
+local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, forceBlink)
     if not threat then return end
     local delta = goal - rootPart.Position
     if delta.Magnitude < 0.5 then return end
@@ -2133,7 +2137,12 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now)
     -- announcements). Melee separation walks: spending the 3-per-3s budget
     -- dodging bodies leaves nothing for the one-shot windup that follows.
     local telegraphed = not (typeof(threat) == "Instance" and threat:IsA("Model"))
-    if telegraphed and CFG.TELEPORT_DODGE then performDodgeTeleport(humanoid, rootPart, step, target, threat, now) end
+    -- Walk small dodges, blink far ones: anything inside half a second of
+    -- walking is smoother on foot; the blink is for real distance.
+    -- Emergencies (least-bad) and intentional bursts (windup) always blink.
+    if telegraphed and CFG.TELEPORT_DODGE and (forceBlink or delta.Magnitude > 12) then
+        performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
+    end
 end
 
 local function forceSeparationGoal(rootPart, targetRoot, target)
@@ -2238,7 +2247,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.escapeStartRisk = risk
                 state.escapeReason = "Strafing smash windup"
                 state.status = state.escapeReason
-                dodgeAlongEscape(humanoid, rootPart, goal, target, "windup" .. math.floor(now * 10), now)
+                dodgeAlongEscape(humanoid, rootPart, goal, target, "windup" .. math.floor(now * 10), now, true)
                 issueMove(humanoid, goal, "evade", now)
                 return true
             end
@@ -2312,7 +2321,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.escapeReason = "Cutting through weakest exposure"
                 state.status = state.escapeReason
                 logThreat("escape", state.escapeReason)
-                dodgeAlongEscape(humanoid, rootPart, backup, target, zone and zone.id or contactThreat, now)
+                dodgeAlongEscape(humanoid, rootPart, backup, target, zone and zone.id or contactThreat, now, true)
                 issueMove(humanoid, backup, "evade", now, true)
                 return true
             end
