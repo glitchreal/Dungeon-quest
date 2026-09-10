@@ -1512,9 +1512,12 @@ local function refreshSafety(rootPart, now)
     for _, zone in ipairs(zones) do
         if not loggedThreats[zone.id] then
             loggedThreats[zone.id] = true
+            local fp = zone.frame.Position
             logThreat("zone", {
                 name = typeof(zone.id) == "Instance" and zone.id:GetFullName() or ("announced:" .. tostring(zone.name or zone.shape)),
                 shape = zone.shape,
+                at = string.format("%d,%d,%d", math.floor(fp.X), math.floor(fp.Y), math.floor(fp.Z)),
+                size = tostring(zone.size),
             })
         end
     end
@@ -2361,16 +2364,26 @@ local function watchHealth(character)
             if root then
                 local nearby = {}
                 for _, zone in ipairs(state.activeZones) do
+                    local zp = zone.frame.Position
                     table.insert(nearby, {
                         name = typeof(zone.id) == "Instance" and zone.id:GetFullName() or "Announced telegraph",
                         clearance = ThreatGeometry.clearance(zone, root.Position, 0),
                         position = zone.frame.Position, size = zone.size, shape = zone.shape,
+                        zoneAt = string.format("%d,%d,%d", math.floor(zp.X), math.floor(zp.Y), math.floor(zp.Z)),
                     })
                 end
                 table.sort(nearby, function(a, b) return a.clearance < b.clearance end)
                 while #nearby > 4 do table.remove(nearby) end
                 state.lastDamage.position = root.Position
                 state.lastDamage.goal = state.escapeGoal
+                do
+                    local boss = state.currentTarget
+                    local bossRoot = boss and getRootPart(boss)
+                    if bossRoot then
+                        local bp = bossRoot.Position
+                        state.lastDamage.boss = (boss and boss.Name or "?") .. string.format(" @%d,%d,%d", math.floor(bp.X), math.floor(bp.Y), math.floor(bp.Z))
+                    end
+                end
                 state.lastDamage.speed = humanoid.WalkSpeed
                 state.lastDamage.nearestHazards = nearby
             end
