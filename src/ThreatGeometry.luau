@@ -12,6 +12,9 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
     if zone.shape == "ProtectorSmash" then
+        -- Smash corridors earn extra margin: they expand after being modeled
+        -- and every recent death landed a few studs inside the modeled edge.
+        margin = (margin or 0) + 4
         local height = math.abs(point.Y) - half.Y - BASE_MARGIN
         if height > 0 then return height end
         local forward = -point.Z

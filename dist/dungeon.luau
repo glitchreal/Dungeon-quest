@@ -214,6 +214,9 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
     if zone.shape == "ProtectorSmash" then
+        -- Smash corridors earn extra margin: they expand after being modeled
+        -- and every recent death landed a few studs inside the modeled edge.
+        margin = (margin or 0) + 4
         local height = math.abs(point.Y) - half.Y - BASE_MARGIN
         if height > 0 then return height end
         local forward = -point.Z
@@ -1899,6 +1902,16 @@ local function findEmergencySideStep(rootPart, target)
     return nil
 end
 
+local function threatIsSmash(threat)
+    if typeof(threat) == "string" then
+        return threat:find("smash", 1, true) ~= nil or threat:find("windup", 1, true)
+    end
+    for _, zone in ipairs(state.activeZones) do
+        if zone.id == threat and zone.shape == "ProtectorSmash" then return true end
+    end
+    return false
+end
+
 local function canTeleportDodge(now, distance, threat)
     local history = state.dodgeHistory
     while history[1] and now - history[1].at >= CFG.DODGE_WINDOW do table.remove(history, 1) end
@@ -1909,6 +1922,12 @@ local function canTeleportDodge(now, distance, threat)
     if previous and now - previous < CFG.DODGE_SAME_THREAT_COOLDOWN then return false end
     local spent = 0
     for _, entry in ipairs(history) do spent = spent + entry.distance end
+    -- Reserve a full blink for smash windups: anything else may only spend
+    -- what leaves 8 studs of budget. Gridshot clips are survivable; the slam
+    -- is not, and a dry budget at windup time is death.
+    if not threatIsSmash(threat) and spent + distance > CFG.DODGE_DISTANCE_BUDGET - 8 then
+        return false
+    end
     return spent + distance <= CFG.DODGE_DISTANCE_BUDGET + 0.001
 end
 
