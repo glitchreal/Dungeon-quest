@@ -671,8 +671,41 @@ local function chooseFallbackStep(rootPart, goal, target)
     return best
 end
 
-local function findRecoveryPath(rootPart, goal, target, minRise)
-    local params = buildRaycastParams(rootPart.Parent, target)
+-- Uphill survey: cast a transect from the player toward a higher goal and
+-- return the base of the nearest up-step (stairs/ramp), so long climbs chain
+-- stair-base -> local climb instead of walking the flat route underneath.
+local function surveyUphill(rootPart, targetPos)
+    local flat = Vector3.new(targetPos.X - rootPart.Position.X, 0, targetPos.Z - rootPart.Position.Z)
+    local dist = flat.Magnitude
+    if dist < 12 then return nil end
+    local dir = flat.Unit
+    local params = buildRaycastParams(rootPart.Parent, nil)
+    params.RespectCanCollide = true
+    local prev = rootPart.Position + Vector3.new(0, 2, 0)
+    local prevGround = Workspace:Raycast(prev, Vector3.new(0, -14, 0), params)
+    local prevY = (prevGround and prevGround.Position.Y) or rootPart.Position.Y
+    local step, i = 10, 1
+    while i * step < math.min(dist, 150) do
+        local sample = rootPart.Position + dir * (i * step)
+        local hit = Workspace:Raycast(sample + Vector3.new(0, 30, 0), Vector3.new(0, -70, 0), params)
+        if hit and hit.Normal.Y > 0.6 and not hit.Instance.Name:lower():find("lava", 1, true) then
+            if hit.Position.Y - prevY > 4 then
+                -- Walk to just before the step; close-range climb takes over.
+                local base = rootPart.Position + dir * ((i - 1) * step)
+                local baseHit = Workspace:Raycast(base + Vector3.new(0, 30, 0), Vector3.new(0, -70, 0), params)
+                if baseHit and baseHit.Normal.Y > 0.55 then
+                    return baseHit.Position + Vector3.new(0, 2.5, 0)
+                end
+                return nil
+            end
+            prevY = hit.Position.Y
+        end
+        i = i + 1
+    end
+    return nil
+end
+
+local function findRecoveryPath(rootPart, goal, target, minRise)    local params = buildRaycastParams(rootPart.Parent, target)
     params.RespectCanCollide = true
     local start = rootPart.Position
     minRise = minRise or 4
@@ -1005,23 +1038,6 @@ local function refreshSafety(rootPart, now)
         end
     end
     state.nearbyEnemies = enemies
-    -- Volley siege: 2+ fresh smash corridors means a synchronized volley.
-    -- Hold ground and exit laterally instead of pushing through the wall
-    -- back to the boss; the corridors resolve in ~2s.
-    do
-        local freshSmash = 0
-        for _, zone in ipairs(zones) do
-            if zone.shape == "ProtectorSmash" and zone.born and now - zone.born < 1.5 then
-                freshSmash = freshSmash + 1
-            end
-        end
-        if freshSmash >= 2 then
-            if not (state.siegeUntil and now < state.siegeUntil) then
-                state.siegeAnchor = rootPart.Position
-            end
-            state.siegeUntil = now + 2.5
-        end
-    end
     state.safeSpots = {}
     for part in pairs(safeSpots) do
         if part.Parent and part:IsDescendantOf(Workspace) then
@@ -1276,12 +1292,6 @@ local function findEscapeGoal(rootPart, targetRoot)
                         score = score + math.max(0, originalDist - targetDistance) * 8
                             - math.max(0, targetDistance - originalDist) * 12
                     end
-                    if state.siegeUntil and os.clock() < state.siegeUntil and state.siegeAnchor then
-                        -- Siege: hold ground near the anchor. Pulling back to
-                        -- the boss through a resolving volley wall is suicide.
-                        score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
-                            - radius * 2 - (candidate - state.siegeAnchor).Magnitude * 2
-                    end
                     table.insert(candidates, { position = candidate, score = score, risk = risk, radius = radius })
                 end
             end
@@ -1357,9 +1367,6 @@ local function findLeastBadStep(rootPart, target)
                     local candDist = (candidate - bossPosition).Magnitude
                     score = score + math.max(0, originalLbDist - candDist) * 8
                         - math.max(0, candDist - originalLbDist) * 12
-                end
-                if state.siegeUntil and os.clock() < state.siegeUntil and state.siegeAnchor then
-                    score = score + (candidate - state.siegeAnchor).Magnitude * 4
                 end
                 if not bestScore or score < bestScore then best, bestScore = candidate, score end
             end
@@ -1708,10 +1715,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
     local contactDistance = (targetRoot.Position - rootPart.Position).Magnitude
-    -- The flank doctrine holds ~13 studs off the Protector; only break it for
-    -- true contact, not the standard melee envelope.
-    local isProtectorTarget = target.Name == "Ancient Temple Protector"
-    if contactThreat and ((contactThreat == target and not isProtectorTarget) or contactDistance <= (isProtectorTarget and 9 or CFG.MELEE_DANGER_DISTANCE)) then
+    if contactThreat and (contactThreat == target or contactDistance <= CFG.MELEE_DANGER_DISTANCE) then
         local separation = forceSeparationGoal(rootPart, targetRoot, target)
         state.retreating = true
         if separation then
@@ -1744,10 +1748,10 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             local dist = away.Magnitude
             if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) else away = away.Unit end
             local goal
-            if dist > 22 then
+            if dist > 20 then
                 -- Phase 1: close distance fast while rectangles are small.
                 local toward = Vector3.new(-away.X, 0, -away.Z)
-                goal = rootPart.Position + toward * math.min(14, dist - 18)
+                goal = rootPart.Position + toward * math.min(14, dist - 14)
             else
                 -- Phase 2: strafe whichever side has more open space.
                 local tangent = Vector3.new(-away.Z, 0, away.X)
@@ -1773,7 +1777,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.escapeGoal, state.escapeUntil = goal, now + 0.5
                 state.escapeMargin = CFG.HAZARD_MARGIN
                 state.escapeStartRisk = risk
-                state.escapeReason = dist > 22 and "Closing on smash windup" or "Strafing smash by open space"
+                state.escapeReason = dist > 20 and "Closing on smash windup" or "Strafing smash by open space"
                 state.status = state.escapeReason
                 dodgeAlongEscape(humanoid, rootPart, goal, target, "smash" .. math.floor(now * 10), now, true)
                 issueMove(humanoid, goal, "evade", now)
@@ -1985,8 +1989,8 @@ local function controllerTick()
         local offset = rootPart.Position - targetRoot.Position
         if Vector3.new(offset.X, 0, offset.Z).Magnitude > 40 then
             local side = offset:Dot(targetRoot.CFrame.RightVector) >= 0 and 1 or -1
-            protectorApproach = groundPosition(targetRoot.Position + targetRoot.CFrame.RightVector * side * 16
-                - targetRoot.CFrame.LookVector * 6, character, target)
+            protectorApproach = groundPosition(targetRoot.Position + targetRoot.CFrame.RightVector * side * 24
+                - targetRoot.CFrame.LookVector * 16, character, target)
         end
     end
     state.prevHealth[target] = targetHumanoid.Health
@@ -2127,9 +2131,7 @@ local function controllerTick()
         end
         state.status = "Routing around obstacle to " .. target.Name
         local approachGoal = protectorApproach or (protectorRear
-            and groundPosition(targetRoot.Position + targetRoot.CFrame.RightVector
-                * ((rootPart.Position - targetRoot.Position):Dot(targetRoot.CFrame.RightVector) >= 0 and 1 or -1) * 18
-                - targetRoot.CFrame.LookVector * 4, character, target)) or targetRoot.Position
+            and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target)) or targetRoot.Position
         followGoal(humanoid, rootPart, approachGoal, "approach", now, target)
         updateProgress(humanoid, rootPart, approachGoal, target, now)
         return
@@ -2168,18 +2170,15 @@ local function controllerTick()
     elseif CFG.FARM_POSITION == "Right" then flat = targetRoot.CFrame.RightVector end
     flat = Vector3.new(flat.X, 0, flat.Z)
     if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
-    -- Protector doctrine: hug a close flank (~13 studs, ~75 degrees off the
-    -- facing). Frontal smash corridors are narrow near the boss, so a flank
-    -- hold dodges them passively; the lead angle keeps the orbit moving.
-    local holdDistance = CFG.COMBAT_DISTANCE
     if protectorRear then
         local radial = Vector3.new(offset.X, 0, offset.Z)
-        if radial.Magnitude < 0.1 then radial = Vector3.new(1, 0, 0) else radial = radial.Unit end
-        state.protectorOrbitSide = state.protectorOrbitSide or 1
-        flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi * 0.42):VectorToWorldSpace(radial)
-        holdDistance = 13
+        if radial.Magnitude > 0.1 then
+            radial = radial.Unit
+            state.protectorOrbitSide = state.protectorOrbitSide or 1
+            flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi / 6):VectorToWorldSpace(radial)
+        end
     end
-    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * holdDistance, character, target)
+    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
     -- Idle creep (Protector): with no active threats, blink small steps
     -- toward the hold instead of only walking. Closes distance between
     -- volleys so the fight happens at sidestep range, not cross-arena.
