@@ -2366,9 +2366,17 @@ local function controllerTick()
         if distance > 50 and (state.routeFails or 0) > 20 then
             if not state.wanderGoal or now > (state.wanderUntil or 0)
                 or (state.wanderGoal - rootPart.Position).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD then
+                -- Far wander (55 studs): dungeon rooms are gated by inviswalls
+                -- with the real route elsewhere. Short pacing never finds the
+                -- door; long biased steps with visit memory do. The 2s
+                -- re-probe above resumes the advance when a route opens.
                 local angle = math.random() * math.pi * 2
-                local goal = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 14
-                state.wanderGoal = chooseFallbackStep(rootPart, goal, target) or groundPosition(goal, character, target)
+                local goal = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 55
+                local far = groundPosition(goal, character, target)
+                -- Stride the full distance when the corridor is open; probe
+                -- short steps when walled in.
+                state.wanderGoal = (walkingSegmentClear(rootPart, far, target) and far)
+                    or chooseFallbackStep(rootPart, goal, target) or far
                 state.wanderUntil = now + 4
             end
             state.status = "Holding for wave/door: " .. target.Name
