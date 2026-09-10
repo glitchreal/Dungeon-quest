@@ -1413,6 +1413,23 @@ local function refreshSafety(rootPart, now)
         end
     end
     state.nearbyEnemies = enemies
+    -- Volley siege: 2+ fresh smash corridors means a synchronized volley.
+    -- Hold ground and exit laterally instead of pushing through the wall
+    -- back to the boss; the corridors resolve in ~2s.
+    do
+        local freshSmash = 0
+        for _, zone in ipairs(zones) do
+            if zone.shape == "ProtectorSmash" and zone.born and now - zone.born < 1.5 then
+                freshSmash = freshSmash + 1
+            end
+        end
+        if freshSmash >= 2 then
+            if not (state.siegeUntil and now < state.siegeUntil) then
+                state.siegeAnchor = rootPart.Position
+            end
+            state.siegeUntil = now + 2.5
+        end
+    end
     state.safeSpots = {}
     for part in pairs(safeSpots) do
         if part.Parent and part:IsDescendantOf(Workspace) then
@@ -1516,7 +1533,7 @@ local function refreshSafety(rootPart, now)
             logThreat("zone", {
                 name = typeof(zone.id) == "Instance" and zone.id:GetFullName() or ("announced:" .. tostring(zone.name or zone.shape)),
                 shape = zone.shape,
-                at = string.format("%d,%d,%d", math.floor(fp.X), math.floor(fp.Y), math.floor(fp.Z)),
+                zat = string.format("%d,%d,%d", math.floor(fp.X), math.floor(fp.Y), math.floor(fp.Z)),
                 size = tostring(zone.size),
             })
         end
@@ -1647,6 +1664,12 @@ local function findEscapeGoal(rootPart, targetRoot)
                     local score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
                         - radius * 2 - math.abs(targetDistance - desiredDistance)
                         - math.max(0, targetDistance - CFG.ATTACK_RANGE) * 4
+                    if state.siegeUntil and os.clock() < state.siegeUntil and state.siegeAnchor then
+                        -- Siege: hold ground near the anchor. Pulling back to
+                        -- the boss through a resolving volley wall is suicide.
+                        score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
+                            - radius * 2 - (candidate - state.siegeAnchor).Magnitude * 2
+                    end
                     table.insert(candidates, { position = candidate, score = score, risk = risk, radius = radius })
                 end
             end
@@ -1715,6 +1738,9 @@ local function findLeastBadStep(rootPart, target)
                 local score = risk * 1000 + radius
                 if bossPosition then
                     score = score + math.max(0, (candidate - bossPosition).Magnitude - 34) * 3
+                end
+                if state.siegeUntil and os.clock() < state.siegeUntil and state.siegeAnchor then
+                    score = score + (candidate - state.siegeAnchor).Magnitude * 4
                 end
                 if not bestScore or score < bestScore then best, bestScore = candidate, score end
             end
