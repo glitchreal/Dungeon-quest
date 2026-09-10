@@ -738,7 +738,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     end
     state.directTravel = false
 
-    local shouldRepath = state.pathBlocked or #state.waypoints == 0 or not state.pathGoal or (goal - state.pathGoal).Magnitude > 2
+    local shouldRepath = state.pathBlocked or #state.waypoints == 0 or not state.pathGoal or (goal - state.pathGoal).Magnitude > 6
     if shouldRepath and not state.pathPending and now - state.pathUpdateTime >= CFG.PATH_UPDATE_INTERVAL and (goal - rootPart.Position).Magnitude > CFG.WAYPOINT_REACH_THRESHOLD then
         state.pathUpdateTime = now
         state.pathPending = true
@@ -896,6 +896,10 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
     state.stuckCount = state.stuckCount + 1
     if state.stuckStartTime == 0 then state.stuckStartTime = now end
     if now - state.stuckStartTime < CFG.STUCK_TIMEOUT then return false end
+    -- Rate-limit recoveries: chained lateral hops every 0.75s read as
+    -- oscillation. One committed recovery per 2s, then keep walking it.
+    if now - (state.lastRecoveryAt or -math.huge) < 2 then return true end
+    state.lastRecoveryAt = now
 
     state.stuckRetries = state.stuckRetries + 1
     state.stuckStartTime = now
@@ -1824,6 +1828,25 @@ local function controllerTick()
         state.routeFails, state.wanderGoal = 0, nil
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
+    -- Doomed round: same target for 3 minutes with zero kills and zero damage
+    -- dealt (e.g. mob under the map behind a wall that never opens). Solo
+    -- only, so nobody else's run is ever touched. Leaves via teleToLobby.
+    do
+        local dw = state.doomWatch
+        local hp = targetHumanoid and targetHumanoid.Health or 0
+        if not dw or dw.target ~= target then
+            state.doomWatch = { target = target, since = now, kills = state.kills, hp = hp }
+        elseif now - dw.since >= 180 and state.kills == dw.kills and hp >= dw.hp and not state.doomFired then
+            if #Players:GetPlayers() <= 1 then
+                state.doomFired = true
+                logThreat("doomed", target.Name)
+                warn("[EnemyWalker] doomed round, leaving: " .. target.Name)
+                pcall(function()
+                    game:GetService("ReplicatedStorage"):WaitForChild("remotes"):WaitForChild("teleToLobby", 5):FireServer()
+                end)
+            end
+        end
+    end
     local protectorRear = target.Name == "Ancient Temple Protector"
     local protectorApproach
     if protectorRear then
@@ -1903,14 +1926,14 @@ local function controllerTick()
                 -- Bias toward the target's bearing: doors/triggers lie that
                 -- way far more often than behind us.
                 local bearing = math.atan2(targetRoot.Position.Z - rootPart.Position.Z, targetRoot.Position.X - rootPart.Position.X)
-                local angle = bearing + (math.random() * 2.4 - 1.2)
+                local angle = bearing + (math.random() * 1.4 - 0.7)
                 local goal = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 55
                 local far = groundPosition(goal, character, target)
                 -- Stride the full distance when the corridor is open; probe
                 -- short steps when walled in.
                 state.wanderGoal = (walkingSegmentClear(rootPart, far, target) and far)
                     or chooseFallbackStep(rootPart, goal, target) or far
-                state.wanderUntil = now + 4
+                state.wanderUntil = now + 8
             end
             state.status = "Holding for wave/door: " .. target.Name
             if state.wanderGoal then issueMove(humanoid, state.wanderGoal, "hold", now) end
@@ -2035,6 +2058,7 @@ local function setRunning(running)
         state.fallbackGoal, state.fallbackUntil = nil, 0
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0
         state.routeFails, state.wanderGoal, state.wanderUntil = 0, nil, 0
+        state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
         createWaypointFolder()
