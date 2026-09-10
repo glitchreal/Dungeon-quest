@@ -2502,9 +2502,12 @@ local function controllerTick()
         -- Target on a higher level: the flat navmesh route walks underneath
         -- and never climbs. Chain upward recovery steps toward the target
         -- until the height gap closes. Gated on SUSTAINED elevation so flying
-        -- trash bobbing up and down doesn't yo-yo the bot up every slope.
+        -- trash bobbing up and down doesn't yo-yo the bot up every slope, and
+        -- on horizontal closeness so far targets route normally instead of
+        -- climbing random hills hundreds of studs away.
         local climbDy = targetRoot.Position.Y - rootPart.Position.Y
-        if climbDy > 8 then
+        local climbFlat = Vector3.new(targetRoot.Position.X - rootPart.Position.X, 0, targetRoot.Position.Z - rootPart.Position.Z).Magnitude
+        if climbDy > 8 and climbFlat < 80 then
             state.climbDySince = state.climbDySince or now
         else
             state.climbDySince = nil
