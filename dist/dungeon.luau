@@ -218,8 +218,9 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
         if height > 0 then return height end
         local forward = -point.Z
         local travel = zone.travelDistance
-        if zone.forecastAge then
-            travel = math.min(travel, math.max(0, zone.forecastAge + 0.25 + (arrivalTime or 0)) * 50)
+        local age = zone.born and (os.clock() - zone.born) or zone.forecastAge or 0
+        if zone.born or zone.forecastAge then
+            travel = math.min(travel, math.max(0, age + 0.25 + (arrivalTime or 0)) * 50)
         end
         local width = zone.startWidth * 0.5 + math.clamp(forward + 5, 0, travel) * 0.5
         return math.max(math.abs(point.X) - width - margin,
@@ -244,6 +245,31 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
     local height = math.abs(point.Y) - half.Y - BASE_MARGIN
     if height > 0 then return height end
     return math.max(math.abs(point.X) - half.X - margin, math.abs(point.Z) - half.Z - margin)
+end
+
+-- Lateral exit from a traveling smash corridor: how far sideways out of the
+-- corridor, and in which world direction the nearer edge lies. Returns nil
+-- when already clear or too deep to matter.
+function Geometry.smashExit(zone, position, margin)
+    if zone.shape ~= "ProtectorSmash" then return nil end
+    local point = zone.frame:PointToObjectSpace(position)
+    local half = zone.size * 0.5
+    if math.abs(point.Y) - half.Y - BASE_MARGIN > 0 then return nil end
+    local forward = -point.Z
+    local travel = zone.travelDistance
+    local age = zone.born and (os.clock() - zone.born) or zone.forecastAge or 0
+    if zone.born or zone.forecastAge then
+        travel = math.min(travel, math.max(0, age + 0.25) * 50)
+    end
+    local width = zone.startWidth * 0.5 + math.clamp(forward + 5, 0, travel) * 0.5
+    local need = width + (margin or 0) - math.abs(point.X)
+    if need <= 0 or need > 45 then return nil end
+    local lateral = zone.frame.RightVector
+    if math.abs(lateral.Y) > 0.5 then return nil end
+    lateral = Vector3.new(lateral.X, 0, lateral.Z)
+    if lateral.Magnitude < 0.01 then return nil end
+    if point.X < 0 then lateral = -lateral end
+    return need, lateral.Unit
 end
 
 function Geometry.risk(zones, position, margin)
@@ -293,6 +319,7 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
         previousRisk = risk
     end
     return true
+end
 
 -- Adaptive safety spacing: adds margin based on recent hit and health.
 -- 3 studs briefly after a hit, up to 8 studs at low health.
@@ -603,7 +630,21 @@ local state = {
     enemyMotion = setmetatable({}, { __mode = "k" }),
     retreating = false,
     pathComputations = 0,
+    threatLog = {},
 }
+
+-- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
+-- Lets a later hit be explained from the previous ~60s of decisions.
+local function logThreat(kind, info)
+    local entry = { at = os.clock(), kind = kind }
+    if type(info) == "table" then
+        for key, value in pairs(info) do entry[key] = value end
+    else
+        entry.detail = info
+    end
+    table.insert(state.threatLog, entry)
+    while #state.threatLog > 160 do table.remove(state.threatLog, 1) end
+end
 
 local abilities = AbilityController.new(player, function(slot)
     if state.closed then return end
@@ -623,6 +664,8 @@ local humanoidModels = {}
 -- lets the dodge check remain cheap and catches indicators created under Workspace.
 local threatParts = {}
 local announcedZones = {}
+local safeSpots = {}
+local loggedThreats = setmetatable({}, { __mode = "k" })
 local aquaticLineTemplates = {}
 do
     local templates = game:GetService("ReplicatedStorage"):FindFirstChild("enemyProjectiles")
@@ -644,12 +687,17 @@ local function trackInstance(instance)
         if not instance.CanCollide and (not state.waypointFolder or not instance:IsDescendantOf(state.waypointFolder)) then
             threatParts[instance] = { createdAt = now, lastPosition = instance.Position, lastAt = now }
         end
+        local safeName = instance:GetFullName():lower()
+        if safeName:find("safespot", 1, true) or safeName:find("safezone", 1, true) then
+            safeSpots[instance] = true
+        end
     end
 end
 connect(Workspace.DescendantAdded, trackInstance)
 connect(Workspace.DescendantRemoving, function(instance)
     local sample = threatParts[instance]
     if sample and sample.zone then sample.removedAt = os.clock() else threatParts[instance] = nil end
+    safeSpots[instance] = nil
     humanoidModels[instance] = nil
 end)
 for _, instance in ipairs(Workspace:GetDescendants()) do trackInstance(instance) end
@@ -1024,8 +1072,8 @@ local function safeEnemyStep(startPosition, endPosition)
     return true
 end
 
-local function issueMove(humanoid, position, mode, now)
-    if CFG.AUTO_DODGE and #state.activeZones > 0 then
+local function issueMove(humanoid, position, mode, now, bypass)
+    if not bypass and CFG.AUTO_DODGE and #state.activeZones > 0 then
         local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
         if root then
             local delta = position - root.Position
@@ -1040,7 +1088,7 @@ local function issueMove(humanoid, position, mode, now)
             end
         end
     end
-    if CFG.AUTO_DODGE and #state.nearbyEnemies > 0 then
+    if not bypass and CFG.AUTO_DODGE and #state.nearbyEnemies > 0 then
         local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
         if root then
             local delta = position - root.Position
@@ -1359,6 +1407,16 @@ local function refreshSafety(rootPart, now)
         end
     end
     state.nearbyEnemies = enemies
+    state.safeSpots = {}
+    for part in pairs(safeSpots) do
+        if part.Parent and part:IsDescendantOf(Workspace) then
+            if (part.Position - rootPart.Position).Magnitude <= 120 then
+                table.insert(state.safeSpots, part.Position + Vector3.new(0, 2.5, 0))
+            end
+        else
+            safeSpots[part] = nil
+        end
+    end
     for i = #announcedZones, 1, -1 do
         local zone = announcedZones[i]
         if zone.origin then
@@ -1408,13 +1466,13 @@ local function refreshSafety(rootPart, now)
                 local velocity = part.AssemblyLinearVelocity
                 if velocity.Magnitude < 1 then velocity = (part.Position - sample.lastPosition) / elapsed end
                 local projectile = (name:find("projectile") or name:find("missile") or name:find("shot")) and velocity.Magnitude > 1
-                local named = part.Transparency < 0.95 and (name:find("hitbox") or name:find("precast") or name:find("telegraph") or name:find("warning") or name:find("danger") or name:find("attack"))
+                local named = part.Transparency < 0.95 and (name:find("hitbox") or name:find("precast") or name:find("telegraph") or name:find("warning") or name:find("danger") or name:find("attack") or name:find("bomb") or name:find("spike") or name:find("orb") or name:find("blast") or name:find("slam") or name:find("flame") or name:find("beam"))
                 local attributed = part:GetAttribute("Attack") == true or part:GetAttribute("Hitbox") == true or part:GetAttribute("Damage") ~= nil
                 local floorMarker = part:IsA("Part") and ((part.Shape == Enum.PartType.Block and part.Size.Y <= 4)
                     or (part.Shape == Enum.PartType.Cylinder and part.Size.X <= 4))
                 local precast = floorMarker and part.Parent == Workspace and part.Anchored and not part.CanCollide
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
-                if not name:find("safespot") and (projectile or named or attributed or precast or damageContainer or protectorSmash or lineBox) then
+                if not (name:find("safespot") or name:find("safezone")) and (projectile or named or attributed or precast or damageContainer or protectorSmash or lineBox) then
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
                     local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
                     local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
@@ -1426,7 +1484,7 @@ local function refreshSafety(rootPart, now)
                         local humanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
                         sample.zone = { frame = smashBox.CFrame, size = Vector3.new(150, 150, travel * 2 + 10),
                             shape = "ProtectorSmash", startWidth = part.Size.X, travelDistance = travel, id = part,
-                            forecastAge = now - sample.createdAt, walkSpeed = humanoid and humanoid.WalkSpeed or 16 }
+                            forecastAge = now - sample.createdAt, born = now, walkSpeed = humanoid and humanoid.WalkSpeed or 16 }
                     elseif lineBox then
                         sample.zone = { frame = lineBox.CFrame, size = lineBox.Size, shape = "Block",
                             id = part, kind = "AquaticDelayedLine", name = lineName }
@@ -1445,6 +1503,15 @@ local function refreshSafety(rootPart, now)
         end
     end
     state.activeZones = zones
+    for _, zone in ipairs(zones) do
+        if not loggedThreats[zone.id] then
+            loggedThreats[zone.id] = true
+            logThreat("zone", {
+                name = typeof(zone.id) == "Instance" and zone.id:GetFullName() or ("announced:" .. tostring(zone.name or zone.shape)),
+                shape = zone.shape,
+            })
+        end
+    end
 end
 
 local function crowdDistance(position)
@@ -1515,6 +1582,41 @@ local function findEscapeGoal(rootPart, targetRoot)
         end
     end
     local originalCrowd = crowdDistance(rootPart.Position)
+    -- Young smash corridors: exit strictly sideways. Generic gradient steps
+    -- waste the ~1s windup on diagonals that never leave the corridor.
+    do
+        local need, lateral
+        for _, activeZone in ipairs(state.activeZones) do
+            local exitNeed, exitDir = ThreatGeometry.smashExit(activeZone, rootPart.Position, CFG.HAZARD_MARGIN)
+            if exitNeed and (not need or exitNeed < need) then need, lateral = exitNeed, exitDir end
+        end
+        if need and lateral then
+            for _, extra in ipairs({ 2, 6, 10 }) do
+                for _, dir in ipairs({ lateral, -lateral }) do
+                    local candidate = groundPosition(rootPart.Position + dir * (need + extra), rootPart.Parent, targetRoot.Parent)
+                    if safeEnemyStep(rootPart.Position, candidate)
+                        and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
+                        and walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor) then
+                        return candidate
+                    end
+                end
+            end
+        end
+    end
+    if originalRisk > 0 and state.safeSpots and #state.safeSpots > 0 then
+        local bestSpot, bestSpotDist
+        for _, spot in ipairs(state.safeSpots) do
+            local dist = (spot - rootPart.Position).Magnitude
+            if dist <= 80 and (not bestSpotDist or dist < bestSpotDist)
+                and ThreatGeometry.risk(state.activeZones, spot, CFG.HAZARD_MARGIN) == 0
+                and safeEnemyStep(rootPart.Position, spot)
+                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, spot, CFG.HAZARD_MARGIN)
+                and walkingSegmentClear(rootPart, spot, targetRoot.Parent, params, floor) then
+                bestSpot, bestSpotDist = spot, dist
+            end
+        end
+        if bestSpot then return bestSpot end
+    end
     local crowdLimit = math.clamp(CFG.COMBAT_MIN_DISTANCE, 6, 22)
     local radii = originalRisk > 0 and { 5, 10, 18, 28, 40 } or { 3, 8, 14 }
     local angleSteps = 16
@@ -1576,6 +1678,31 @@ local function findEscapeGoal(rootPart, targetRoot)
     return nil
 end
 
+local function findLeastBadStep(rootPart, target)
+    -- No fully safe route exists. Standing still inside an active hitbox is
+    -- the worst option, so walk the reachable step with the lowest exposure.
+    -- Scores with a body-radius survival margin (2) instead of the comfort
+    -- margin: corridor blankets can still hold tight safe cells that the
+    -- planning margin would erase. Teleports keep their strict checks; only
+    -- the walk relaxes.
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    local best, bestScore
+    for _, radius in ipairs({ 3, 6, 10 }) do
+        for index = 0, 15 do
+            local angle = index * math.pi / 8
+            local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
+            if walkingSegmentClear(rootPart, candidate, target, params)
+                and safeEnemyStep(rootPart.Position, candidate) then
+                local risk = ThreatGeometry.risk(state.activeZones, candidate, 2)
+                local score = risk * 1000 + radius
+                if not bestScore or score < bestScore then best, bestScore = candidate, score end
+            end
+        end
+    end
+    return best
+end
+
 local function findEmergencySideStep(rootPart, target)
     local params = buildRaycastParams(rootPart.Parent, target)
     params.RespectCanCollide = true
@@ -1625,6 +1752,7 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     end
     rootPart.CFrame = rootPart.CFrame + delta
     table.insert(state.dodgeHistory, { at = now, distance = delta.Magnitude })
+    logThreat("tp", { distance = math.floor(delta.Magnitude * 10) / 10 })
     state.dodgedThreats[threat] = now
     state.lastDodgeTime = now
     state.safetyUntil = now + 0.75
@@ -1825,12 +1953,17 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if clearance < 0 then state.retreating = true
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
-    if contactThreat and (contactThreat == target or (targetRoot.Position - rootPart.Position).Magnitude <= CFG.MELEE_DANGER_DISTANCE) then
+    local contactDistance = (targetRoot.Position - rootPart.Position).Magnitude
+    -- The flank doctrine holds ~13 studs off the Protector; only break it for
+    -- true contact, not the standard melee envelope.
+    local isProtectorTarget = target.Name == "Ancient Temple Protector"
+    if contactThreat and ((contactThreat == target and not isProtectorTarget) or contactDistance <= (isProtectorTarget and 9 or CFG.MELEE_DANGER_DISTANCE)) then
         local separation = forceSeparationGoal(rootPart, targetRoot, target)
         state.retreating = true
         if separation then
             clearPath()
             state.escapeGoal, state.escapeUntil = separation, now + 1.25
+            state.escapeMargin = CFG.HAZARD_MARGIN
             state.escapeClear, state.lastEscapeCheck = true, now
             state.escapeReason = "Breaking melee contact"
             state.status = state.escapeReason
@@ -1855,14 +1988,22 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             state.lastEscapeCheck = now
         end
         if (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
-            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.HAZARD_MARGIN)
-            and safeEnemyStep(rootPart.Position, state.escapeGoal)
             and state.escapeClear
+            and safeEnemyStep(rootPart.Position, state.escapeGoal)
             and (crowd >= crowdLimit or crowdDistance(state.escapeGoal) > crowd) then
+            local contMargin = state.escapeMargin or CFG.HAZARD_MARGIN
+            -- Survival-margin escapes already accepted crossing exposure at
+            -- selection time; re-validating the strict segment would jitter
+            -- between cells instead of committing to the least-bad one.
+            if contMargin >= CFG.HAZARD_MARGIN
+                and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, contMargin) then
+                state.escapeGoal = nil
+            else
             state.status = state.escapeReason or "Avoiding nearby enemies"
             dodgeAlongEscape(humanoid, rootPart, state.escapeGoal, target, zone and zone.id or contactThreat, now)
             issueMove(humanoid, state.escapeGoal, "evade", now)
             return true
+            end
         end
     end
     state.escapeGoal = nil
@@ -1882,6 +2023,21 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.movementBlocked, state.blockedByHazard = false, false
     if not goal then
         state.blockedByHazard = false
+        if risk > 0 then
+            local backup = findLeastBadStep(rootPart, target)
+            if backup then
+                clearPath()
+                state.escapeGoal, state.escapeUntil = backup, now + 0.8
+                state.escapeMargin = 2
+                state.escapeClear, state.lastEscapeCheck = true, now
+                state.escapeReason = "Cutting through weakest exposure"
+                state.status = state.escapeReason
+                logThreat("escape", state.escapeReason)
+                dodgeAlongEscape(humanoid, rootPart, backup, target, zone and zone.id or contactThreat, now)
+                issueMove(humanoid, backup, "evade", now, true)
+                return true
+            end
+        end
         state.status = "Waiting for safe escape route"
         stopMovement(humanoid, rootPart)
         return true
@@ -1889,11 +2045,13 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     clearPath()
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
+    state.escapeMargin = CFG.HAZARD_MARGIN
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
     dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now)
     state.escapeReason = zone and "Escaping attack area" or "Avoiding nearby enemies"
     state.status = state.escapeReason
+    logThreat("escape", state.escapeReason)
     issueMove(humanoid, goal, "evade", now)
     return true
 end
@@ -1974,8 +2132,8 @@ local function controllerTick()
         local offset = rootPart.Position - targetRoot.Position
         if Vector3.new(offset.X, 0, offset.Z).Magnitude > 40 then
             local side = offset:Dot(targetRoot.CFrame.RightVector) >= 0 and 1 or -1
-            protectorApproach = groundPosition(targetRoot.Position + targetRoot.CFrame.RightVector * side * 24
-                - targetRoot.CFrame.LookVector * 16, character, target)
+            protectorApproach = groundPosition(targetRoot.Position + targetRoot.CFrame.RightVector * side * 16
+                - targetRoot.CFrame.LookVector * 6, character, target)
         end
     end
     state.prevHealth[target] = targetHumanoid.Health
@@ -2000,7 +2158,9 @@ local function controllerTick()
         restoreFacing()
         state.status = "Routing around obstacle to " .. target.Name
         local approachGoal = protectorApproach or (protectorRear
-            and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target)) or targetRoot.Position
+            and groundPosition(targetRoot.Position + targetRoot.CFrame.RightVector
+                * ((rootPart.Position - targetRoot.Position):Dot(targetRoot.CFrame.RightVector) >= 0 and 1 or -1) * 18
+                - targetRoot.CFrame.LookVector * 4, character, target)) or targetRoot.Position
         followGoal(humanoid, rootPart, approachGoal, "approach", now, target)
         updateProgress(humanoid, rootPart, approachGoal, target, now)
         return
@@ -2039,15 +2199,18 @@ local function controllerTick()
     elseif CFG.FARM_POSITION == "Right" then flat = targetRoot.CFrame.RightVector end
     flat = Vector3.new(flat.X, 0, flat.Z)
     if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
+    -- Protector doctrine: hug a close flank (~13 studs, ~75 degrees off the
+    -- facing). Frontal smash corridors are narrow near the boss, so a flank
+    -- hold dodges them passively; the lead angle keeps the orbit moving.
+    local holdDistance = CFG.COMBAT_DISTANCE
     if protectorRear then
         local radial = Vector3.new(offset.X, 0, offset.Z)
-        if radial.Magnitude > 0.1 then
-            radial = radial.Unit
-            state.protectorOrbitSide = state.protectorOrbitSide or 1
-            flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi / 6):VectorToWorldSpace(radial)
-        end
+        if radial.Magnitude < 0.1 then radial = Vector3.new(1, 0, 0) else radial = radial.Unit end
+        state.protectorOrbitSide = state.protectorOrbitSide or 1
+        flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi * 0.42):VectorToWorldSpace(radial)
+        holdDistance = 13
     end
-    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * holdDistance, character, target)
     if (Vector3.new(desiredPosition.X - rootPart.Position.X, 0, desiredPosition.Z - rootPart.Position.Z)).Magnitude < 2 then
         stopMovement(humanoid, rootPart)
         if distance <= CFG.ATTACK_RANGE then castSkill() end
@@ -2134,6 +2297,7 @@ local function shutdown()
     for _, connection in ipairs(connections) do connection:Disconnect() end
     table.clear(connections)
     table.clear(threatParts)
+    table.clear(safeSpots)
     table.clear(humanoidModels)
     table.clear(announcedZones)
 end
@@ -2168,6 +2332,7 @@ local function watchHealth(character)
                 state.lastDamage.nearestHazards = nearby
             end
             warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f)", state.damageEvents, previous, health))
+            logThreat("hit", { amount = math.floor(previous - health) })
         end
         previous = health
     end)

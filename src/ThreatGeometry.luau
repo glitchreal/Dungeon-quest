@@ -16,8 +16,9 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
         if height > 0 then return height end
         local forward = -point.Z
         local travel = zone.travelDistance
-        if zone.forecastAge then
-            travel = math.min(travel, math.max(0, zone.forecastAge + 0.25 + (arrivalTime or 0)) * 50)
+        local age = zone.born and (os.clock() - zone.born) or zone.forecastAge or 0
+        if zone.born or zone.forecastAge then
+            travel = math.min(travel, math.max(0, age + 0.25 + (arrivalTime or 0)) * 50)
         end
         local width = zone.startWidth * 0.5 + math.clamp(forward + 5, 0, travel) * 0.5
         return math.max(math.abs(point.X) - width - margin,
@@ -42,6 +43,31 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
     local height = math.abs(point.Y) - half.Y - BASE_MARGIN
     if height > 0 then return height end
     return math.max(math.abs(point.X) - half.X - margin, math.abs(point.Z) - half.Z - margin)
+end
+
+-- Lateral exit from a traveling smash corridor: how far sideways out of the
+-- corridor, and in which world direction the nearer edge lies. Returns nil
+-- when already clear or too deep to matter.
+function Geometry.smashExit(zone, position, margin)
+    if zone.shape ~= "ProtectorSmash" then return nil end
+    local point = zone.frame:PointToObjectSpace(position)
+    local half = zone.size * 0.5
+    if math.abs(point.Y) - half.Y - BASE_MARGIN > 0 then return nil end
+    local forward = -point.Z
+    local travel = zone.travelDistance
+    local age = zone.born and (os.clock() - zone.born) or zone.forecastAge or 0
+    if zone.born or zone.forecastAge then
+        travel = math.min(travel, math.max(0, age + 0.25) * 50)
+    end
+    local width = zone.startWidth * 0.5 + math.clamp(forward + 5, 0, travel) * 0.5
+    local need = width + (margin or 0) - math.abs(point.X)
+    if need <= 0 or need > 45 then return nil end
+    local lateral = zone.frame.RightVector
+    if math.abs(lateral.Y) > 0.5 then return nil end
+    lateral = Vector3.new(lateral.X, 0, lateral.Z)
+    if lateral.Magnitude < 0.01 then return nil end
+    if point.X < 0 then lateral = -lateral end
+    return need, lateral.Unit
 end
 
 function Geometry.risk(zones, position, margin)
@@ -91,6 +117,7 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
         previousRisk = risk
     end
     return true
+end
 
 -- Adaptive safety spacing: adds margin based on recent hit and health.
 -- 3 studs briefly after a hit, up to 8 studs at low health.
