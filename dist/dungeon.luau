@@ -1446,7 +1446,10 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
     state.stuckStartTime = now
     state.stuckCount = 0
     state.routeFails = (state.routeFails or 0) + 1
-    clearPath()
+    -- NOTE: no clearPath() here. Clearing bumps the path generation, which
+    -- discards the in-flight repath result, which stalls again, which clears
+    -- again: a permanent loop where no path ever survives to be walked.
+    -- Keep the current path; the Blocked event repaths if truly blocked.
     local recovery = chooseRecoveryGoal(rootPart, goal, target)
     if recovery then
         state.fallbackGoal, state.fallbackUntil = recovery, now + 1.6
