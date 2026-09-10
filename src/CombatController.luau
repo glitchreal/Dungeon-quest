@@ -1169,6 +1169,8 @@ local function findEscapeGoal(rootPart, targetRoot)
         end
     end
     local originalCrowd = crowdDistance(rootPart.Position)
+    local originalDist = (rootPart.Position - targetRoot.Position).Magnitude
+    local isProt = targetRoot.Parent and targetRoot.Parent.Name == "Ancient Temple Protector"
     -- Young smash corridors: exit strictly sideways. Generic gradient steps
     -- waste the ~1s windup on diagonals that never leave the corridor.
     do
@@ -1225,6 +1227,13 @@ local function findEscapeGoal(rootPart, targetRoot)
                     local score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
                         - radius * 2 - math.abs(targetDistance - desiredDistance)
                         - math.max(0, targetDistance - CFG.ATTACK_RANGE) * 4
+                    if isProt then
+                        -- Dodge FORWARD, never back: reward closing on the
+                        -- boss, punish backing off. Retreating from the
+                        -- Protector just sets up the next volley at range.
+                        score = score + math.max(0, originalDist - targetDistance) * 8
+                            - math.max(0, targetDistance - originalDist) * 12
+                    end
                     if state.siegeUntil and os.clock() < state.siegeUntil and state.siegeAnchor then
                         -- Siege: hold ground near the anchor. Pulling back to
                         -- the boss through a resolving volley wall is suicide.
@@ -1288,6 +1297,8 @@ local function findLeastBadStep(rootPart, target)
         local bossRoot = getRootPart(target)
         if bossRoot then bossPosition = bossRoot.Position end
     end
+    local isProtLB = target and target.Name == "Ancient Temple Protector"
+    local originalLbDist = (bossPosition and (rootPart.Position - bossPosition).Magnitude) or nil
     local best, bestScore
     for _, radius in ipairs({ 3, 6, 10 }) do
         for index = 0, 15 do
@@ -1299,6 +1310,11 @@ local function findLeastBadStep(rootPart, target)
                 local score = risk * 1000 + radius
                 if bossPosition then
                     score = score + math.max(0, (candidate - bossPosition).Magnitude - 34) * 3
+                end
+                if isProtLB and originalLbDist then
+                    local candDist = (candidate - bossPosition).Magnitude
+                    score = score + math.max(0, originalLbDist - candDist) * 8
+                        - math.max(0, candDist - originalLbDist) * 12
                 end
                 if state.siegeUntil and os.clock() < state.siegeUntil and state.siegeAnchor then
                     score = score + (candidate - state.siegeAnchor).Magnitude * 4
@@ -1507,11 +1523,27 @@ local function stopMovement(humanoid, rootPart)
 end
 
 -- Protector windup tell: hands rest at body level; a fast raise starts the
--- smash volley. Returns true on the tick the raise is detected.
+-- smash volley. A freshly started animation track on the boss counts too.
+-- Returns true on the tick the tell is detected.
 local function protectorWindup(target, now)
     if not target or target.Name ~= "Ancient Temple Protector" then
-        state.windHands = nil
+        state.windHands, state.windTracks = nil, nil
         return false
+    end
+    local humanoid = target:FindFirstChildOfClass("Humanoid")
+    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+    if animator then
+        local seen, fresh, nowSeen = state.windTracks, false, {}
+        local ok, tracks = pcall(function() return animator:GetPlayingAnimationTracks() end)
+        if ok and tracks then
+            for _, track in ipairs(tracks) do
+                local id = (track.Animation and track.Animation.AnimationId) or track.Name
+                nowSeen[id] = true
+                if not (seen and seen[id]) then fresh = true end
+            end
+        end
+        state.windTracks = nowSeen
+        if fresh and seen then return true end
     end
     local left = target:FindFirstChild("leftHandModel")
     local right = target:FindFirstChild("rightHandModel")
