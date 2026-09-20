@@ -1269,6 +1269,22 @@ local function findEscapeGoal(rootPart, targetRoot)
     if not floor then return nil end
     local candidates = {}
     local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
+    local targetOffset = rootPart.Position - targetRoot.Position
+    local targetRadial = Vector3.new(targetOffset.X, 0, targetOffset.Z)
+    if targetRadial.Magnitude < 0.1 then targetRadial = Vector3.new(1, 0, 0) end
+    targetRadial = targetRadial.Unit
+    local orbitDirection = Vector3.new(-targetRadial.Z, 0, targetRadial.X) * state.dodgeSide
+    local originalTargetDistance = Vector3.new(targetOffset.X, 0, targetOffset.Z).Magnitude
+    local function combatShapeScore(candidate)
+        local candidateOffset = candidate - targetRoot.Position
+        local targetDistance = Vector3.new(candidateOffset.X, 0, candidateOffset.Z).Magnitude
+        local movement = candidate - rootPart.Position
+        movement = Vector3.new(movement.X, 0, movement.Z)
+        local orbitAlignment = movement.Magnitude > 0.1 and movement.Unit:Dot(orbitDirection) or 0
+        local outward = math.max(0, targetDistance - originalTargetDistance)
+        local desiredError = math.abs(targetDistance - CFG.COMBAT_DISTANCE)
+        return orbitAlignment * 18 - outward * 24 - desiredError * 2, targetDistance
+    end
     if targetRoot.Parent.Name == "Ancient Temple Protector" then
         local toward = targetRoot.Position - rootPart.Position
         toward = Vector3.new(toward.X, 0, toward.Z)
@@ -1376,7 +1392,9 @@ local function findEscapeGoal(rootPart, targetRoot)
                     and safeEnemyStep(rootPart.Position, candidate) then
                     local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
                     local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
-                    local score = survivalRisk * 10000 + comfortRisk * 100 + distance
+                    local shapeScore, targetDistance = combatShapeScore(candidate)
+                    local score = survivalRisk * 10000 + comfortRisk * 100 + distance - shapeScore
+                        + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 4)) * 500
                     if ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, 2)
                         and (not bestScore or score < bestScore) then
                         best, bestScore = candidate, score
@@ -1394,7 +1412,8 @@ local function findEscapeGoal(rootPart, targetRoot)
                         accumulatedRisk = accumulatedRisk + sampleRisk
                     end
                     local fallbackCandidateScore = survivalRisk * 10000 + peakRisk * 1000
-                        + accumulatedRisk * 100 + comfortRisk * 10 + distance
+                        + accumulatedRisk * 100 + comfortRisk * 10 + distance - shapeScore
+                        + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 7)) * 500
                     if not fallbackScore or fallbackCandidateScore < fallbackScore then
                         fallback, fallbackScore = candidate, fallbackCandidateScore
                     end
@@ -1408,7 +1427,9 @@ local function findEscapeGoal(rootPart, targetRoot)
         local bestSpot, bestSpotDist
         for _, spot in ipairs(state.safeSpots) do
             local dist = (spot - rootPart.Position).Magnitude
+            local spotTargetDistance = (spot - targetRoot.Position).Magnitude
             if dist <= 80 and (not bestSpotDist or dist < bestSpotDist)
+                and spotTargetDistance <= math.max(CFG.ATTACK_RANGE, originalTargetDistance + 4)
                 and ThreatGeometry.risk(state.activeZones, spot, CFG.HAZARD_MARGIN) == 0
                 and safeEnemyStep(rootPart.Position, spot)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, spot, CFG.HAZARD_MARGIN)
@@ -1426,26 +1447,29 @@ local function findEscapeGoal(rootPart, targetRoot)
             local angle = i * math.pi * 2 / angleSteps
             local candidate = rootPart.Position + Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
             do
-                -- Hard no-back rule (Protector): never even consider an escape
-                -- that ends meaningfully farther from the boss. Scoring bias
-                -- alone loses to risk terms; this is a filter.
-                local backOk = true
-                if isProt then
-                    backOk = (candidate - targetRoot.Position).Magnitude <= originalDist + 8
-                end
+                -- Keep every combat escape on a tight target-centered leash.
+                -- A few studs of outward travel are allowed to clear a body,
+                -- but repeated hazards cannot walk the character to a wall.
+                local targetDistance = (candidate - targetRoot.Position).Magnitude
+                local backLimit = math.max(CFG.COMBAT_DISTANCE + 6,
+                    originalDist + (originalDist > CFG.ATTACK_RANGE and 1 or 4))
+                local backOk = targetDistance <= backLimit
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                 local crowd = crowdDistance(candidate)
                 local hazardClearance = 12
                 for _, activeZone in ipairs(state.activeZones) do
                     hazardClearance = math.min(hazardClearance, ThreatGeometry.clearance(activeZone, candidate, CFG.HAZARD_MARGIN))
                 end
-                if backOk and (originalRisk == 0 or risk < originalRisk - 0.1)
-                    and ((originalCrowd >= crowdLimit and not state.retreating) or crowd > originalCrowd + 0.25) then
-                    local targetDistance = (candidate - targetRoot.Position).Magnitude
+                local crowdOk = originalRisk > 0 and crowd >= originalCrowd - 0.5
+                    or (originalCrowd >= crowdLimit and not state.retreating)
+                    or crowd > originalCrowd + 0.25
+                if backOk and (originalRisk == 0 or risk < originalRisk - 0.1) and crowdOk then
                     local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
+                    local shapeScore = combatShapeScore(candidate)
                     local score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
                         - radius * 2 - math.abs(targetDistance - desiredDistance)
                         - math.max(0, targetDistance - CFG.ATTACK_RANGE) * 4
+                        + shapeScore
                     if isProt then
                         -- Dodge FORWARD, never back: reward closing on the
                         -- boss, punish backing off. Retreating from the
@@ -1510,8 +1534,12 @@ local function findLeastBadStep(rootPart, target)
         local bossRoot = getRootPart(target)
         if bossRoot then bossPosition = bossRoot.Position end
     end
-    local isProtLB = target and target.Name == "Ancient Temple Protector"
     local originalLbDist = (bossPosition and (rootPart.Position - bossPosition).Magnitude) or nil
+    local radial, tangent
+    if bossPosition and originalLbDist and originalLbDist > 0.1 then
+        radial = Vector3.new(rootPart.Position.X - bossPosition.X, 0, rootPart.Position.Z - bossPosition.Z).Unit
+        tangent = Vector3.new(-radial.Z, 0, radial.X) * state.dodgeSide
+    end
     local best, bestScore
     for _, radius in ipairs({ 3, 6, 10 }) do
         for index = 0, 15 do
@@ -1521,13 +1549,13 @@ local function findLeastBadStep(rootPart, target)
                 and safeEnemyStep(rootPart.Position, candidate) then
                 local risk = ThreatGeometry.risk(state.activeZones, candidate, 2)
                 local score = risk * 1000 + radius
-                if bossPosition then
-                    score = score + math.max(0, (candidate - bossPosition).Magnitude - 34) * 3
-                end
-                if isProtLB and originalLbDist then
+                if bossPosition and originalLbDist then
                     local candDist = (candidate - bossPosition).Magnitude
-                    score = score + math.max(0, originalLbDist - candDist) * 8
-                        - math.max(0, candDist - originalLbDist) * 12
+                    local movement = candidate - rootPart.Position
+                    movement = Vector3.new(movement.X, 0, movement.Z)
+                    local alignment = tangent and movement.Magnitude > 0.1 and movement.Unit:Dot(tangent) or 0
+                    score = score + math.max(0, candDist - originalLbDist) * 50
+                        + math.abs(candDist - CFG.COMBAT_DISTANCE) * 3 - alignment * 12
                 end
                 if not bestScore or score < bestScore then best, bestScore = candidate, score end
             end
@@ -1605,7 +1633,6 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     state.lastDodgeTime = now
     state.safetyUntil = now + 0.75
     state.dodgeCount = state.dodgeCount + 1
-    state.dodgeSide = -state.dodgeSide
     clearPath()
     state.motionGoal = nil
     state.fallbackGoal, state.fallbackUntil = nil, 0
@@ -1869,16 +1896,32 @@ end
 local function forceSeparationGoal(rootPart, targetRoot, target)
     local away = Vector3.new(rootPart.Position.X - targetRoot.Position.X, 0, rootPart.Position.Z - targetRoot.Position.Z)
     if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) else away = away.Unit end
+    local tangent = Vector3.new(-away.Z, 0, away.X)
     local params = buildRaycastParams(rootPart.Parent, target)
-    for _, distance in ipairs({ 3, 6, 10, 14 }) do
-        local candidate = groundPosition(rootPart.Position + away * distance, rootPart.Parent, target)
-        if walkingSegmentClear(rootPart, candidate, target, params)
-            and safeEnemyStep(rootPart.Position, candidate)
-            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN) then
-            return candidate
+    local originalDistance = (rootPart.Position - targetRoot.Position).Magnitude
+    local best, bestScore, bestSide
+    for _, side in ipairs({ state.dodgeSide, -state.dodgeSide }) do
+        -- Mostly tangent with only enough outward motion to break body contact.
+        -- This keeps the fight centered instead of retreating toward a wall.
+        local direction = (tangent * side + away * 0.22).Unit
+        for _, distance in ipairs({ 5, 8, 12, 16 }) do
+            local candidate = groundPosition(rootPart.Position + direction * distance, rootPart.Parent, target)
+            if walkingSegmentClear(rootPart, candidate, target, params)
+                and safeEnemyStep(rootPart.Position, candidate)
+                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN) then
+                local candidateDistance = (candidate - targetRoot.Position).Magnitude
+                local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                local score = risk * 1000 + math.max(0, candidateDistance - originalDistance) * 30
+                    + math.abs(candidateDistance - CFG.COMBAT_DISTANCE) * 2 + distance
+                    + (side == state.dodgeSide and 0 or 18)
+                if not bestScore or score < bestScore then
+                    best, bestScore, bestSide = candidate, score, side
+                end
+            end
         end
     end
-    return nil
+    if bestSide then state.dodgeSide = bestSide end
+    return best
 end
 
 
@@ -2032,7 +2075,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             -- between cells instead of committing to the least-bad one.
             -- They also bypass issueMove's guards, which would otherwise
             -- freeze the walk mid-escape (safety-hold inside a hitbox).
-            if contMargin >= CFG.HAZARD_MARGIN
+            if now >= (state.escapeCommitUntil or 0) and contMargin >= CFG.HAZARD_MARGIN
                 and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, contMargin) then
                 state.escapeGoal = nil
             else
@@ -2051,7 +2094,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             return true
         end
     end
-    if now - state.lastEscapePlan < 0.05 then return true end
+    if now - state.lastEscapePlan < 0.12 then return true end
     state.lastEscapePlan = now
     local goal, escapeMargin, escapeReason = findEscapeGoal(rootPart, targetRoot)
     if not goal and (risk > 0 or state.blockedByHazard) then
@@ -2085,7 +2128,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
     state.escapeMargin = escapeMargin or CFG.HAZARD_MARGIN
-    state.escapeCommitUntil = escapeMargin and now + 0.9 or now
+    state.escapeCommitUntil = escapeMargin and now + 0.9 or now + 0.45
     state.escapeStartRisk = risk
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
