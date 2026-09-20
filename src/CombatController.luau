@@ -1365,25 +1365,44 @@ local function findEscapeGoal(rootPart, targetRoot)
                 table.insert(exits, { distance = far + 4, direction = farDirection })
             end
         end
-        local best, bestScore
+        local best, bestScore, fallback, fallbackScore
+        local initialSurvivalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
         for _, exit in ipairs(exits) do
             for _, extra in ipairs({ 0, 6, 12 }) do
                 local distance = math.min(40, exit.distance + extra)
                 local candidate = groundPosition(rootPart.Position + exit.direction * distance,
                     rootPart.Parent, targetRoot.Parent)
                 if walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor)
-                    and safeEnemyStep(rootPart.Position, candidate)
-                    and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, 2) then
+                    and safeEnemyStep(rootPart.Position, candidate) then
                     local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
                     local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                     local score = survivalRisk * 10000 + comfortRisk * 100 + distance
-                    if not bestScore or score < bestScore then
+                    if ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, 2)
+                        and (not bestScore or score < bestScore) then
                         best, bestScore = candidate, score
+                    end
+                    -- Crossing grids can make every perpendicular route brush
+                    -- another already active strip.  Still choose a committed
+                    -- exit instead of falling back to a five-stud radial move.
+                    -- Penalize exposure sampled along the route so this is
+                    -- used only when no fully clear lateral crossing exists.
+                    local peakRisk, accumulatedRisk = initialSurvivalRisk, 0
+                    for sample = 1, 8 do
+                        local sampleRisk = ThreatGeometry.risk(state.activeZones,
+                            rootPart.Position:Lerp(candidate, sample / 8), 2)
+                        peakRisk = math.max(peakRisk, sampleRisk)
+                        accumulatedRisk = accumulatedRisk + sampleRisk
+                    end
+                    local fallbackCandidateScore = survivalRisk * 10000 + peakRisk * 1000
+                        + accumulatedRisk * 100 + comfortRisk * 10 + distance
+                    if not fallbackScore or fallbackCandidateScore < fallbackScore then
+                        fallback, fallbackScore = candidate, fallbackCandidateScore
                     end
                 end
             end
         end
         if best then return best, 2, "Crossing out of line attack" end
+        if fallback then return fallback, 2, "Crossing overlapping line attacks" end
     end
     if originalRisk > 0 and state.safeSpots and #state.safeSpots > 0 then
         local bestSpot, bestSpotDist
@@ -2062,11 +2081,12 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
     state.escapeMargin = escapeMargin or CFG.HAZARD_MARGIN
-    state.escapeCommitUntil = escapeMargin and now + 0.65 or now
+    state.escapeCommitUntil = escapeMargin and now + 0.9 or now
     state.escapeStartRisk = risk
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
-    dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now)
+    dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now,
+        escapeMargin ~= nil)
     state.escapeReason = escapeReason or (zone and "Escaping attack area" or "Avoiding nearby enemies")
     state.status = state.escapeReason
     logThreat("escape", state.escapeReason)
