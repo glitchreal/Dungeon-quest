@@ -32,7 +32,7 @@ local C = {
     SmartFarm = true, GroupRadius = 6, CloseAoeRange = 8,
     SpellRange = 26,
     DynamicDistance = false, AdaptiveSpacing = true, MeleeDistance = 8, Hover = false, HoverHeight = 5,
-    AutoDodge = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
+    AutoDodge = true, SoloHitless = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
     KickOnJoin = false, AllowFriends = true, AllowedPlayers = "",
     Dungeon = "Desert Temple", Difficulty = "Easy", AutoCreate = false, AutoStart = false,
     Hardcore = false, PrivateLobby = true, WaveDefence = false,
@@ -333,6 +333,7 @@ slider(helper, "MeleeDistance", "Melee Distance", 5, 12)
 toggle(helper, "Hover", "Hover Above Hitboxes", function(value) if not value then clearHover() end end)
 slider(helper, "HoverHeight", "Hover Height", 0, 14)
 toggle(helper, "AutoDodge", "Auto Dodge")
+toggle(helper, "SoloHitless", "Solo Hitless Safety", nil, "When alone, forces dodge protection on, scans farther ahead, and uses larger telegraph margins while preserving bounded 8-stud dodge teleports")
 slider(helper, "ReactionTime", "Reaction Time", 0.05, 0.8, 2)
 slider(helper, "Standoff", "Standoff Distance", 0, 60)
 slider(helper, "SafetyDistance", "Safety Distance", 0.25, 16, 2)
@@ -340,7 +341,7 @@ toggle(helper, "KickOnJoin", "Kick On Player Join", nil, "Disconnects your own a
 toggle(helper, "AllowFriends", "Allow Friends")
 input(helper, "AllowedPlayers", "Allow Players", false)
 local dodge = tabs.Farm:AddRightGroupbox("Teleport Limits", "move-horizontal")
-label(dodge, "Limits", "2 studs maximum | 0.5 second cooldown\n3 dodges / 6 studs per 3 seconds")
+label(dodge, "Limits", "8 studs maximum | 0.5 second cooldown\n3 dodges / 18 studs per 3 seconds")
 local combat = tabs.Farm:AddRightGroupbox("Combat Status", "activity")
 label(combat, "CombatTarget", "Target: none")
 label(combat, "CombatHealth", "Target HP: -")
@@ -720,6 +721,8 @@ connect(RunService.Heartbeat, function(dt)
         local damageBuffer = damage and now - damage.at < 5 and 3 or 0
         distance = distance + math.max(healthBuffer, damageBuffer)
     end
+    local soloHitless = C.SoloHitless and #Players:GetPlayers() == 1
+    if soloHitless then distance = math.max(distance, 20) end
     if target and target.Name == "Ancient Temple Protector" then distance = 16 end
     if C.SmartFarm and controller.AbilityStatus then
         if C.AdaptiveSpacing and targetRoot then
@@ -736,9 +739,15 @@ connect(RunService.Heartbeat, function(dt)
     end
     cfg.COMBAT_DISTANCE = math.max(1, distance)
     cfg.COMBAT_MIN_DISTANCE, cfg.COMBAT_MAX_DISTANCE = math.max(0, distance - 3), distance + 3
-    cfg.FARM_POSITION, cfg.PRECAST_MARGIN = C.FarmPosition, C.SafetyDistance
-    cfg.HAZARD_MARGIN = math.max(6, C.SafetyDistance + 3)
-    cfg.AUTO_ABILITIES, cfg.AUTO_DODGE, cfg.REACTION_TIME = C.AutoAbilities, C.AutoDodge, C.ReactionTime
+    cfg.FARM_POSITION = C.FarmPosition
+    cfg.PRECAST_MARGIN = math.max(C.SafetyDistance, soloHitless and 6 or 0)
+    cfg.HAZARD_MARGIN = math.max(6, C.SafetyDistance + 3, soloHitless and 9 or 0)
+    cfg.AUTO_ABILITIES, cfg.AUTO_DODGE = C.AutoAbilities, C.AutoDodge or soloHitless
+    cfg.HITLESS_SOLO = C.SoloHitless
+    cfg.REACTION_TIME = soloHitless and math.min(C.ReactionTime, 0.05) or C.ReactionTime
+    cfg.PROJECTILE_LOOKAHEAD = soloHitless and 1.75 or 1.35
+    cfg.THREAT_RADIUS = soloHitless and 120 or 90
+    cfg.MELEE_DANGER_DISTANCE = soloHitless and math.max(11, C.MeleeDistance) or 11
     cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
     cfg.SPELL_RANGE_OVERRIDE = C.SpellRange
     cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.35 or 0.2

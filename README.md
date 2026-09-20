@@ -72,12 +72,21 @@ re-entering an active hitbox after a teleport. When a short teleport cannot clea
 a large attack, the controller continues walking outward while attacking when
 the target remains in range and visible. Static safe-zone/spawn markers are
 excluded; no movement-speed increase is required.
+Solo Hitless Safety is enabled by default. While alone it keeps dodge protection
+active, scans threats from farther away, increases telegraph margins and projectile
+lookahead, retains named attack parts that activate later in the run, and treats
+active beam/laser geometry as a hazard. Dodge teleports remain bounded to the
+normal anticheat-safe limits. Client-visible attacks can be predicted; damage
+with no replicated telegraph or geometry can only be handled after it appears.
 Approach steps also check enemies' predicted positions half a second ahead.
 This lets the controller brake or retreat before a closing enemy reaches it,
 including enemies arriving from behind and larger enemy bodies.
 Target selection refreshes every 0.15 seconds, preferring the closest nearby
 enemy in clear sight over one behind a wall. Switching to a different area
 invalidates the old route; switches within a close group preserve smooth walking.
+When a target is replicated through a wall, the controller follows the dungeon's
+ordered room checkpoints. This applies dynamically to every map that exposes
+checkpoint parts and avoids cutting across folded rooms or locked doors.
 
 Abilities use the equipped tools' real cooldowns and the game's normal
 `localEvent` / `abilityUsed` activation path. The scheduler skips unavailable

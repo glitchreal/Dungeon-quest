@@ -49,6 +49,7 @@ local CFG = {
     THREAT_MAX_AGE = 2,
     AUTO_ABILITIES = true,
     AUTO_DODGE = true,
+    HITLESS_SOLO = true,
     TELEPORT_DODGE = true,
     REACTION_TIME = 0.05,
     MELEE_DANGER_DISTANCE = 11,
@@ -136,6 +137,10 @@ local state = {
     retreating = false,
     pathComputations = 0,
     threatLog = {},
+    routeDungeon = nil,
+    routeAnchors = {},
+    routeAnchorIndex = 1,
+    routeScannedAt = -math.huge,
 }
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
@@ -173,6 +178,22 @@ local safeSpots = {}
 local beamParts = {}
 local loggedThreats = setmetatable({}, { __mode = "k" })
 local aquaticLineTemplates = {}
+local function soloHitless()
+    return CFG.HITLESS_SOLO and #Players:GetPlayers() == 1
+end
+local function dangerousName(instance)
+    local name = instance:GetFullName():lower()
+    return name:find("damage", 1, true) or name:find("hitbox", 1, true)
+        or name:find("hazard", 1, true) or name:find("telegraph", 1, true)
+        or name:find("precast", 1, true) or name:find("warning", 1, true)
+        or name:find("danger", 1, true) or name:find("attack", 1, true)
+        or name:find("projectile", 1, true) or name:find("missile", 1, true)
+        or name:find("shot", 1, true) or name:find("bomb", 1, true)
+        or name:find("spike", 1, true) or name:find("orb", 1, true)
+        or name:find("blast", 1, true) or name:find("slam", 1, true)
+        or name:find("flame", 1, true) or name:find("beam", 1, true)
+        or name:find("laser", 1, true)
+end
 do
     local templates = game:GetService("ReplicatedStorage"):FindFirstChild("enemyProjectiles")
     for _, name in ipairs({ "firstBossRightHandShot", "secondBossRandomLine" }) do
@@ -366,6 +387,56 @@ local function getRootPart(model)
     return model.PrimaryPart
 end
 
+local function dungeonName()
+    local value = Workspace:FindFirstChild("dungeonName")
+    return value and value:IsA("ValueBase") and tostring(value.Value) or nil
+end
+
+-- Dungeon maps expose their intended room order through checkPoint parts. Use
+-- that authored route whenever replicated enemies are visible through a wall;
+-- direct nearest-enemy steering otherwise cuts across folded rooms and doors.
+local function refreshRouteAnchors(now)
+    local name = dungeonName()
+    if state.routeDungeon == name and #state.routeAnchors > 0 then return end
+    if state.routeDungeon == name and now - state.routeScannedAt < 2 then return end
+    state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = name, {}, 1
+    state.routeScannedAt = now
+    local dungeon = Workspace:FindFirstChild("dungeon")
+    if not dungeon then return end
+    for _, instance in ipairs(dungeon:GetDescendants()) do
+        if instance:IsA("BasePart") and instance.Name:lower() == "checkpoint" then
+            local room = instance.Parent and instance.Parent.Name or ""
+            local number = tonumber(room:lower():match("room(%d+)"))
+            local order = number or (room:lower():find("boss", 1, true) and 1000 or 900)
+            table.insert(state.routeAnchors, { part = instance, order = order, name = room })
+        end
+    end
+    table.sort(state.routeAnchors, function(a, b)
+        return a.order < b.order or a.order == b.order and a.name < b.name
+    end)
+end
+
+local function mapRouteGoal(rootPart, now)
+    refreshRouteAnchors(now)
+    while true do
+        local anchor = state.routeAnchors[state.routeAnchorIndex]
+        if not anchor then return nil end
+        if not anchor.part.Parent then
+            state.routeDungeon, state.routeScannedAt = nil, -math.huge
+            refreshRouteAnchors(now)
+            anchor = state.routeAnchors[state.routeAnchorIndex]
+            if not anchor then return nil end
+        end
+        local delta = rootPart.Position - anchor.part.Position
+        local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
+        if flat <= 28 and math.abs(delta.Y) <= 60 then
+            state.routeAnchorIndex = state.routeAnchorIndex + 1
+        else
+            return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+        end
+    end
+end
+
 local function isValidTarget(model)
     if not model or not model.Parent or not model:IsA("Model") then return false end
     local humanoid = model:FindFirstChildOfClass("Humanoid")
@@ -422,6 +493,7 @@ local function getClosestEnemy(rootPart, now)
     end
     table.sort(candidates, function(a, b) return a.distance < b.distance end)
     local closest = candidates[1]
+    local closestIsVisible = false
     if closest then
         -- Prefer nearby enemies we can engage over a closer one behind a wall.
         local searchDistance = math.max(CFG.THREAT_RADIUS, closest.distance + 24)
@@ -429,6 +501,7 @@ local function getClosestEnemy(rootPart, now)
             if candidate.distance > searchDistance then break end
             if not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
                 closest = candidate
+                closestIsVisible = true
                 break
             end
         end
@@ -444,7 +517,8 @@ local function getClosestEnemy(rootPart, now)
         local lockedRoot = getRootPart(previousLock)
         if lockedRoot then
             local lockedDist = (rootPart.Position - lockedRoot.Position).Magnitude
-            if lockedDist <= pickDist + 20 and lockedDist <= CFG.DETECTION_RADIUS then
+            local lockedVisible = not hasBlockingRay(rootPart.Position, lockedRoot.Position, rootPart.Parent, previousLock)
+            if (not closestIsVisible or lockedVisible) and lockedDist <= pickDist + 20 and lockedDist <= CFG.DETECTION_RADIUS then
                 state.lockedTarget = previousLock
                 return previousLock, lockedDist
             end
@@ -1063,6 +1137,26 @@ local function refreshSafety(rootPart, now)
             table.insert(zones, zone)
         end
     end
+    for beam in pairs(beamParts) do
+        if not beam.Parent then
+            beamParts[beam] = nil
+        elseif beam.Enabled and (soloHitless() or beam.Name ~= "Beam" and dangerousName(beam)
+            or beam.Parent and dangerousName(beam.Parent)) then
+            local first, second = beam.Attachment0, beam.Attachment1
+            if first and second and first.Parent and second.Parent
+                and not first:IsDescendantOf(rootPart.Parent) and not second:IsDescendantOf(rootPart.Parent) then
+                local startPosition, endPosition = first.WorldPosition, second.WorldPosition
+                local delta = endPosition - startPosition
+                local width = math.max(1, beam.Width0, beam.Width1)
+                if delta.Magnitude > 0.1
+                    and ThreatGeometry.segmentDistance(rootPart.Position, startPosition, endPosition) <= CFG.THREAT_RADIUS then
+                    table.insert(zones, { frame = CFrame.lookAt((startPosition + endPosition) * 0.5, endPosition),
+                        size = Vector3.new(width, math.max(6, width), delta.Magnitude), shape = "Block",
+                        velocity = Vector3.zero, moving = false, live = true, lookahead = 0, id = beam })
+                end
+            end
+        end
+    end
     for part, sample in pairs(threatParts) do
         if sample.removedAt then
             if now - sample.removedAt > 0.35 then threatParts[part] = nil
@@ -1101,7 +1195,8 @@ local function refreshSafety(rootPart, now)
                 local velocity = part.AssemblyLinearVelocity
                 if velocity.Magnitude < 1 then velocity = (part.Position - sample.lastPosition) / elapsed end
                 local projectile = (name:find("projectile") or name:find("missile") or name:find("shot")) and velocity.Magnitude > 1
-                local named = part.Transparency < 0.95 and (name:find("hitbox") or name:find("precast") or name:find("telegraph") or name:find("warning") or name:find("danger") or name:find("attack") or name:find("bomb") or name:find("spike") or name:find("orb") or name:find("blast") or name:find("slam") or name:find("flame") or name:find("beam"))
+                local potential = dangerousName(part)
+                local named = part.Transparency < 0.95 and potential
                 local attributed = part:GetAttribute("Attack") == true or part:GetAttribute("Hitbox") == true or part:GetAttribute("Damage") ~= nil
                 local floorMarker = part:IsA("Part") and ((part.Shape == Enum.PartType.Block and part.Size.Y <= 4)
                     or (part.Shape == Enum.PartType.Cylinder and part.Size.X <= 4))
@@ -1128,7 +1223,7 @@ local function refreshSafety(rootPart, now)
                     table.insert(zones, sample.zone)
                 elseif sample.zone and now - (sample.lastActive or 0) < 0.35 then
                     table.insert(zones, sample.zone)
-                elseif now - sample.createdAt > CFG.THREAT_MAX_AGE then
+                elseif now - sample.createdAt > CFG.THREAT_MAX_AGE and not potential then
                     threatParts[part] = nil
                 end
                 -- Homing/expanding rectangles: re-snapshot frame, size, and a
@@ -1143,7 +1238,7 @@ local function refreshSafety(rootPart, now)
                     sample.zone.lookahead = math.clamp(hSpeed / 40, 0.5, 1.5)
                 end
                 sample.lastPosition, sample.lastAt = part.Position, now
-            elseif now - sample.createdAt > CFG.THREAT_MAX_AGE and not sample.zone then
+            elseif now - sample.createdAt > CFG.THREAT_MAX_AGE and not sample.zone and not dangerousName(part) then
                 threatParts[part] = nil
             end
         end
@@ -2076,6 +2171,13 @@ local function controllerTick()
         state.navigationPhase = "approach"
         state.lastThreatPart, state.dodgeGoal = nil, nil
         restoreFacing()
+        local routeGoal, routeAnchor = mapRouteGoal(rootPart, now)
+        if routeGoal and distance > 35 then
+            state.status = "Following map route: " .. routeAnchor.name
+            followGoal(humanoid, rootPart, routeGoal, "map-route", now, target)
+            updateProgress(humanoid, rootPart, routeGoal, target, now)
+            return
+        end
         -- Target on a higher level: the flat navmesh route walks underneath
         -- and never climbs. Chain upward recovery steps toward the target
         -- until the height gap closes. Gated on SUSTAINED elevation so flying
@@ -2318,6 +2420,8 @@ local function setRunning(running)
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0
         state.routeFails, state.wanderGoal, state.wanderUntil = 0, nil, 0
         state.wallSide, state.wallVisits, state.wallFlips = nil, {}, 0
+        state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = nil, {}, 1
+        state.routeScannedAt = -math.huge
         state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
@@ -2411,6 +2515,8 @@ connect(player.CharacterAdded, function(character)
     state.motionGoal, state.motionGoalMode, state.motionMode = nil, nil, "idle"
     state.fallbackGoal, state.fallbackUntil = nil, 0
     state.lastPlayerHealth, state.lastTargetScan = nil, 0
+    state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = nil, {}, 1
+    state.routeScannedAt = -math.huge
     state.pathUpdateTime = 0
     state.stuckStartTime, state.stuckCount = 0, 0
     state.dodgeGoal = nil
