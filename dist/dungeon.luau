@@ -2424,19 +2424,23 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     -- so tall smash volumes never trigger it.
     if now - (state.lastJumpAt or -math.huge) >= 0.4 and humanoid.FloorMaterial ~= Enum.Material.Air then
         for _, activeZone in ipairs(state.activeZones) do
-            if activeZone.live and activeZone.velocity then
+            if activeZone.live then
                 local top = activeZone.frame.Position.Y + activeZone.size.Y * 0.5
                 if top - rootPart.Position.Y < 2 then
+                    local shouldJump = activeZone.shape == "Block" and activeZone.size.Y <= 4
+                        and ThreatGeometry.clearance(activeZone, rootPart.Position, CFG.HAZARD_MARGIN) < 0
+                    local velocity = activeZone.velocity or Vector3.zero
                     local toPlayer = rootPart.Position - activeZone.frame.Position
-                    if toPlayer.Magnitude > 0.01 then
-                        local closing = activeZone.velocity:Dot(toPlayer.Unit)
+                    if not shouldJump and velocity.Magnitude > 0.01 and toPlayer.Magnitude > 0.01 then
+                        local closing = velocity:Dot(toPlayer.Unit)
                         local clearanceNow = ThreatGeometry.clearance(activeZone, rootPart.Position, 0)
-                        if closing > 4 and clearanceNow / closing < 0.4 then
-                            humanoid.Jump = true
-                            state.lastJumpAt = now
-                            logThreat("jump", activeZone.shape or "?")
-                            break
-                        end
+                        shouldJump = closing > 4 and clearanceNow / closing < 0.4
+                    end
+                    if shouldJump then
+                        humanoid.Jump = true
+                        state.lastJumpAt = now
+                        logThreat("jump", activeZone.shape or "?")
+                        break
                     end
                 end
             end
