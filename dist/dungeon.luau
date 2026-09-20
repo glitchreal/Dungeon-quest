@@ -275,6 +275,38 @@ function Geometry.smashExit(zone, position, margin)
     return need, lateral.Unit
 end
 
+-- Return both perpendicular exits from a long, narrow rectangular telegraph.
+-- Generic radial sampling often walks along these attacks and remains inside
+-- the damage lane.  The first result is the nearer edge; the second lets the
+-- planner choose the opposite side when several lanes overlap.
+function Geometry.lineExits(zone, position, margin)
+    if zone.shape ~= "Block" then return nil end
+    local size = zone.size
+    local shortAxis, shortSize, longSize
+    if size.X * 2.25 <= size.Z then
+        shortAxis, shortSize, longSize = "X", size.X, size.Z
+    elseif size.Z * 2.25 <= size.X then
+        shortAxis, shortSize, longSize = "Z", size.Z, size.X
+    else
+        return nil
+    end
+    if longSize < 20 then return nil end
+    local point = zone.frame:PointToObjectSpace(position)
+    local half = size * 0.5
+    if math.abs(point.Y) - half.Y - BASE_MARGIN > 0 then return nil end
+    local coordinate = shortAxis == "X" and point.X or point.Z
+    local needNear = shortSize * 0.5 + (margin or 0) - math.abs(coordinate)
+    if needNear <= 0 or needNear > 45 then return nil end
+    -- Roblox local +Z points opposite CFrame.LookVector.
+    local axis = shortAxis == "X" and zone.frame.RightVector or -zone.frame.LookVector
+    axis = Vector3.new(axis.X, 0, axis.Z)
+    if axis.Magnitude < 0.01 then return nil end
+    axis = axis.Unit
+    if coordinate < 0 then axis = -axis end
+    local needFar = shortSize * 0.5 + (margin or 0) + math.abs(coordinate)
+    return needNear, axis, needFar, -axis
+end
+
 function Geometry.risk(zones, position, margin)
     local risk, nearest = 0, nil
     for _, zone in ipairs(zones) do
@@ -1847,6 +1879,42 @@ local function findEscapeGoal(rootPart, targetRoot)
             end
         end
     end
+    -- Long rectangular attacks (Northern Mage shots, spearman strikes, boss
+    -- beams, and equivalent attacks on other maps) must be crossed sideways.
+    -- Test both edges because overlapping lanes can make the nearest edge the
+    -- worse one.  A small survival margin permits leaving an overlap without
+    -- accepting a path that enters a new attack.
+    do
+        local exits = {}
+        for _, activeZone in ipairs(state.activeZones) do
+            local near, nearDirection, far, farDirection = ThreatGeometry.lineExits(
+                activeZone, rootPart.Position, CFG.HAZARD_MARGIN
+            )
+            if near then
+                table.insert(exits, { distance = near + 4, direction = nearDirection })
+                table.insert(exits, { distance = far + 4, direction = farDirection })
+            end
+        end
+        local best, bestScore
+        for _, exit in ipairs(exits) do
+            for _, extra in ipairs({ 0, 6, 12 }) do
+                local distance = math.min(40, exit.distance + extra)
+                local candidate = groundPosition(rootPart.Position + exit.direction * distance,
+                    rootPart.Parent, targetRoot.Parent)
+                if walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor)
+                    and safeEnemyStep(rootPart.Position, candidate)
+                    and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, 2) then
+                    local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
+                    local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                    local score = survivalRisk * 10000 + comfortRisk * 100 + distance
+                    if not bestScore or score < bestScore then
+                        best, bestScore = candidate, score
+                    end
+                end
+            end
+        end
+        if best then return best, 2, "Crossing out of line attack" end
+    end
     if originalRisk > 0 and state.safeSpots and #state.safeSpots > 0 then
         local bestSpot, bestSpotDist
         for _, spot in ipairs(state.safeSpots) do
@@ -2461,7 +2529,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         -- strict per-tick checks is what used to freeze the character
         -- (safety-hold) inside resolving hitboxes. Only abort into something
         -- much worse than when the plan was made.
-        if risk > (state.escapeStartRisk or 0) + 2.5 then
+        if now >= (state.escapeCommitUntil or 0) and risk > (state.escapeStartRisk or 0) + 2.5 then
             state.escapeGoal = nil
         elseif (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
             and state.escapeClear then
@@ -2492,7 +2560,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     end
     if now - state.lastEscapePlan < 0.05 then return true end
     state.lastEscapePlan = now
-    local goal = findEscapeGoal(rootPart, targetRoot)
+    local goal, escapeMargin, escapeReason = findEscapeGoal(rootPart, targetRoot)
     if not goal and (risk > 0 or state.blockedByHazard) then
         goal = findEmergencySideStep(rootPart, target)
     end
@@ -2504,6 +2572,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             if backup then
                 clearPath()
                 state.escapeGoal, state.escapeUntil = backup, now + 0.8
+                state.escapeCommitUntil = now + 0.35
                 state.escapeMargin = 2
                 state.escapeStartRisk = risk
                 state.escapeClear, state.lastEscapeCheck = true, now
@@ -2522,12 +2591,13 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     clearPath()
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
-    state.escapeMargin = CFG.HAZARD_MARGIN
+    state.escapeMargin = escapeMargin or CFG.HAZARD_MARGIN
+    state.escapeCommitUntil = escapeMargin and now + 0.65 or now
     state.escapeStartRisk = risk
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
     dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now)
-    state.escapeReason = zone and "Escaping attack area" or "Avoiding nearby enemies"
+    state.escapeReason = escapeReason or (zone and "Escaping attack area" or "Avoiding nearby enemies")
     state.status = state.escapeReason
     logThreat("escape", state.escapeReason)
     issueMove(humanoid, goal, "evade", now)
