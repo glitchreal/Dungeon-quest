@@ -594,6 +594,8 @@ label(combat, "FarmAim", "Splash group: -")
 label(combat, "AbilityQ", "Q: unequipped")
 label(combat, "AbilityE", "E: unequipped")
 label(combat, "Hazards", "Active attacks: 0")
+label(combat, "HazardPlan", "Attack registry: none")
+label(combat, "DodgePlan", "Dodge plan: pursuit")
 label(combat, "Navigation", "Navigation: idle")
 label(combat, "Spacing", "Combat distance: -")
 label(combat, "LastDamage", "Last hit: none")
@@ -909,6 +911,21 @@ local function slowTick(now)
         setLabel(slot == "q" and "AbilityQ" or "AbilityE", slot:upper() .. ": " .. text .. " | " .. (count or 0) .. " casts")
     end
     setLabel("Hazards", "Active attacks: " .. #(combatState.activeZones or {}) .. " | Dodges: " .. (combatState.dodgeCount or 0))
+    local hazardSnapshot = combatState.hazardSnapshot or {}
+    local hazardItems = hazardSnapshot.items or {}
+    local hazardLines = {}
+    for index = 1, math.min(8, #hazardItems) do
+        local item = hazardItems[index]
+        local eta = item.expiresIn and string.format(" %.1fs", item.expiresIn) or ""
+        table.insert(hazardLines, string.format("%s %s %s %.1f%s", item.decision, item.name, item.shape, item.clearance, eta))
+    end
+    if #hazardLines == 0 then table.insert(hazardLines, "SAFE / no active attack geometry") end
+    if #hazardItems > #hazardLines and #hazardLines > 0 then
+        table.insert(hazardLines, string.format("+%d more active attacks", #hazardItems - math.min(8, #hazardItems)))
+    end
+    setLabel("HazardPlan", "Attack registry:\n" .. table.concat(hazardLines, "\n"))
+    setLabel("DodgePlan", string.format("Dodge plan: %s | goal %.1f studs | risk %.1f",
+        tostring(hazardSnapshot.plan or "pursuit"), hazardSnapshot.goalDistance or 0, hazardSnapshot.risk or 0))
     setLabel("Navigation", (combatState.pathStatus or "Navigation: idle") .. " | Plans: " .. (combatState.pathComputations or 0))
     setLabel("Spacing", string.format("Combat distance: %.0f studs", controller.Config.COMBAT_DISTANCE or 0))
     local damage = combatState.lastDamage

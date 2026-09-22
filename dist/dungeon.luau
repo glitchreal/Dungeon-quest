@@ -717,6 +717,7 @@ local state = {
     routeAnchors = {},
     routeAnchorIndex = 1,
     routeScannedAt = -math.huge,
+    hazardSnapshot = { at = 0, risk = 0, items = {}, plan = "idle", goalDistance = 0 },
 }
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
@@ -730,6 +731,61 @@ local function logThreat(kind, info)
     end
     table.insert(state.threatLog, entry)
     while #state.threatLog > 160 do table.remove(state.threatLog, 1) end
+end
+
+local function hazardDisplayName(zone)
+    if zone.name and zone.name ~= "" then return tostring(zone.name) end
+    local instance = zone.id
+    if typeof(instance) == "Instance" then
+        if (instance.Name == "precast" or instance.Name == "hitBox") and instance.Parent then
+            instance = instance.Parent
+        end
+        return instance.Name
+    end
+    return zone.shape or "attack"
+end
+
+local function hazardDisplayShape(zone)
+    if zone.shape == "Cylinder" then return "radial" end
+    if zone.shape == "Projectile" then return "projectile" end
+    if zone.shape == "ProtectorSmash" then return "expanding" end
+    if zone.shape == "Block" then
+        local size = zone.size
+        if size and ((size.X * 2.25 <= size.Z) or (size.Z * 2.25 <= size.X)) then return "line" end
+    end
+    return string.lower(tostring(zone.shape or "zone"))
+end
+
+local function refreshHazardSnapshot(rootPart, risk)
+    local items = {}
+    if rootPart then
+        for _, zone in ipairs(state.activeZones) do
+            local clearance = ThreatGeometry.clearance(zone, rootPart.Position, 0)
+            local planningClearance = ThreatGeometry.clearance(zone, rootPart.Position, CFG.HAZARD_MARGIN)
+            table.insert(items, {
+                name = hazardDisplayName(zone),
+                shape = hazardDisplayShape(zone),
+                clearance = clearance,
+                planningClearance = planningClearance,
+                decision = planningClearance < 0 and "DODGE" or "WATCH",
+                expiresIn = zone.expires and math.max(0, zone.expires - os.clock()) or nil,
+            })
+        end
+    end
+    table.sort(items, function(a, b)
+        if a.planningClearance ~= b.planningClearance then return a.planningClearance < b.planningClearance end
+        return a.name < b.name
+    end)
+    while #items > 12 do table.remove(items) end
+    local goalDistance = 0
+    if rootPart and state.escapeGoal then goalDistance = (state.escapeGoal - rootPart.Position).Magnitude end
+    state.hazardSnapshot = {
+        at = os.clock(),
+        risk = risk or 0,
+        items = items,
+        plan = state.escapeReason or (state.escapeGoal and "committed escape" or "pursuit"),
+        goalDistance = goalDistance,
+    }
 end
 
 local abilities = AbilityController.new(player, function(slot)
@@ -1896,6 +1952,7 @@ local function refreshSafety(rootPart, now)
         end
     end
     state.activeZones = zones
+    refreshHazardSnapshot(rootPart, ThreatGeometry.risk(zones, rootPart.Position, CFG.HAZARD_MARGIN))
     for _, zone in ipairs(zones) do
         if not loggedThreats[zone.id] then
             loggedThreats[zone.id] = true
@@ -3898,6 +3955,8 @@ label(combat, "FarmAim", "Splash group: -")
 label(combat, "AbilityQ", "Q: unequipped")
 label(combat, "AbilityE", "E: unequipped")
 label(combat, "Hazards", "Active attacks: 0")
+label(combat, "HazardPlan", "Attack registry: none")
+label(combat, "DodgePlan", "Dodge plan: pursuit")
 label(combat, "Navigation", "Navigation: idle")
 label(combat, "Spacing", "Combat distance: -")
 label(combat, "LastDamage", "Last hit: none")
@@ -4213,6 +4272,21 @@ local function slowTick(now)
         setLabel(slot == "q" and "AbilityQ" or "AbilityE", slot:upper() .. ": " .. text .. " | " .. (count or 0) .. " casts")
     end
     setLabel("Hazards", "Active attacks: " .. #(combatState.activeZones or {}) .. " | Dodges: " .. (combatState.dodgeCount or 0))
+    local hazardSnapshot = combatState.hazardSnapshot or {}
+    local hazardItems = hazardSnapshot.items or {}
+    local hazardLines = {}
+    for index = 1, math.min(8, #hazardItems) do
+        local item = hazardItems[index]
+        local eta = item.expiresIn and string.format(" %.1fs", item.expiresIn) or ""
+        table.insert(hazardLines, string.format("%s %s %s %.1f%s", item.decision, item.name, item.shape, item.clearance, eta))
+    end
+    if #hazardLines == 0 then table.insert(hazardLines, "SAFE / no active attack geometry") end
+    if #hazardItems > #hazardLines and #hazardLines > 0 then
+        table.insert(hazardLines, string.format("+%d more active attacks", #hazardItems - math.min(8, #hazardItems)))
+    end
+    setLabel("HazardPlan", "Attack registry:\n" .. table.concat(hazardLines, "\n"))
+    setLabel("DodgePlan", string.format("Dodge plan: %s | goal %.1f studs | risk %.1f",
+        tostring(hazardSnapshot.plan or "pursuit"), hazardSnapshot.goalDistance or 0, hazardSnapshot.risk or 0))
     setLabel("Navigation", (combatState.pathStatus or "Navigation: idle") .. " | Plans: " .. (combatState.pathComputations or 0))
     setLabel("Spacing", string.format("Combat distance: %.0f studs", controller.Config.COMBAT_DISTANCE or 0))
     local damage = combatState.lastDamage
