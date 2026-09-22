@@ -2781,10 +2781,18 @@ local function watchHealth(character)
             local nearestName = state.lastDamage.nearestHazards and state.lastDamage.nearestHazards[1]
                 and state.lastDamage.nearestHazards[1].name or "none"
             local nearest = state.lastDamage.nearestHazards and state.lastDamage.nearestHazards[1]
+            local hazardSummary = {}
+            for index = 1, math.min(4, #(state.lastDamage.nearestHazards or {})) do
+                local item = state.lastDamage.nearestHazards[index]
+                table.insert(hazardSummary, string.format("%s:%.1f", item.name, item.clearance))
+            end
             warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f) mode=%s status=%s nearest=%s shape=%s clearance=%.1f size=%s",
                 state.damageEvents, previous, health, tostring(state.motionMode), tostring(state.status), nearestName,
                 tostring(nearest and nearest.shape or "?"), nearest and nearest.clearance or 0,
                 tostring(nearest and nearest.size or "?")))
+            if #hazardSummary > 0 then
+                warn("[EnemyWalker] nearby hazards: " .. table.concat(hazardSummary, " | "))
+            end
             logThreat("hit", { amount = math.floor(previous - health) })
         end
         previous = health
