@@ -1766,7 +1766,7 @@ local function refreshSafety(rootPart, now)
                 local activeMarker = part.Transparency < 0.95 or attributed or damageContainer or projectile
                     or lineBox or protectorSmash or moved or fresh
                 local named = not duplicateHitbox and potential
-                    and (part.Transparency < 0.95 or not attackMarker or activeMarker)
+                    and (part.Transparency < 0.95 or attackMarker and activeMarker)
                 local floorMarker = part:IsA("Part") and ((part.Shape == Enum.PartType.Block and part.Size.Y <= 4)
                     or (part.Shape == Enum.PartType.Cylinder and part.Size.X <= 4))
                 local precast = floorMarker and part.Parent == Workspace and part.Anchored and not part.CanCollide
