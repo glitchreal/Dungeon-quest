@@ -220,6 +220,14 @@ local function trackInstance(instance)
         local now = os.clock()
         if not instance.CanCollide and (not state.waypointFolder or not instance:IsDescendantOf(state.waypointFolder)) then
             threatParts[instance] = { createdAt = now, lastPosition = instance.Position, lastAt = now }
+            local parentThreat = instance.Parent and dangerousName(instance.Parent)
+            if dangerousName(instance) or parentThreat then
+                -- DescendantAdded can arrive between the 0.1s safety scans.
+                -- Invalidate the cached scan immediately; the control owner
+                -- will perform the actual geometry and movement decision.
+                state.lastSafetyScan = -math.huge
+                state.lastEscapePlan = -math.huge
+            end
         end
         local safeName = instance:GetFullName():lower()
         if safeName:find("safespot", 1, true) or safeName:find("safezone", 1, true) then
@@ -1431,6 +1439,51 @@ local function findEscapeGoal(rootPart, targetRoot)
                 end
             end
         end
+        -- Do not accept a single-circle exit while multiple rings overlap the
+        -- current area. The joint scorer below must get first choice in that
+        -- case, otherwise a plausible edge from ring A can remain inside
+        -- ring B and recreate the Northern Lands boss failure.
+        local overlappingRadials = initialRisk > 0 and #exits > 1
+        if best and not overlappingRadials then return best, 2, "Exiting radial attack" end
+
+        -- When circles overlap, every single-circle exit can still land in a
+        -- neighboring ring. If the player is already exposed, choose the
+        -- reachable point with the lowest combined exposure instead of
+        -- repeatedly committing to the first ring's edge. This is a walk
+        -- fallback, not a teleport: the normal 8-stud blink and rolling
+        -- dodge budget remain enforced by dodgeAlongEscape.
+        if initialRisk > 0 then
+            local overlapBest, overlapScore
+            for _, radius in ipairs({ 8, 14, 20, 28, 36, 40 }) do
+                for index = 0, 15 do
+                    local angle = index * math.pi / 8
+                    local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
+                    local candidate = groundPosition(rootPart.Position + direction * radius,
+                        rootPart.Parent, targetRoot.Parent)
+                    if walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor)
+                        and safeEnemyStep(rootPart.Position, candidate) then
+                        local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
+                        local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                        local peakRisk, routeRisk = initialRisk, 0
+                        for sample = 1, 8 do
+                            local sampleRisk = ThreatGeometry.risk(state.activeZones,
+                                rootPart.Position:Lerp(candidate, sample / 8), 2)
+                            peakRisk = math.max(peakRisk, sampleRisk)
+                            routeRisk = routeRisk + sampleRisk
+                        end
+                        local shapeScore, targetDistance = combatShapeScore(candidate)
+                        local score = survivalRisk * 10000 + peakRisk * 700
+                            + routeRisk * 80 + comfortRisk * 40 + radius - shapeScore
+                            + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 6)) * 500
+                        if survivalRisk < initialRisk - 0.1
+                            and (not overlapScore or score < overlapScore) then
+                            overlapBest, overlapScore = candidate, score
+                        end
+                    end
+                end
+            end
+            if overlapBest then return overlapBest, 2, "Leaving overlapping radial attacks" end
+        end
         if best then return best, 2, "Exiting radial attack" end
     end
     -- Long rectangular attacks (Northern Mage shots, spearman strikes, boss
@@ -1928,10 +1981,15 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     -- confirmed melee contact may use one bounded blink too, but only after
     -- forceSeparationGoal has validated the short lateral destination.
     local telegraphed = not (typeof(threat) == "Instance" and threat:IsA("Model"))
-    -- Walk small dodges, blink far ones: anything inside half a second of
-    -- walking is smoother on foot; the blink is for real distance.
-    -- Emergencies (least-bad) and intentional bursts (windup) always blink.
-    if CFG.TELEPORT_DODGE and (forceBlink or telegraphed and delta.Magnitude > 12) then
+    -- Preserve the rolling budget for hazards that are already overlapping
+    -- the body. Future telegraphs and ordinary line crossings walk their
+    -- validated exit; smash windups and moving projectiles retain priority.
+    local currentRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 0)
+    local smashThreat = typeof(threat) == "string"
+        and (threat:find("smash", 1, true) ~= nil or threat:find("windup", 1, true) ~= nil)
+    local urgent = currentRisk > 0 or smashThreat
+    local shouldBlink = forceBlink and urgent or telegraphed and delta.Magnitude > 12
+    if CFG.TELEPORT_DODGE and shouldBlink then
         performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
     end
 end
@@ -2046,7 +2104,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local meleeEscapeActive = state.escapeReason == "Breaking melee contact"
         and state.escapeGoal and now < (state.escapeUntil or 0)
     local hazardEscapeActive = state.escapeGoal and now < (state.escapeUntil or 0)
-        and state.escapeReason ~= "Breaking melee contact" and (risk > 0 or zone ~= nil)
+        and state.escapeReason ~= "Breaking melee contact"
     if meleeEscapeActive and not inMeleeContact then
         state.escapeGoal, state.escapeUntil, state.escapeReason = nil, 0, nil
         state.escapeClear, state.retreating = false, false
@@ -2159,14 +2217,28 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
             state.lastEscapeCheck = now
         end
+        -- Keep the escape owner, but do not keep following an old route when
+        -- a newly spawned attack becomes the nearest hazard. This matters for
+        -- Northern Lands beam/radial overlaps: the radial exit may be valid
+        -- when selected, then a beam can appear during its short commitment.
+        -- Replanning here avoids handing movement back to pursuit while still
+        -- reacting before the next damage window.
+        if zone and state.escapeThreatId and zone.id ~= state.escapeThreatId and risk > 0 then
+            state.escapeGoal = nil
+            state.escapeThreatId = nil
+            state.lastEscapePlan = -math.huge
+        end
         -- Commit to the escape walk: the plan was validated at selection and
         -- replans correct course within a fraction of a second. Re-validating
         -- strict per-tick checks is what used to freeze the character
         -- (safety-hold) inside resolving hitboxes. Only abort into something
         -- much worse than when the plan was made.
-        if now >= (state.escapeCommitUntil or 0) and risk > (state.escapeStartRisk or 0) + 2.5 then
+        local startRisk = state.escapeStartRisk or 0
+        local riskEscalated = risk > startRisk + 2.5
+        local postCommitRisk = now >= (state.escapeCommitUntil or 0) and risk > startRisk + 0.5
+        if riskEscalated or postCommitRisk then
             state.escapeGoal = nil
-        elseif (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
+        elseif state.escapeGoal and (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
             and state.escapeClear then
             local contMargin = state.escapeMargin or CFG.HAZARD_MARGIN
             -- Survival-margin escapes already accepted crossing exposure at
@@ -2229,6 +2301,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.escapeMargin = escapeMargin or CFG.HAZARD_MARGIN
     state.escapeCommitUntil = escapeMargin and now + 0.9 or now + 0.45
     state.escapeStartRisk = risk
+    state.escapeThreatId = zone and zone.id or nil
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
     dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now,
@@ -2705,7 +2778,10 @@ local function watchHealth(character)
                 state.lastDamage.speed = humanoid.WalkSpeed
                 state.lastDamage.nearestHazards = nearby
             end
-            warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f)", state.damageEvents, previous, health))
+            local nearestName = state.lastDamage.nearestHazards and state.lastDamage.nearestHazards[1]
+                and state.lastDamage.nearestHazards[1].name or "none"
+            warn(string.format("[EnemyWalker] damage event #%d (%.0f -> %.0f) mode=%s status=%s nearest=%s",
+                state.damageEvents, previous, health, tostring(state.motionMode), tostring(state.status), nearestName))
             logThreat("hit", { amount = math.floor(previous - health) })
         end
         previous = health
@@ -2737,7 +2813,7 @@ connect(player.CharacterAdded, function(character)
 end)
 task.spawn(watchHealth, player.Character)
 
-print("[EnemyWalker] loaded: indexed targets, asynchronous paths, bounded teleport dodges")
+print("[EnemyWalker] loaded: original-local radial-overlap-v3, event-driven hazards, bounded teleport dodges")
 
 return {
     Config = CFG,
