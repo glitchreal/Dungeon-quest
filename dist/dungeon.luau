@@ -597,6 +597,7 @@ local CFG = {
     THREAT_RADIUS = 90,
     PROJECTILE_LOOKAHEAD = 1.35,
     PRECAST_MARGIN = 3,
+    HAZARD_MARGIN_BASE = 6,
     HAZARD_MARGIN = 6,
     THREAT_MAX_AGE = 2,
     AUTO_ABILITIES = true,
@@ -680,6 +681,8 @@ local state = {
     lastThreatScan = 0,
     dodgeHistory = {},
     dodgedThreats = setmetatable({}, { __mode = "k" }),
+    hazardMarginBonus = 0,
+    hazardMarginBonusAt = 0,
     observedThreats = setmetatable({}, { __mode = "k" }),
     activeZones = {},
     nearbyEnemies = {},
@@ -1721,7 +1724,8 @@ local function refreshSafety(rootPart, now)
             local distance = (part.Position - rootPart.Position).Magnitude
             local model = part:FindFirstAncestorOfClass("Model")
             local playerBody = model and Players:GetPlayerFromCharacter(model)
-            if not playerBody and distance < CFG.THREAT_RADIUS + part.Size.Magnitude then
+            local ownStunPart = part.Name == player.Name and part.Parent and part.Parent.Name:lower() == "stunparts"
+            if not playerBody and not ownStunPart and distance < CFG.THREAT_RADIUS + part.Size.Magnitude then
                 local name = part:GetFullName():lower()
                 local smashBox = part.Name == "precast" and part.Size.Y == 1 and part.Size.Z == 10
                     and part.Size.X >= 10 and part.Size.X <= 150 and part.Parent:FindFirstChild("hitBox")
@@ -2548,6 +2552,8 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         state.escapeGoal, state.lastThreatPart, state.movementBlocked, state.retreating = nil, nil, false, false
         return false
     end
+    local hazardBonus = now - (state.hazardMarginBonusAt or 0) < 1.5 and (state.hazardMarginBonus or 0) or 0
+    CFG.HAZARD_MARGIN = CFG.HAZARD_MARGIN_BASE + math.clamp(hazardBonus, 0, 8)
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     state.lastThreatPart = zone and zone.id
     -- Jump-over: thin homing rectangles are cleared by leaving the ground as
@@ -2591,6 +2597,8 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local inMeleeContact = contactThreat and (contactThreat == target or contactDistance <= CFG.MELEE_DANGER_DISTANCE)
     local meleeEscapeActive = state.escapeReason == "Breaking melee contact"
         and state.escapeGoal and now < (state.escapeUntil or 0)
+    local hazardEscapeActive = state.escapeGoal and now < (state.escapeUntil or 0)
+        and state.escapeReason ~= "Breaking melee contact" and (risk > 0 or zone ~= nil)
     if meleeEscapeActive and not inMeleeContact then
         state.escapeGoal, state.escapeUntil, state.escapeReason = nil, 0, nil
         state.escapeClear, state.retreating = false, false
@@ -2612,7 +2620,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         end
         state.escapeGoal, state.escapeUntil, state.escapeReason = nil, 0, nil
     end
-    if inMeleeContact then
+    if inMeleeContact and not hazardEscapeActive then
         local separation = nil
         if isProt then
             separation = protectorLateralSeparation(rootPart, targetRoot, target)
@@ -3165,6 +3173,8 @@ local function setRunning(running)
         state.lastDodgeTime, state.dodgeGoal = 0, nil
         table.clear(state.dodgeHistory)
         table.clear(state.dodgedThreats)
+        state.hazardMarginBonus, state.hazardMarginBonusAt = 0, 0
+        CFG.HAZARD_MARGIN = CFG.HAZARD_MARGIN_BASE
         state.motionGoal, state.motionGoalMode, state.motionMode = nil, nil, "idle"
         state.fallbackGoal, state.fallbackUntil = nil, 0
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0
@@ -3231,6 +3241,9 @@ local function watchHealth(character)
                 end
                 table.sort(nearby, function(a, b) return a.clearance < b.clearance end)
                 while #nearby > 4 do table.remove(nearby) end
+                local nearestClearance = nearby[1] and nearby[1].clearance or 0
+                state.hazardMarginBonus = math.clamp(math.max(3, nearestClearance - CFG.HAZARD_MARGIN_BASE + 2), 3, 8)
+                state.hazardMarginBonusAt = os.clock()
                 state.lastDamage.position = root.Position
                 state.lastDamage.goal = state.escapeGoal
                 do
