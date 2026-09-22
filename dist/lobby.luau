@@ -276,7 +276,7 @@ local C = {
     SmartFarm = true, GroupRadius = 6, CloseAoeRange = 8,
     SpellRange = 26,
     DynamicDistance = false, AdaptiveSpacing = true, MeleeDistance = 8, Hover = false, HoverHeight = 5,
-    AutoDodge = true, SoloHitless = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
+    AutoDodge = true, TeleportDodge = true, SoloHitless = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
     KickOnJoin = false, AllowFriends = true, AllowedPlayers = "",
     Dungeon = "Desert Temple", Difficulty = "Easy", AutoCreate = false, AutoStart = false,
     Hardcore = false, PrivateLobby = true, WaveDefence = false,
@@ -577,6 +577,7 @@ slider(helper, "MeleeDistance", "Melee Distance", 5, 12)
 toggle(helper, "Hover", "Hover Above Hitboxes", function(value) if not value then clearHover() end end)
 slider(helper, "HoverHeight", "Hover Height", 0, 14)
 toggle(helper, "AutoDodge", "Auto Dodge")
+toggle(helper, "TeleportDodge", "Bounded Blink Dodge", nil, "Optional 8-stud client snap; off by default to avoid anti-cheat risk. Walking dodges remain active")
 toggle(helper, "SoloHitless", "Solo Hitless Safety", nil, "When alone, forces dodge protection on, scans farther ahead, and uses larger telegraph margins while preserving bounded 8-stud dodge teleports")
 slider(helper, "ReactionTime", "Reaction Time", 0.05, 0.8, 2)
 slider(helper, "Standoff", "Standoff Distance", 0, 60)
@@ -992,6 +993,7 @@ connect(RunService.Heartbeat, function(dt)
     cfg.PROJECTILE_LOOKAHEAD = soloHitless and 1.75 or 1.35
     cfg.THREAT_RADIUS = soloHitless and 120 or 90
     cfg.MELEE_DANGER_DISTANCE = soloHitless and math.max(11, C.MeleeDistance) or 11
+    cfg.TELEPORT_DODGE = C.TeleportDodge == true
     cfg.SMART_FARM, cfg.GROUP_RADIUS, cfg.CLOSE_AOE_RANGE = C.SmartFarm, C.GroupRadius, C.CloseAoeRange
     cfg.SPELL_RANGE_OVERRIDE = C.SpellRange
     cfg.SKILL_COOLDOWN = C.SpamAbilities and 0.35 or 0.2

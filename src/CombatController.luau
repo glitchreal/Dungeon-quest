@@ -1745,7 +1745,18 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     if not canTeleportDodge(now, delta.Magnitude, threat) then return false end
     if not safeEnemyStep(rootPart.Position, destination) then return false end
     if not walkingSegmentClear(rootPart, destination, target) then return false end
-    if not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, destination, CFG.HAZARD_MARGIN) then return false end
+    local currentRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+    local destinationRisk = ThreatGeometry.risk(state.activeZones, destination, 2)
+    -- A blink is specifically for leaving an already-overlapping attack, so
+    -- the swept segment may cross that attack. Never blink through a clear
+    -- position into another zone: require a real body-margin improvement and
+    -- a clear landing cell, while ordinary walking keeps the strict segment
+    -- safety check in issueMove/findEscapeGoal.
+    if destinationRisk > 0 then return false end
+    if currentRisk == 0
+        and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, destination, CFG.HAZARD_MARGIN) then
+        return false
+    end
     -- Check several body-width rays before applying the bounded horizontal step.
     for _, offset in ipairs({ Vector3.zero, Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), Vector3.new(0, 0, 1), Vector3.new(0, 0, -1) }) do
         if hasBlockingRay(rootPart.Position + offset, destination + offset, rootPart.Parent, target) then return false end
@@ -2063,6 +2074,9 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local hazardBonus = now - (state.hazardMarginBonusAt or 0) < 1.5 and (state.hazardMarginBonus or 0) or 0
     CFG.HAZARD_MARGIN = CFG.HAZARD_MARGIN_BASE + math.clamp(hazardBonus, 0, 8)
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
+    local routeThreat = state.motionGoal and state.motionGoalMode == "map-route"
+        and (state.motionGoal - rootPart.Position).Magnitude > 4
+        and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.motionGoal, CFG.HAZARD_MARGIN)
     state.lastThreatPart = zone and zone.id
     -- Jump-over: thin homing rectangles are cleared by leaving the ground as
     -- they pass under. Only when the zone top is within jump apex (~6 studs)
@@ -2071,9 +2085,12 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         for _, activeZone in ipairs(state.activeZones) do
             if activeZone.live then
                 local top = activeZone.frame.Position.Y + activeZone.size.Y * 0.5
-                if top - rootPart.Position.Y < 2 then
-                    local shouldJump = activeZone.shape == "Block" and activeZone.size.Y <= 4
-                        and ThreatGeometry.clearance(activeZone, rootPart.Position, CFG.HAZARD_MARGIN) < 0
+                local groundCylinder = activeZone.shape == "Cylinder" and activeZone.size.X <= 4
+                    and math.abs(activeZone.frame.Position.Y - rootPart.Position.Y) < 6
+                if top - rootPart.Position.Y < 2 or groundCylinder then
+                    local shouldJump = ThreatGeometry.clearance(activeZone, rootPart.Position, CFG.HAZARD_MARGIN) < 0
+                        and ((activeZone.shape == "Block" and activeZone.size.Y <= 4)
+                            or (activeZone.shape == "Cylinder" and activeZone.size.X <= 4))
                     local velocity = activeZone.velocity or Vector3.zero
                     local toPlayer = rootPart.Position - activeZone.frame.Position
                     if not shouldJump and velocity.Magnitude > 0.01 and toPlayer.Magnitude > 0.01 then
@@ -2107,12 +2124,12 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         and state.escapeGoal and now < (state.escapeUntil or 0)
     local hazardEscapeActive = state.escapeGoal and now < (state.escapeUntil or 0)
         and state.escapeReason ~= "Breaking melee contact"
-    if meleeEscapeActive and not inMeleeContact then
+    if meleeEscapeActive and (not inMeleeContact or risk > 0) then
         state.escapeGoal, state.escapeUntil, state.escapeReason = nil, 0, nil
         state.escapeClear, state.retreating = false, false
         meleeEscapeActive = false
     end
-    if meleeEscapeActive then
+    if meleeEscapeActive and risk == 0 then
         if now - (state.lastEscapeCheck or 0) >= 0.2 then
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
                 and safeEnemyStep(rootPart.Position, state.escapeGoal)
@@ -2128,7 +2145,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         end
         state.escapeGoal, state.escapeUntil, state.escapeReason = nil, 0, nil
     end
-    if inMeleeContact and not hazardEscapeActive then
+    if inMeleeContact and risk == 0 and not hazardEscapeActive then
         local separation = nil
         if isProt then
             separation = protectorLateralSeparation(rootPart, targetRoot, target)
@@ -2209,10 +2226,14 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         state.escapeGoal = nil
         state.lastEscapePlan = -math.huge
     end
-    if risk == 0 and not state.retreating and not contactThreat and crowd >= crowdLimit
+    if risk == 0 and not routeThreat and not state.retreating and not contactThreat and crowd >= crowdLimit
         and not state.movementBlocked and not state.blockedByHazard then
         state.escapeGoal, state.threatReactionAt = nil, nil
         return false
+    end
+    if routeThreat and risk == 0 then
+        state.status = "Replanning route around active hazard"
+        state.lastEscapePlan = -math.huge
     end
     if state.escapeGoal and now < (state.escapeUntil or 0) then
         if now - (state.lastEscapeCheck or 0) >= 0.2 then
