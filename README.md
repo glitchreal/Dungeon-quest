@@ -72,6 +72,17 @@ re-entering an active hitbox after a teleport. When a short teleport cannot clea
 a large attack, the controller continues walking outward while attacking when
 the target remains in range and visible. Static safe-zone/spawn markers are
 excluded; no movement-speed increase is required.
+Active hazards are rescanned at the combat tick rate. The default reaction
+pause is zero, and validated short escapes can use a bounded blink. A second
+blink against the same attack is allowed after the normal cooldown only when
+the character is still inside it; the existing per-window distance and count
+limits remain in force.
+
+When a named, client-visible attack causes damage, Obsidian remembers that
+attack and adds up to five studs of planning clearance for later encounters.
+The memory is limited to 24 attack types and saved with the account's Obsidian
+settings when executor file saving is available. It does not infer attacks that
+the client cannot see.
 Solo Hitless Safety is enabled by default. While alone it keeps dodge protection
 active, scans threats from farther away, increases telegraph margins and projectile
 lookahead, retains named attack parts that activate later in the run, and treats

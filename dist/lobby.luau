@@ -276,7 +276,7 @@ local C = {
     SmartFarm = true, GroupRadius = 6, CloseAoeRange = 8,
     SpellRange = 26,
     DynamicDistance = false, AdaptiveSpacing = true, MeleeDistance = 8, Hover = false, HoverHeight = 5,
-    AutoDodge = true, TeleportDodge = true, SoloHitless = true, ThreatLabels = true, ReactionTime = 0.05, Standoff = 20, SafetyDistance = 3,
+    AutoDodge = true, TeleportDodge = true, SoloHitless = true, ThreatLabels = true, ReactionTime = 0, Standoff = 20, SafetyDistance = 3,
     KickOnJoin = false, AllowFriends = true, AllowedPlayers = "",
     Dungeon = "Desert Temple", Difficulty = "Easy", AutoCreate = false, AutoStart = false,
     Hardcore = false, PrivateLobby = true, WaveDefence = false,
@@ -311,7 +311,9 @@ local fpsChanged = false
 local controls = {}
 local errors, lastErrors = {}, {}
 local configPath = "DungeonQuestObsidian-config.json"
+local storedDodgeMemory = nil
 local saveReady, saveDirty, saveVersion = false, false, 0
+local lastMemorySave = 0
 local menuKey = "RightShift"
 
 local function uiIdentity()
@@ -335,15 +337,22 @@ local function notify(message)
 end
 
 local function saveConfig()
-    if not saveReady or not saveDirty then return end
+    local memoryDirty = controller.DodgeMemoryDirty and controller.DodgeMemoryDirty()
+    if not saveReady or (not saveDirty and not memoryDirty) then return end
     if type(writefile) ~= "function" then
         errors.config = "Executor file saving is unavailable"
         return
     end
     local ok = pcall(function()
-        writefile(configPath, HttpService:JSONEncode({ Version = 1, Config = C, MenuKey = menuKey }))
+        local memory = controller.GetDodgeMemory and controller.GetDodgeMemory() or storedDodgeMemory
+        writefile(configPath, HttpService:JSONEncode({ Version = 1, Config = C, MenuKey = menuKey,
+            DodgeMemory = memory }))
+        storedDodgeMemory = memory
     end)
-    if ok then saveDirty = false; errors.config = nil
+    if ok then
+        saveDirty = false
+        errors.config = nil
+        if memoryDirty and controller.MarkDodgeMemorySaved then controller.MarkDodgeMemorySaved() end
     else errors.config = "Could not save settings" end
 end
 
@@ -580,7 +589,7 @@ toggle(helper, "AutoDodge", "Auto Dodge")
 toggle(helper, "TeleportDodge", "Bounded Blink Dodge", nil, "Optional 8-stud client snap; off by default to avoid anti-cheat risk. Walking dodges remain active")
 toggle(helper, "SoloHitless", "Solo Hitless Safety", nil, "When alone, forces dodge protection on, scans farther ahead, and uses larger telegraph margins while preserving bounded 8-stud dodge teleports")
 toggle(helper, "ThreatLabels", "3D Threat Labels", nil, "Shows names and dodge state for client-visible attacks above their hitboxes")
-slider(helper, "ReactionTime", "Reaction Time", 0.05, 0.8, 2)
+slider(helper, "ReactionTime", "Reaction Time", 0, 0.8, 2)
 slider(helper, "Standoff", "Standoff Distance", 0, 60)
 slider(helper, "SafetyDistance", "Safety Distance", 0.25, 16, 2)
 toggle(helper, "KickOnJoin", "Kick On Player Join", nil, "Disconnects your own account if an unapproved player joins")
@@ -843,6 +852,10 @@ end
 
 local lastHealth, lastHumanoid, lastSlow = nil, nil, 0
 local function slowTick(now)
+    if controller.DodgeMemoryDirty and controller.DodgeMemoryDirty() and now - lastMemorySave >= 10 then
+        lastMemorySave = now
+        scheduleSave()
+    end
     if not Adapter.level() then
         setLabel("Level", "Level: loading")
         return
@@ -1083,6 +1096,10 @@ if env.autoloadconfig ~= false then
     end
     if saved and type(saved.MenuKey) == "string" then
         pcall(function() Library.Options.MenuKey:SetValue({ saved.MenuKey, "Toggle" }) end)
+    end
+    if saved then
+        storedDodgeMemory = saved.DodgeMemory
+        if controller.SetDodgeMemory then controller.SetDodgeMemory(storedDodgeMemory) end
     end
 end
 saveReady = true

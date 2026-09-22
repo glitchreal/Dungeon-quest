@@ -53,7 +53,7 @@ local CFG = {
     HITLESS_SOLO = true,
     TELEPORT_DODGE = true,
     SHOW_THREAT_LABELS = true,
-    REACTION_TIME = 0.05,
+    REACTION_TIME = 0,
     MELEE_DANGER_DISTANCE = 11,
     MELEE_ESCAPE_LEASE = 0.9,
     RETREAT_RELEASE_MARGIN = 5,
@@ -132,6 +132,9 @@ local state = {
     dodgedThreats = setmetatable({}, { __mode = "k" }),
     hazardMarginBonus = 0,
     hazardMarginBonusAt = 0,
+    hazardMemory = {},
+    hazardMemorySequence = 0,
+    hazardMemoryDirty = false,
     observedThreats = setmetatable({}, { __mode = "k" }),
     activeZones = {},
     nearbyEnemies = {},
@@ -185,6 +188,44 @@ local function hazardDisplayShape(zone)
         if size and ((size.X * 2.25 <= size.Z) or (size.Z * 2.25 <= size.X)) then return "line" end
     end
     return string.lower(tostring(zone.shape or "zone"))
+end
+
+local function hazardMemoryKey(zone)
+    return string.sub(hazardDisplayName(zone), 1, 48) .. "|" .. hazardDisplayShape(zone)
+end
+
+local function rememberHazardHit(zone)
+    local key = hazardMemoryKey(zone)
+    local memory = state.hazardMemory
+    local entry = memory[key]
+    if entry and entry.lastHitAt and os.clock() - entry.lastHitAt < 2 then return end
+    if not entry then
+        local count, oldestKey, oldestSequence = 0, nil, math.huge
+        for candidate, value in pairs(memory) do
+            count = count + 1
+            if value.sequence < oldestSequence then oldestKey, oldestSequence = candidate, value.sequence end
+        end
+        if count >= 24 and oldestKey then memory[oldestKey] = nil end
+        entry = { hits = 0, bonus = 0, sequence = 0 }
+        memory[key] = entry
+    end
+    state.hazardMemorySequence = state.hazardMemorySequence + 1
+    entry.hits = math.min(100, entry.hits + 1)
+    entry.bonus = math.min(5, entry.bonus + 1)
+    entry.sequence = state.hazardMemorySequence
+    entry.lastHitAt = os.clock()
+    state.hazardMemoryDirty = true
+end
+
+local function learnedHazardMargin(position)
+    local bonus = 0
+    for _, zone in ipairs(state.activeZones) do
+        if (zone.frame.Position - position).Magnitude < 40 then
+            local entry = state.hazardMemory[hazardMemoryKey(zone)]
+            if entry then bonus = math.max(bonus, entry.bonus) end
+        end
+    end
+    return bonus
 end
 
 local function clearHazardLabels()
@@ -1282,7 +1323,8 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
 end
 
 local function refreshSafety(rootPart, now)
-    if now - state.lastSafetyScan < 0.1 then return end
+    local interval = #state.activeZones > 0 and CFG.CONTROL_INTERVAL * 0.75 or 0.1
+    if now - state.lastSafetyScan < interval then return end
     state.lastSafetyScan = now
     local zones, enemies = {}, {}
     -- These sections are created with the map and activated much later. They
@@ -1955,14 +1997,16 @@ local function threatIsSmash(threat)
     return false
 end
 
-local function canTeleportDodge(now, distance, threat)
+local function canTeleportDodge(now, distance, threat, exposed)
     local history = state.dodgeHistory
     while history[1] and now - history[1].at >= CFG.DODGE_WINDOW do table.remove(history, 1) end
     if not distance or distance < 0.1 or distance > CFG.DODGE_LATERAL_DISTANCE + 0.001 then return false end
     if #history >= CFG.DODGE_MAX_PER_WINDOW then return false end
     if history[#history] and now - history[#history].at < CFG.DODGE_COOLDOWN then return false end
     local previous = state.dodgedThreats[threat]
-    if previous and now - previous < CFG.DODGE_SAME_THREAT_COOLDOWN then return false end
+    -- A persistent attack may need a second bounded step if the first leaves
+    -- the character exposed; otherwise avoid spending budget on the same ID.
+    if previous and now - previous < (exposed and 0.6 or CFG.DODGE_SAME_THREAT_COOLDOWN) then return false end
     local spent = 0
     for _, entry in ipairs(history) do spent = spent + entry.distance end
     -- Reserve a full blink for smash windups: anything else may only spend
@@ -1982,7 +2026,8 @@ end
 local function performDodgeTeleport(humanoid, rootPart, destination, target, threat, now)
     if not destination or humanoid.FloorMaterial == Enum.Material.Air then return false end
     local delta = destination - rootPart.Position
-    if not canTeleportDodge(now, delta.Magnitude, threat) then return false end
+    local exposed = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2) > 0
+    if not canTeleportDodge(now, delta.Magnitude, threat, exposed) then return false end
     if not safeEnemyStep(rootPart.Position, destination) then return false end
     if not walkingSegmentClear(rootPart, destination, target) then return false end
     local currentRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
@@ -2236,9 +2281,8 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     -- confirmed melee contact may use one bounded blink too, but only after
     -- forceSeparationGoal has validated the short lateral destination.
     local telegraphed = not (typeof(threat) == "Instance" and threat:IsA("Model"))
-    -- Preserve the rolling budget for hazards that are already overlapping
-    -- the body. Future telegraphs and ordinary line crossings walk their
-    -- validated exit; smash windups and moving projectiles retain priority.
+    -- Favor confirmed overlaps and smash windups, while allowing a short
+    -- telegraphed escape to blink if the bounded landing cell passes checks.
     local currentRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 0)
     local smashThreat = typeof(threat) == "string"
         and (threat:find("smash", 1, true) ~= nil or threat:find("windup", 1, true) ~= nil)
@@ -2247,7 +2291,7 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     -- before the walking controller can clear it. Use one bounded blink for
     -- that preemptive crossing when the landing cell is clear; the teleport
     -- function still enforces the 8-stud limit, wall checks, and budget.
-    local shouldBlink = forceBlink and (urgent or telegraphed) or telegraphed and delta.Magnitude > 12
+    local shouldBlink = forceBlink and (urgent or telegraphed) or telegraphed and delta.Magnitude > 4
     if CFG.TELEPORT_DODGE and shouldBlink then
         performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
     end
@@ -2318,7 +2362,8 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         return false
     end
     local hazardBonus = now - (state.hazardMarginBonusAt or 0) < 1.5 and (state.hazardMarginBonus or 0) or 0
-    CFG.HAZARD_MARGIN = CFG.HAZARD_MARGIN_BASE + math.clamp(hazardBonus, 0, 8)
+    CFG.HAZARD_MARGIN = CFG.HAZARD_MARGIN_BASE
+        + math.max(math.clamp(hazardBonus, 0, 8), learnedHazardMargin(rootPart.Position))
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     local routeThreat = state.motionGoal and state.motionGoalMode == "map-route"
         and (state.motionGoal - rootPart.Position).Magnitude > 4
@@ -2461,7 +2506,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.escapeStartRisk = risk
                 state.escapeReason = dist > 20 and "Closing on smash windup" or "Strafing smash by open space"
                 state.status = state.escapeReason
-                dodgeAlongEscape(humanoid, rootPart, goal, target, "smash" .. math.floor(now * 10), now, true)
+                dodgeAlongEscape(humanoid, rootPart, goal, target, "smash", now, true)
                 issueMove(humanoid, goal, "evade", now)
                 return true
             end
@@ -3021,12 +3066,17 @@ local function watchHealth(character)
             local root = character:FindFirstChild("HumanoidRootPart")
             if root then
                 local nearby = {}
+                local nearestZone, nearestZoneClearance = nil, math.huge
                 for _, zone in ipairs(state.activeZones) do
                     local zp = zone.frame.Position
+                    local clearance = ThreatGeometry.clearance(zone, root.Position, 0)
+                    if clearance < nearestZoneClearance then
+                        nearestZone, nearestZoneClearance = zone, clearance
+                    end
                     table.insert(nearby, {
                         name = typeof(zone.id) == "Instance" and zone.id:GetFullName()
                             or zone.name or "Announced telegraph",
-                        clearance = ThreatGeometry.clearance(zone, root.Position, 0),
+                        clearance = clearance,
                         position = zone.frame.Position, size = zone.size, shape = zone.shape,
                         zoneAt = string.format("%d,%d,%d", math.floor(zp.X), math.floor(zp.Y), math.floor(zp.Z)),
                     })
@@ -3034,6 +3084,9 @@ local function watchHealth(character)
                 table.sort(nearby, function(a, b) return a.clearance < b.clearance end)
                 while #nearby > 4 do table.remove(nearby) end
                 local nearestClearance = nearby[1] and nearby[1].clearance or 0
+                if nearestZone and nearestZoneClearance <= 1 then
+                    rememberHazardHit(nearestZone)
+                end
                 state.hazardMarginBonus = math.clamp(math.max(3, nearestClearance - CFG.HAZARD_MARGIN_BASE + 2), 3, 8)
                 state.hazardMarginBonusAt = os.clock()
                 state.lastDamage.position = root.Position
@@ -3095,6 +3148,30 @@ connect(player.CharacterAdded, function(character)
 end)
 task.spawn(watchHealth, player.Character)
 
+local function loadDodgeMemory(data)
+    if type(data) ~= "table" or data.Version ~= 1 or type(data.Entries) ~= "table" then return end
+    local memory, count, sequence = {}, 0, 0
+    for key, source in pairs(data.Entries) do
+        if type(key) == "string" and #key > 0 and #key <= 64 and type(source) == "table"
+            and count < 24 then
+            local hits = math.clamp(math.floor(tonumber(source.Hits) or 0), 0, 100)
+            local bonus = math.clamp(math.floor(tonumber(source.Bonus) or 0), 0, 5)
+            sequence = sequence + 1
+            memory[key] = { hits = hits, bonus = bonus, sequence = sequence }
+            count = count + 1
+        end
+    end
+    state.hazardMemory, state.hazardMemorySequence, state.hazardMemoryDirty = memory, sequence, false
+end
+
+local function exportDodgeMemory()
+    local entries = {}
+    for key, entry in pairs(state.hazardMemory) do
+        entries[key] = { Hits = entry.hits, Bonus = entry.bonus }
+    end
+    return { Version = 1, Entries = entries }
+end
+
 print("[EnemyWalker] loaded: original-local radial-overlap-v3, event-driven hazards, bounded teleport dodges")
 
 return {
@@ -3105,6 +3182,10 @@ return {
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
     SetAbilityInventory = abilities.SetInventory,
     AbilityProfile = FarmPlanner.profile,
+    SetDodgeMemory = loadDodgeMemory,
+    GetDodgeMemory = exportDodgeMemory,
+    DodgeMemoryDirty = function() return state.hazardMemoryDirty end,
+    MarkDodgeMemorySaved = function() state.hazardMemoryDirty = false end,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end
