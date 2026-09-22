@@ -2024,9 +2024,11 @@ local function findEscapeGoal(rootPart, targetRoot)
                             routeRisk = routeRisk + sampleRisk
                         end
                         local shapeScore, targetDistance = combatShapeScore(candidate)
+                        local severeOverlap = initialRisk > 4
+                        local leashPenalty = severeOverlap and 80 or 500
                         local score = survivalRisk * 10000 + peakRisk * 700
                             + routeRisk * 80 + comfortRisk * 40 + radius - shapeScore
-                            + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 6)) * 500
+                            + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 6)) * leashPenalty
                         if survivalRisk < initialRisk - 0.1
                             and (not overlapScore or score < overlapScore) then
                             overlapBest, overlapScore = candidate, score
