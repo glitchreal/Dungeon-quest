@@ -52,6 +52,7 @@ local CFG = {
     AUTO_DODGE = true,
     HITLESS_SOLO = true,
     TELEPORT_DODGE = true,
+    SHOW_THREAT_LABELS = true,
     REACTION_TIME = 0.05,
     MELEE_DANGER_DISTANCE = 11,
     MELEE_ESCAPE_LEASE = 0.9,
@@ -146,6 +147,8 @@ local state = {
     routeAnchorIndex = 1,
     routeScannedAt = -math.huge,
     hazardSnapshot = { at = 0, risk = 0, items = {}, plan = "idle", goalDistance = 0 },
+    hazardLabelFolder = nil,
+    hazardLabels = {},
 }
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
@@ -184,6 +187,94 @@ local function hazardDisplayShape(zone)
     return string.lower(tostring(zone.shape or "zone"))
 end
 
+local function clearHazardLabels()
+    for key, entry in pairs(state.hazardLabels) do
+        if entry.gui then entry.gui:Destroy() end
+        if entry.anchor then entry.anchor:Destroy() end
+        state.hazardLabels[key] = nil
+    end
+    if state.hazardLabelFolder then
+        state.hazardLabelFolder:Destroy()
+        state.hazardLabelFolder = nil
+    end
+end
+
+local function updateHazardLabels(rootPart)
+    if not CFG.SHOW_THREAT_LABELS or not rootPart then
+        clearHazardLabels()
+        return
+    end
+    local playerGui = player:FindFirstChildOfClass("PlayerGui")
+    if not playerGui then return end
+    if not state.hazardLabelFolder then
+        state.hazardLabelFolder = Instance.new("Folder")
+        state.hazardLabelFolder.Name = "ObsidianHazardLabelAnchors"
+        state.hazardLabelFolder.Parent = Workspace
+    end
+    local active = {}
+    local shown = 0
+    for _, zone in ipairs(state.activeZones) do
+        if shown >= 12 then break end
+        local name, shape = hazardDisplayName(zone), hazardDisplayShape(zone)
+        local position = zone.frame.Position
+        local key = table.concat({ name, shape, math.floor(position.X / 3), math.floor(position.Y / 3), math.floor(position.Z / 3) }, ":")
+        if not active[key] then
+            active[key] = true
+            shown = shown + 1
+            local clearance = ThreatGeometry.clearance(zone, rootPart.Position, 0)
+            local planningClearance = ThreatGeometry.clearance(zone, rootPart.Position, CFG.HAZARD_MARGIN)
+            local decision = planningClearance < 0 and "DODGE" or "WATCH"
+            local entry = state.hazardLabels[key]
+            local anchor = typeof(zone.id) == "Instance" and zone.id:IsA("BasePart") and zone.id or nil
+            if not entry then
+                entry = {}
+                if not anchor then
+                    anchor = Instance.new("Part")
+                    anchor.Name = "HazardLabelAnchor"
+                    anchor.Anchored, anchor.CanCollide, anchor.CanTouch, anchor.CanQuery = true, false, false, false
+                    anchor.Transparency, anchor.Size = 1, Vector3.new(0.2, 0.2, 0.2)
+                    anchor.Parent = state.hazardLabelFolder
+                end
+                local gui = Instance.new("BillboardGui")
+                gui.Name = "HazardLabel"
+                gui.AlwaysOnTop, gui.MaxDistance = true, 180
+                gui.Size, gui.StudsOffset = UDim2.fromOffset(230, 42), Vector3.new(0, 3, 0)
+                gui.Adornee, gui.Parent = anchor, playerGui
+                local label = Instance.new("TextLabel")
+                label.Name = "Text"
+                label.BackgroundTransparency = 1
+                label.Size = UDim2.fromScale(1, 1)
+                label.Font = Enum.Font.GothamBold
+                label.TextSize, label.TextStrokeTransparency = 12, 0.35
+                label.TextWrapped = true
+                label.Parent = gui
+                entry = { gui = gui, anchor = anchor, label = label }
+                state.hazardLabels[key] = entry
+            end
+            if not entry.anchor.Parent then entry.anchor.Parent = state.hazardLabelFolder end
+            if entry.anchor ~= anchor and anchor then
+                entry.anchor = anchor
+                entry.gui.Adornee = anchor
+            end
+            if entry.anchor ~= zone.id then
+                pcall(function() entry.anchor.CFrame = zone.frame end)
+            end
+            entry.label.Text = string.format("%s | %s\n%s %.1f", decision, name, shape, clearance)
+            entry.label.TextColor3 = planningClearance < 0 and Color3.fromRGB(255, 90, 80)
+                or planningClearance < 3 and Color3.fromRGB(255, 210, 80)
+                or Color3.fromRGB(100, 255, 150)
+            entry.gui.StudsOffset = Vector3.new(0, math.clamp(zone.size.Y * 0.5 + 2, 3, 14), 0)
+        end
+    end
+    for key, entry in pairs(state.hazardLabels) do
+        if not active[key] then
+            if entry.gui then entry.gui:Destroy() end
+            if entry.anchor and entry.anchor.Parent == state.hazardLabelFolder then entry.anchor:Destroy() end
+            state.hazardLabels[key] = nil
+        end
+    end
+end
+
 local function refreshHazardSnapshot(rootPart, risk)
     local items = {}
     if rootPart then
@@ -214,6 +305,7 @@ local function refreshHazardSnapshot(rootPart, risk)
         plan = state.escapeReason or (state.escapeGoal and "committed escape" or "pursuit"),
         goalDistance = goalDistance,
     }
+    updateHazardLabels(rootPart)
 end
 
 local abilities = AbilityController.new(player, function(slot)
@@ -266,6 +358,7 @@ do
     end
 end
 local function trackInstance(instance)
+    if state.hazardLabelFolder and instance:IsDescendantOf(state.hazardLabelFolder) then return end
     if instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
         humanoidModels[instance] = instance.Parent
     end
@@ -2903,6 +2996,7 @@ local function shutdown()
     local _, humanoid, rootPart = getChar()
     if humanoid and rootPart then stopMovement(humanoid, rootPart) end
     clearPath()
+    clearHazardLabels()
     if state.waypointFolder then state.waypointFolder:Destroy() end
     for _, connection in ipairs(connections) do connection:Disconnect() end
     table.clear(connections)
