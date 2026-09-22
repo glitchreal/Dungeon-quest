@@ -307,6 +307,28 @@ function Geometry.lineExits(zone, position, margin)
     return needNear, axis, needFar, -axis
 end
 
+-- Return both exits from a circular ground telegraph. The game represents
+-- these cylinders with their thin local X axis rotated into world space, so
+-- the playable radial plane is local Y/Z rather than world X/Z.
+function Geometry.circleExits(zone, position, margin)
+    if zone.shape ~= "Cylinder" then return nil end
+    local point = zone.frame:PointToObjectSpace(position)
+    local half = zone.size * 0.5
+    if math.abs(point.X) - half.X - BASE_MARGIN > 0 then return nil end
+    local radial = Vector3.new(0, point.Y, point.Z)
+    local radius = math.max(half.Y, half.Z)
+    local distance = radial.Magnitude
+    local needNear = radius + (margin or 0) - distance
+    if needNear <= 0 or needNear > 45 then return nil end
+    if distance < 0.01 then radial = Vector3.new(0, 1, 0) else radial = radial.Unit end
+    local axis = zone.frame:VectorToWorldSpace(radial)
+    axis = Vector3.new(axis.X, 0, axis.Z)
+    if axis.Magnitude < 0.01 then return nil end
+    axis = axis.Unit
+    local needFar = radius + (margin or 0) + distance
+    return needNear, axis, needFar, -axis
+end
+
 function Geometry.risk(zones, position, margin)
     local risk, nearest = 0, nil
     for _, zone in ipairs(zones) do
@@ -583,6 +605,7 @@ local CFG = {
     TELEPORT_DODGE = true,
     REACTION_TIME = 0.05,
     MELEE_DANGER_DISTANCE = 11,
+    MELEE_ESCAPE_LEASE = 0.9,
     RETREAT_RELEASE_MARGIN = 5,
     FARM_POSITION = "Nearest",
     SMART_FARM = true,
@@ -1724,46 +1747,71 @@ local function refreshSafety(rootPart, now)
                 local elapsed = math.max(0.001, now - sample.lastAt)
                 local velocity = part.AssemblyLinearVelocity
                 if velocity.Magnitude < 1 then velocity = (part.Position - sample.lastPosition) / elapsed end
+                local moved = (part.Position - sample.lastPosition).Magnitude > 0.5
                 local projectile = (name:find("projectile") or name:find("missile") or name:find("shot")) and velocity.Magnitude > 1
                 local potential = dangerousName(part)
-                local named = part.Transparency < 0.95 and potential
+                local parentIsAttack = part.Parent and dangerousName(part.Parent)
+                local attackMarker = (part.Name == "precast" or part.Name == "hitBox" or name:find("hitbox", 1, true))
+                    and parentIsAttack
+                -- Northern Lands keeps several real attack markers fully
+                -- transparent. A marker and its sibling hitbox describe one
+                -- attack; use the marker once and skip the duplicate hitbox.
+                local duplicateHitbox = part.Name == "hitBox" and part.Parent:FindFirstChild("precast") ~= nil
                 local attributed = part:GetAttribute("Attack") == true or part:GetAttribute("Hitbox") == true or part:GetAttribute("Damage") ~= nil
+                local fresh = now - sample.createdAt < 0.45
+                local activeMarker = part.Transparency < 0.95 or attributed or damageContainer or projectile
+                    or lineBox or protectorSmash or moved or fresh
+                local named = not duplicateHitbox and potential
+                    and (part.Transparency < 0.95 or not attackMarker or activeMarker)
                 local floorMarker = part:IsA("Part") and ((part.Shape == Enum.PartType.Block and part.Size.Y <= 4)
                     or (part.Shape == Enum.PartType.Cylinder and part.Size.X <= 4))
                 local precast = floorMarker and part.Parent == Workspace and part.Anchored and not part.CanCollide
                     and not part.CanQuery and not part.CanTouch and part.Material == Enum.Material.Neon and part.Size.Magnitude > 3
                 if not (name:find("safespot") or name:find("safezone")) and (projectile or named or attributed or precast or damageContainer or protectorSmash or lineBox) then
+                    local geometryPart = part
+                    if part.Name == "precast" and part.Parent then
+                        local hitbox = part.Parent:FindFirstChild("hitBox")
+                        if hitbox and hitbox:IsA("BasePart") then geometryPart = hitbox end
+                    end
+                    local geometryVelocity = geometryPart.AssemblyLinearVelocity
+                    if geometryVelocity.Magnitude < 1 then geometryVelocity = velocity end
                     local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
-                    local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+                    local horizontal = Vector3.new(geometryVelocity.X, 0, geometryVelocity.Z)
                     local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
-                    sample.zone = { frame = part.CFrame, size = part.Size, shape = shape,
-                        velocity = velocity, moving = not projectile and moving, live = true,
+                    sample.geometryPart = geometryPart
+                    sample.zone = { frame = geometryPart.CFrame, size = geometryPart.Size, shape = shape,
+                        velocity = geometryVelocity, moving = not projectile and moving, live = true,
+                        followPart = true,
                         lookahead = projectile and CFG.PROJECTILE_LOOKAHEAD or 0.5, id = part }
                     if protectorSmash then
                         local travel = 150 - part.Size.X
                         local humanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
                         sample.zone = { frame = smashBox.CFrame, size = Vector3.new(150, 150, travel * 2 + 10),
                             shape = "ProtectorSmash", startWidth = part.Size.X, travelDistance = travel, id = part,
-                            forecastAge = now - sample.createdAt, born = now, walkSpeed = humanoid and humanoid.WalkSpeed or 16 }
+                            forecastAge = now - sample.createdAt, born = now, walkSpeed = humanoid and humanoid.WalkSpeed or 16,
+                            followPart = false }
+                        sample.geometryPart = nil
                     elseif lineBox then
                         sample.zone = { frame = lineBox.CFrame, size = lineBox.Size, shape = "Block",
-                            id = part, kind = "AquaticDelayedLine", name = lineName }
+                            id = part, kind = "AquaticDelayedLine", name = lineName, followPart = false }
+                        sample.geometryPart = nil
                     end
                     sample.lastActive = now
                     table.insert(zones, sample.zone)
                 elseif sample.zone and now - (sample.lastActive or 0) < 0.35 then
                     table.insert(zones, sample.zone)
-                elseif now - sample.createdAt > CFG.THREAT_MAX_AGE and not potential then
+                elseif now - sample.createdAt > CFG.THREAT_MAX_AGE and (not potential or attackMarker) then
                     threatParts[part] = nil
                 end
                 -- Homing/expanding rectangles: re-snapshot frame, size, and a
                 -- speed-scaled lookahead every scan. Frozen snapshots go stale
                 -- within a frame against parts that chase and grow.
-                if sample.zone and sample.zone.live then
-                    sample.zone.frame = part.CFrame
-                    sample.zone.size = part.Size
-                    sample.zone.velocity = velocity
-                    local hSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+                if sample.zone and sample.zone.live and sample.zone.followPart ~= false then
+                    local geometryPart = sample.geometryPart and sample.geometryPart.Parent and sample.geometryPart or part
+                    sample.zone.frame = geometryPart.CFrame
+                    sample.zone.size = geometryPart.Size
+                    sample.zone.velocity = geometryPart.AssemblyLinearVelocity
+                    local hSpeed = Vector3.new(sample.zone.velocity.X, 0, sample.zone.velocity.Z).Magnitude
                     sample.zone.moving = hSpeed > 2 and hSpeed < 160
                     sample.zone.lookahead = math.clamp(hSpeed / 40, 0.5, 1.5)
                 end
@@ -1894,6 +1942,44 @@ local function findEscapeGoal(rootPart, targetRoot)
                 end
             end
         end
+    end
+    -- Circular ground telegraphs need a radial exit before a line exit. In
+    -- Northern Lands several rings can overlap; a perpendicular line escape
+    -- may reduce one lane while leaving the player inside the ring stack.
+    do
+        local exits = {}
+        for _, activeZone in ipairs(state.activeZones) do
+            local near, nearDirection, far, farDirection = ThreatGeometry.circleExits(
+                activeZone, rootPart.Position, CFG.HAZARD_MARGIN
+            )
+            if near then
+                table.insert(exits, { distance = near + 4, direction = nearDirection })
+                table.insert(exits, { distance = far + 4, direction = farDirection })
+            end
+        end
+        local best, bestScore
+        local initialRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+        for _, exit in ipairs(exits) do
+            for _, extra in ipairs({ 0, 6, 12 }) do
+                local distance = math.min(40, exit.distance + extra)
+                local candidate = groundPosition(rootPart.Position + exit.direction * distance,
+                    rootPart.Parent, targetRoot.Parent)
+                if walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor)
+                    and safeEnemyStep(rootPart.Position, candidate)
+                    and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, 2) then
+                    local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
+                    local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                    local shapeScore, targetDistance = combatShapeScore(candidate)
+                    local score = survivalRisk * 10000 + comfortRisk * 100 + distance - shapeScore
+                        + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 4)) * 500
+                    if (survivalRisk < initialRisk - 0.1 or initialRisk == 0)
+                        and (not bestScore or score < bestScore) then
+                        best, bestScore = candidate, score
+                    end
+                end
+            end
+        end
+        if best then return best, 2, "Exiting radial attack" end
     end
     -- Long rectangular attacks (Northern Mage shots, spearman strikes, boss
     -- beams, and equivalent attacks on other maps) must be crossed sideways.
@@ -2159,6 +2245,7 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     end
     rootPart.CFrame = rootPart.CFrame + delta
     table.insert(state.dodgeHistory, { at = now, distance = delta.Magnitude })
+    if threat ~= nil then state.dodgedThreats[threat] = now end
     logThreat("tp", { distance = math.floor(delta.Magnitude * 10) / 10 })
     state.lastDodgeTime = now
     state.safetyUntil = now + 0.75
@@ -2383,15 +2470,16 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     local delta = goal - rootPart.Position
     if delta.Magnitude < 0.5 then return end
     local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
-    if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return end
-    -- Teleport budget is reserved for telegraphed attacks (zone parts and
-    -- announcements). Melee separation walks: spending the 3-per-3s budget
-    -- dodging bodies leaves nothing for the one-shot windup that follows.
+    if not forceBlink and enemyClearance(step) <= enemyClearance(rootPart.Position)
+        and typeof(threat) == "Instance" and threat:IsA("Model") then return end
+    -- Teleport budget is normally reserved for telegraphed attacks. A
+    -- confirmed melee contact may use one bounded blink too, but only after
+    -- forceSeparationGoal has validated the short lateral destination.
     local telegraphed = not (typeof(threat) == "Instance" and threat:IsA("Model"))
     -- Walk small dodges, blink far ones: anything inside half a second of
     -- walking is smoother on foot; the blink is for real distance.
     -- Emergencies (least-bad) and intentional bursts (windup) always blink.
-    if telegraphed and CFG.TELEPORT_DODGE and (forceBlink or delta.Magnitude > 12) then
+    if CFG.TELEPORT_DODGE and (forceBlink or telegraphed and delta.Magnitude > 12) then
         performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
     end
 end
@@ -2500,7 +2588,31 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
     local contactDistance = (targetRoot.Position - rootPart.Position).Magnitude
-    if contactThreat and (contactThreat == target or contactDistance <= CFG.MELEE_DANGER_DISTANCE) then
+    local inMeleeContact = contactThreat and (contactThreat == target or contactDistance <= CFG.MELEE_DANGER_DISTANCE)
+    local meleeEscapeActive = state.escapeReason == "Breaking melee contact"
+        and state.escapeGoal and now < (state.escapeUntil or 0)
+    if meleeEscapeActive and not inMeleeContact then
+        state.escapeGoal, state.escapeUntil, state.escapeReason = nil, 0, nil
+        state.escapeClear, state.retreating = false, false
+        meleeEscapeActive = false
+    end
+    if meleeEscapeActive then
+        if now - (state.lastEscapeCheck or 0) >= 0.2 then
+            state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
+                and safeEnemyStep(rootPart.Position, state.escapeGoal)
+                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.HAZARD_MARGIN)
+            state.lastEscapeCheck = now
+        end
+        if state.escapeClear and (state.escapeGoal - rootPart.Position).Magnitude > 2 then
+            state.retreating = true
+            state.status = state.escapeReason
+            dodgeAlongEscape(humanoid, rootPart, state.escapeGoal, target, contactThreat, now, true)
+            issueMove(humanoid, state.escapeGoal, "evade", now, true)
+            return true
+        end
+        state.escapeGoal, state.escapeUntil, state.escapeReason = nil, 0, nil
+    end
+    if inMeleeContact then
         local separation = nil
         if isProt then
             separation = protectorLateralSeparation(rootPart, targetRoot, target)
@@ -2510,14 +2622,15 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         state.retreating = true
         if separation then
             clearPath()
-            state.escapeGoal, state.escapeUntil = separation, now + 1.25
+            state.escapeGoal, state.escapeUntil = separation, now + CFG.MELEE_ESCAPE_LEASE
             state.escapeMargin = CFG.HAZARD_MARGIN
             state.escapeStartRisk = risk
             state.escapeClear, state.lastEscapeCheck = true, now
             state.escapeReason = "Breaking melee contact"
             state.status = state.escapeReason
-            dodgeAlongEscape(humanoid, rootPart, separation, target, contactThreat, now)
-            issueMove(humanoid, separation, "evade", now)
+            logThreat("melee-escape", { distance = math.floor(contactDistance * 10) / 10 })
+            dodgeAlongEscape(humanoid, rootPart, separation, target, contactThreat, now, true)
+            issueMove(humanoid, separation, "evade", now, true)
             return true
         end
         -- A blocked backward step still permits a lateral escape search.
@@ -2667,7 +2780,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.escapeReason = escapeReason or (zone and "Escaping attack area" or "Avoiding nearby enemies")
     state.status = state.escapeReason
     logThreat("escape", state.escapeReason)
-    issueMove(humanoid, goal, "evade", now)
+    issueMove(humanoid, goal, "evade", now, escapeMargin ~= nil)
     return true
 end
 
@@ -3050,6 +3163,8 @@ local function setRunning(running)
         state.cachedTargets, state.prevHealth = {}, setmetatable({}, { __mode = "k" })
         state.lastTargetScan, state.lastTargetChoice = 0, 0
         state.lastDodgeTime, state.dodgeGoal = 0, nil
+        table.clear(state.dodgeHistory)
+        table.clear(state.dodgedThreats)
         state.motionGoal, state.motionGoalMode, state.motionMode = nil, nil, "idle"
         state.fallbackGoal, state.fallbackUntil = nil, 0
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0

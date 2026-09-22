@@ -105,6 +105,28 @@ function Geometry.lineExits(zone, position, margin)
     return needNear, axis, needFar, -axis
 end
 
+-- Return both exits from a circular ground telegraph. The game represents
+-- these cylinders with their thin local X axis rotated into world space, so
+-- the playable radial plane is local Y/Z rather than world X/Z.
+function Geometry.circleExits(zone, position, margin)
+    if zone.shape ~= "Cylinder" then return nil end
+    local point = zone.frame:PointToObjectSpace(position)
+    local half = zone.size * 0.5
+    if math.abs(point.X) - half.X - BASE_MARGIN > 0 then return nil end
+    local radial = Vector3.new(0, point.Y, point.Z)
+    local radius = math.max(half.Y, half.Z)
+    local distance = radial.Magnitude
+    local needNear = radius + (margin or 0) - distance
+    if needNear <= 0 or needNear > 45 then return nil end
+    if distance < 0.01 then radial = Vector3.new(0, 1, 0) else radial = radial.Unit end
+    local axis = zone.frame:VectorToWorldSpace(radial)
+    axis = Vector3.new(axis.X, 0, axis.Z)
+    if axis.Magnitude < 0.01 then return nil end
+    axis = axis.Unit
+    local needFar = radius + (margin or 0) + distance
+    return needNear, axis, needFar, -axis
+end
+
 function Geometry.risk(zones, position, margin)
     local risk, nearest = 0, nil
     for _, zone in ipairs(zones) do
