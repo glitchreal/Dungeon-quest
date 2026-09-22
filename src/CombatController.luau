@@ -319,6 +319,48 @@ pcall(function()
     end)
 end)
 
+-- Northern Lands announces first-boss projectiles before it creates their
+-- Workspace markers. The client map-local script confirms the payload shape:
+-- distance, travel duration, server start, server end, origin CFrame. Model
+-- these as announced projectile corridors so the controller can move before
+-- a seeking spike or Big Spike reaches the character.
+pcall(function()
+    local storage = game:GetService("ReplicatedStorage")
+    local remotes = storage:FindFirstChild("remotes")
+    local remote = remotes and remotes:FindFirstChild("northernBossSpecficEvents")
+    local templates = storage:FindFirstChild("enemyProjectiles")
+    local syncModule = storage:FindFirstChild("timeSync")
+    if not remote or not templates or not syncModule then return end
+    local timeSync = require(syncModule)
+    local templateNames = {
+        ["First Boss Seeking Spike"] = "firstBossSeekingSpikes",
+        ["First Boss Big Spike"] = "firstBossBigSpike",
+        ["First Boss Criss Cross Projectile"] = "firstBossCrissCross",
+    }
+    connect(remote.OnClientEvent, function(action, data)
+        local templateName = templateNames[action]
+        if state.closed or not templateName or type(data) ~= "table"
+            or type(data[1]) ~= "number" or type(data[2]) ~= "number"
+            or type(data[3]) ~= "number" or type(data[4]) ~= "number"
+            or typeof(data[5]) ~= "CFrame" or data[2] <= 0 then return end
+        local template = templates:FindFirstChild(templateName)
+        if not template or not template:IsA("BasePart") then return end
+        local serverNow, now = timeSync:GetTime(), os.clock()
+        local remaining = data[4] - serverNow
+        if remaining < -0.35 or remaining > 15 then return end
+        local velocity = data[5].LookVector * (data[1] / data[2])
+        table.insert(announcedZones, {
+            frame = data[5], origin = data[5], travel = data[5].LookVector * data[1],
+            duration = data[2], starts = now + data[3] - serverNow,
+            size = template.Size, shape = "Projectile", velocity = velocity,
+            lookahead = math.min(CFG.PROJECTILE_LOOKAHEAD, data[2]),
+            expires = now + remaining + 0.25, id = {}, name = action,
+        })
+        state.lastSafetyScan = -math.huge
+        state.lastEscapePlan = -math.huge
+    end)
+end)
+
 local function getChar()
     local character = player.Character
     if not character then return nil, nil, nil end
