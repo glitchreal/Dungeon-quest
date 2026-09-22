@@ -2409,6 +2409,7 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     if not walkingSegmentClear(rootPart, destination, target) then return false end
     local currentRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
     local destinationRisk = ThreatGeometry.risk(state.activeZones, destination, 2)
+    local hazardThreat = threat ~= nil and not (typeof(threat) == "Instance" and threat:IsA("Model"))
     -- A blink is specifically for leaving an already-overlapping attack, so
     -- the swept segment may cross that attack. Prefer a clear landing cell,
     -- but when a large expanding zone fills the whole 8-stud step, allow a
@@ -2416,7 +2417,8 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     -- finish the exit. Never blink into equal or worse exposure.
     if destinationRisk > 0 and destinationRisk >= currentRisk - 0.5 then return false end
     if currentRisk == 0
-        and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, destination, CFG.HAZARD_MARGIN) then
+        and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, destination, CFG.HAZARD_MARGIN)
+        and not (hazardThreat and destinationRisk == 0) then
         return false
     end
     -- Check several body-width rays before applying the bounded horizontal step.
@@ -2663,7 +2665,11 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     local smashThreat = typeof(threat) == "string"
         and (threat:find("smash", 1, true) ~= nil or threat:find("windup", 1, true) ~= nil)
     local urgent = currentRisk > 0 or smashThreat
-    local shouldBlink = forceBlink and urgent or telegraphed and delta.Magnitude > 12
+    -- A validated hazard escape may need to cross the edge of a line or ring
+    -- before the walking controller can clear it. Use one bounded blink for
+    -- that preemptive crossing when the landing cell is clear; the teleport
+    -- function still enforces the 8-stud limit, wall checks, and budget.
+    local shouldBlink = forceBlink and (urgent or telegraphed) or telegraphed and delta.Magnitude > 12
     if CFG.TELEPORT_DODGE and shouldBlink then
         performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
     end
