@@ -1997,6 +1997,41 @@ local function findEscapeGoal(rootPart, targetRoot)
             end
         end
     end
+    -- Moving first-boss corridors need a perpendicular escape. Treating a
+    -- projectile path like a radial zone can send the player along its lane,
+    -- especially when a beam or slam is active at the same time.
+    do
+        local initialRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+        local best, bestScore
+        for _, activeZone in ipairs(state.activeZones) do
+            if activeZone.shape == "Projectile" then
+                local velocity = activeZone.velocity or Vector3.zero
+                local lateral = Vector3.new(-velocity.Z, 0, velocity.X)
+                if lateral.Magnitude > 0.1 then
+                    lateral = lateral.Unit
+                    for _, side in ipairs({ 1, -1 }) do
+                        for _, distance in ipairs({ 8, 14, 20, 28, 36 }) do
+                            local candidate = groundPosition(rootPart.Position + lateral * side * distance,
+                                rootPart.Parent, targetRoot.Parent)
+                            if walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor)
+                                and safeEnemyStep(rootPart.Position, candidate) then
+                                local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
+                                local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                                local targetDistance = (candidate - targetRoot.Position).Magnitude
+                                local score = survivalRisk * 10000 + comfortRisk * 100 + distance
+                                    + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 6)) * 80
+                                if survivalRisk < initialRisk - 0.1
+                                    and (not bestScore or score < bestScore) then
+                                    best, bestScore = candidate, score
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if best then return best, 2, "Crossing projectile corridor" end
+    end
     -- Circular ground telegraphs need a radial exit before a line exit. In
     -- Northern Lands several rings can overlap; a perpendicular line escape
     -- may reduce one lane while leaving the player inside the ring stack.
@@ -2013,6 +2048,11 @@ local function findEscapeGoal(rootPart, targetRoot)
         end
         local best, bestScore
         local initialRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+        local hasImmediateLine = false
+        for _, activeZone in ipairs(state.activeZones) do
+            local near = ThreatGeometry.lineExits(activeZone, rootPart.Position, CFG.HAZARD_MARGIN)
+            if near then hasImmediateLine = true; break end
+        end
         for _, exit in ipairs(exits) do
             for _, extra in ipairs({ 0, 6, 12 }) do
                 local distance = math.min(40, exit.distance + extra)
@@ -2038,7 +2078,7 @@ local function findEscapeGoal(rootPart, targetRoot)
         -- case, otherwise a plausible edge from ring A can remain inside
         -- ring B and recreate the Northern Lands boss failure.
         local overlappingRadials = initialRisk > 0 and (#exits > 1 or #state.activeZones > 1)
-        if best and not overlappingRadials then return best, 2, "Exiting radial attack" end
+        if best and not hasImmediateLine and not overlappingRadials then return best, 2, "Exiting radial attack" end
 
         -- When circles overlap, every single-circle exit can still land in a
         -- neighboring ring. If the player is already exposed, choose the
@@ -2046,7 +2086,7 @@ local function findEscapeGoal(rootPart, targetRoot)
         -- repeatedly committing to the first ring's edge. This is a walk
         -- fallback, not a teleport: the normal 8-stud blink and rolling
         -- dodge budget remain enforced by dodgeAlongEscape.
-        if initialRisk > 0 then
+        if initialRisk > 0 and not hasImmediateLine then
             local overlapBest, overlapScore
             for _, radius in ipairs({ 8, 14, 20, 28, 36, 40 }) do
                 for index = 0, 15 do
@@ -2080,7 +2120,7 @@ local function findEscapeGoal(rootPart, targetRoot)
             end
             if overlapBest then return overlapBest, 2, "Leaving overlapping radial attacks" end
         end
-        if best then return best, 2, "Exiting radial attack" end
+        if best and not hasImmediateLine then return best, 2, "Exiting radial attack" end
     end
     -- Long rectangular attacks (Northern Mage shots, spearman strikes, boss
     -- beams, and equivalent attacks on other maps) must be crossed sideways.
