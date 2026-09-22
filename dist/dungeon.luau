@@ -2300,11 +2300,11 @@ local function performDodgeTeleport(humanoid, rootPart, destination, target, thr
     local currentRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
     local destinationRisk = ThreatGeometry.risk(state.activeZones, destination, 2)
     -- A blink is specifically for leaving an already-overlapping attack, so
-    -- the swept segment may cross that attack. Never blink through a clear
-    -- position into another zone: require a real body-margin improvement and
-    -- a clear landing cell, while ordinary walking keeps the strict segment
-    -- safety check in issueMove/findEscapeGoal.
-    if destinationRisk > 0 then return false end
+    -- the swept segment may cross that attack. Prefer a clear landing cell,
+    -- but when a large expanding zone fills the whole 8-stud step, allow a
+    -- strictly lower combined exposure cell so the next bounded dodge can
+    -- finish the exit. Never blink into equal or worse exposure.
+    if destinationRisk > 0 and destinationRisk >= currentRisk - 0.5 then return false end
     if currentRisk == 0
         and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, destination, CFG.HAZARD_MARGIN) then
         return false
