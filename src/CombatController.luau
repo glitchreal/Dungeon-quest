@@ -1450,9 +1450,17 @@ local function findEscapeGoal(rootPart, targetRoot)
     -- especially when a beam or slam is active at the same time.
     do
         local initialRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+        local severeNonProjectile = false
+        for _, activeZone in ipairs(state.activeZones) do
+            if activeZone.shape ~= "Projectile"
+                and ThreatGeometry.clearance(activeZone, rootPart.Position, 2) < -1 then
+                severeNonProjectile = true
+                break
+            end
+        end
         local best, bestScore
         for _, activeZone in ipairs(state.activeZones) do
-            if activeZone.shape == "Projectile" then
+            if not severeNonProjectile and activeZone.shape == "Projectile" then
                 local velocity = activeZone.velocity or Vector3.zero
                 local lateral = Vector3.new(-velocity.Z, 0, velocity.X)
                 if lateral.Magnitude > 0.1 then
@@ -1478,7 +1486,7 @@ local function findEscapeGoal(rootPart, targetRoot)
                 end
             end
         end
-        if best then return best, 2, "Crossing projectile corridor" end
+        if best and not severeNonProjectile then return best, 2, "Crossing projectile corridor" end
     end
     -- Circular ground telegraphs need a radial exit before a line exit. In
     -- Northern Lands several rings can overlap; a perpendicular line escape

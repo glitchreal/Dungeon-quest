@@ -203,6 +203,16 @@ local ThreatGeometry = (function()
 local Geometry = {}
 local BASE_MARGIN = 4
 
+local function geometryKey(zone)
+    local frame, size = zone.frame, zone.size
+    local function q(value) return math.floor(value * 2 + 0.5) end
+    local p, r, l = frame.Position, frame.RightVector, frame.LookVector
+    return table.concat({ zone.shape or "?",
+        q(size.X), q(size.Y), q(size.Z),
+        q(p.X), q(p.Y), q(p.Z),
+        q(r.X), q(r.Y), q(r.Z), q(l.X), q(l.Y), q(l.Z) }, ":")
+end
+
 function Geometry.segmentDistance(position, startPosition, endPosition)
     local delta = endPosition - startPosition
     local lengthSquared = delta:Dot(delta)
@@ -331,11 +341,16 @@ end
 
 function Geometry.risk(zones, position, margin)
     local risk, nearest = 0, nil
+    local seen = {}
     for _, zone in ipairs(zones) do
-        local clearance = Geometry.clearance(zone, position, margin)
-        if clearance < 0 then
-            risk = risk + 1 + clearance * clearance
-            if not nearest or clearance < nearest.clearance then nearest = { zone = zone, clearance = clearance } end
+        local key = geometryKey(zone)
+        if not seen[key] then
+            seen[key] = true
+            local clearance = Geometry.clearance(zone, position, margin)
+            if clearance < 0 then
+                risk = risk + 1 + clearance * clearance
+                if not nearest or clearance < nearest.clearance then nearest = { zone = zone, clearance = clearance } end
+            end
         end
     end
     return risk, nearest and nearest.zone
@@ -343,13 +358,18 @@ end
 
 function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
     local relevant = {}
+    local seen = {}
     local padding = math.sqrt(2 * margin * margin + 16)
     for _, zone in ipairs(zones) do
-        local travel = (zone.moving or zone.shape == "Projectile")
-            and zone.velocity.Magnitude * zone.lookahead or 0
-        local radius = zone.size.Magnitude * 0.5 + padding + travel
-        if Geometry.segmentDistance(zone.frame.Position, startPosition, endPosition) <= radius then
-            table.insert(relevant, zone)
+        local key = geometryKey(zone)
+        if not seen[key] then
+            seen[key] = true
+            local travel = (zone.moving or zone.shape == "Projectile")
+                and zone.velocity.Magnitude * zone.lookahead or 0
+            local radius = zone.size.Magnitude * 0.5 + padding + travel
+            if Geometry.segmentDistance(zone.frame.Position, startPosition, endPosition) <= radius then
+                table.insert(relevant, zone)
+            end
         end
     end
     if #relevant == 0 then return true end
@@ -2002,9 +2022,17 @@ local function findEscapeGoal(rootPart, targetRoot)
     -- especially when a beam or slam is active at the same time.
     do
         local initialRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+        local severeNonProjectile = false
+        for _, activeZone in ipairs(state.activeZones) do
+            if activeZone.shape ~= "Projectile"
+                and ThreatGeometry.clearance(activeZone, rootPart.Position, 2) < -1 then
+                severeNonProjectile = true
+                break
+            end
+        end
         local best, bestScore
         for _, activeZone in ipairs(state.activeZones) do
-            if activeZone.shape == "Projectile" then
+            if not severeNonProjectile and activeZone.shape == "Projectile" then
                 local velocity = activeZone.velocity or Vector3.zero
                 local lateral = Vector3.new(-velocity.Z, 0, velocity.X)
                 if lateral.Magnitude > 0.1 then
@@ -2030,7 +2058,7 @@ local function findEscapeGoal(rootPart, targetRoot)
                 end
             end
         end
-        if best then return best, 2, "Crossing projectile corridor" end
+        if best and not severeNonProjectile then return best, 2, "Crossing projectile corridor" end
     end
     -- Circular ground telegraphs need a radial exit before a line exit. In
     -- Northern Lands several rings can overlap; a perpendicular line escape
