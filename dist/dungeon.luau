@@ -3371,7 +3371,8 @@ local function watchHealth(character)
                 for _, zone in ipairs(state.activeZones) do
                     local zp = zone.frame.Position
                     table.insert(nearby, {
-                        name = typeof(zone.id) == "Instance" and zone.id:GetFullName() or "Announced telegraph",
+                        name = typeof(zone.id) == "Instance" and zone.id:GetFullName()
+                            or zone.name or "Announced telegraph",
                         clearance = ThreatGeometry.clearance(zone, root.Position, 0),
                         position = zone.frame.Position, size = zone.size, shape = zone.shape,
                         zoneAt = string.format("%d,%d,%d", math.floor(zp.X), math.floor(zp.Y), math.floor(zp.Z)),
