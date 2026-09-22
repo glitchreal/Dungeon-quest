@@ -1995,7 +1995,7 @@ local function findEscapeGoal(rootPart, targetRoot)
         -- current area. The joint scorer below must get first choice in that
         -- case, otherwise a plausible edge from ring A can remain inside
         -- ring B and recreate the Northern Lands boss failure.
-        local overlappingRadials = initialRisk > 0 and #exits > 1
+        local overlappingRadials = initialRisk > 0 and (#exits > 1 or #state.activeZones > 1)
         if best and not overlappingRadials then return best, 2, "Exiting radial attack" end
 
         -- When circles overlap, every single-circle exit can still land in a
