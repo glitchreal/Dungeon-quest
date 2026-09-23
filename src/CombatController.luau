@@ -1678,12 +1678,31 @@ local function refreshSafety(rootPart, now)
                     end
                     local geometryVelocity = geometryPart.AssemblyLinearVelocity
                     if geometryVelocity.Magnitude < 1 then geometryVelocity = velocity end
-                    local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
+                    local cylinder = geometryPart:IsA("Part") and geometryPart.Shape == Enum.PartType.Cylinder
+                        or part:IsA("Part") and part.Shape == Enum.PartType.Cylinder
+                    local shape = projectile and "Projectile" or (cylinder and "Cylinder" or "Block")
+                    local radialGrowth = 0
+                    if shape == "Cylinder" and geometryPart.Size.X <= 4 then
+                        local radius = math.max(geometryPart.Size.Y, geometryPart.Size.Z) * 0.5
+                        if sample.lastRadius and sample.radiusAt and now > sample.radiusAt then
+                            local increase = radius - sample.lastRadius
+                            if increase > 0.05 then
+                                local measured = math.clamp(increase / (now - sample.radiusAt), 0, 60)
+                                sample.radialGrowth = sample.radialGrowth and sample.radialGrowth * 0.5 + measured * 0.5 or measured
+                                sample.lastGrowthAt = now
+                            elseif increase < -0.05 or now - (sample.lastGrowthAt or 0) > 0.25 then
+                                sample.radialGrowth = 0
+                            end
+                        end
+                        sample.lastRadius, sample.radiusAt = radius, now
+                        radialGrowth = sample.radialGrowth or 0
+                    end
                     local horizontal = Vector3.new(geometryVelocity.X, 0, geometryVelocity.Z)
                     local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
                     sample.geometryPart = geometryPart
                     sample.zone = { frame = geometryPart.CFrame, size = geometryPart.Size, shape = shape,
                         velocity = geometryVelocity, moving = not projectile and moving, live = true,
+                        radialGrowth = radialGrowth,
                         followPart = true,
                         lookahead = projectile and CFG.PROJECTILE_LOOKAHEAD or 0.5, id = part }
                     if protectorSmash then

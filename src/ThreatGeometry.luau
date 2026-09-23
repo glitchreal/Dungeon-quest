@@ -18,6 +18,14 @@ function Geometry.segmentDistance(position, startPosition, endPosition)
     return (position - (startPosition + delta * fraction)).Magnitude
 end
 
+local function projectedCircleRadius(zone, arrivalTime)
+    local radius = math.max(zone.size.Y, zone.size.Z) * 0.5
+    local growth = math.clamp(zone.radialGrowth or 0, 0, 60)
+    -- Only extrapolate growth we have seen on the client. The short horizon
+    -- keeps a stopped circle from blocking the room indefinitely.
+    return radius + math.min(16, growth * math.clamp(arrivalTime or 0.35, 0, 0.45))
+end
+
 local function clearanceSingle(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
@@ -47,7 +55,7 @@ local function clearanceSingle(zone, position, margin, arrivalTime)
     if zone.shape == "Cylinder" then
         local height = math.abs(point.X) - half.X - BASE_MARGIN
         if height > 0 then return height end
-        return Vector2.new(point.Y, point.Z).Magnitude - math.max(half.Y, half.Z) - margin
+        return Vector2.new(point.Y, point.Z).Magnitude - projectedCircleRadius(zone, arrivalTime) - margin
     end
     if zone.shape == "Projectile" then
         return Geometry.segmentDistance(position, zone.frame.Position, zone.frame.Position + zone.velocity * zone.lookahead)
@@ -132,7 +140,7 @@ function Geometry.circleExits(zone, position, margin)
     local half = zone.size * 0.5
     if math.abs(point.X) - half.X - BASE_MARGIN > 0 then return nil end
     local radial = Vector3.new(0, point.Y, point.Z)
-    local radius = math.max(half.Y, half.Z)
+    local radius = projectedCircleRadius(zone)
     local distance = radial.Magnitude
     local needNear = radius + (margin or 0) - distance
     if needNear <= 0 or needNear > 45 then return nil end
@@ -174,6 +182,7 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
                 and zone.velocity.Magnitude * zone.lookahead or 0
             local radius = zone.size.Magnitude * 0.5 + padding + travel
                 + (zone.aimOffset and zone.aimOffset.Magnitude or 0)
+                + math.min(16, (zone.radialGrowth or 0) * 0.45)
             if Geometry.segmentDistance(zone.frame.Position, startPosition, endPosition) <= radius then
                 table.insert(relevant, zone)
             end

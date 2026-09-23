@@ -220,6 +220,14 @@ function Geometry.segmentDistance(position, startPosition, endPosition)
     return (position - (startPosition + delta * fraction)).Magnitude
 end
 
+local function projectedCircleRadius(zone, arrivalTime)
+    local radius = math.max(zone.size.Y, zone.size.Z) * 0.5
+    local growth = math.clamp(zone.radialGrowth or 0, 0, 60)
+    -- Only extrapolate growth we have seen on the client. The short horizon
+    -- keeps a stopped circle from blocking the room indefinitely.
+    return radius + math.min(16, growth * math.clamp(arrivalTime or 0.35, 0, 0.45))
+end
+
 local function clearanceSingle(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
@@ -249,7 +257,7 @@ local function clearanceSingle(zone, position, margin, arrivalTime)
     if zone.shape == "Cylinder" then
         local height = math.abs(point.X) - half.X - BASE_MARGIN
         if height > 0 then return height end
-        return Vector2.new(point.Y, point.Z).Magnitude - math.max(half.Y, half.Z) - margin
+        return Vector2.new(point.Y, point.Z).Magnitude - projectedCircleRadius(zone, arrivalTime) - margin
     end
     if zone.shape == "Projectile" then
         return Geometry.segmentDistance(position, zone.frame.Position, zone.frame.Position + zone.velocity * zone.lookahead)
@@ -334,7 +342,7 @@ function Geometry.circleExits(zone, position, margin)
     local half = zone.size * 0.5
     if math.abs(point.X) - half.X - BASE_MARGIN > 0 then return nil end
     local radial = Vector3.new(0, point.Y, point.Z)
-    local radius = math.max(half.Y, half.Z)
+    local radius = projectedCircleRadius(zone)
     local distance = radial.Magnitude
     local needNear = radius + (margin or 0) - distance
     if needNear <= 0 or needNear > 45 then return nil end
@@ -376,6 +384,7 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
                 and zone.velocity.Magnitude * zone.lookahead or 0
             local radius = zone.size.Magnitude * 0.5 + padding + travel
                 + (zone.aimOffset and zone.aimOffset.Magnitude or 0)
+                + math.min(16, (zone.radialGrowth or 0) * 0.45)
             if Geometry.segmentDistance(zone.frame.Position, startPosition, endPosition) <= radius then
                 table.insert(relevant, zone)
             end
@@ -2259,12 +2268,31 @@ local function refreshSafety(rootPart, now)
                     end
                     local geometryVelocity = geometryPart.AssemblyLinearVelocity
                     if geometryVelocity.Magnitude < 1 then geometryVelocity = velocity end
-                    local shape = projectile and "Projectile" or (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder and "Cylinder" or "Block")
+                    local cylinder = geometryPart:IsA("Part") and geometryPart.Shape == Enum.PartType.Cylinder
+                        or part:IsA("Part") and part.Shape == Enum.PartType.Cylinder
+                    local shape = projectile and "Projectile" or (cylinder and "Cylinder" or "Block")
+                    local radialGrowth = 0
+                    if shape == "Cylinder" and geometryPart.Size.X <= 4 then
+                        local radius = math.max(geometryPart.Size.Y, geometryPart.Size.Z) * 0.5
+                        if sample.lastRadius and sample.radiusAt and now > sample.radiusAt then
+                            local increase = radius - sample.lastRadius
+                            if increase > 0.05 then
+                                local measured = math.clamp(increase / (now - sample.radiusAt), 0, 60)
+                                sample.radialGrowth = sample.radialGrowth and sample.radialGrowth * 0.5 + measured * 0.5 or measured
+                                sample.lastGrowthAt = now
+                            elseif increase < -0.05 or now - (sample.lastGrowthAt or 0) > 0.25 then
+                                sample.radialGrowth = 0
+                            end
+                        end
+                        sample.lastRadius, sample.radiusAt = radius, now
+                        radialGrowth = sample.radialGrowth or 0
+                    end
                     local horizontal = Vector3.new(geometryVelocity.X, 0, geometryVelocity.Z)
                     local moving = sample.zone ~= nil and horizontal.Magnitude > 2 and horizontal.Magnitude < 160
                     sample.geometryPart = geometryPart
                     sample.zone = { frame = geometryPart.CFrame, size = geometryPart.Size, shape = shape,
                         velocity = geometryVelocity, moving = not projectile and moving, live = true,
+                        radialGrowth = radialGrowth,
                         followPart = true,
                         lookahead = projectile and CFG.PROJECTILE_LOOKAHEAD or 0.5, id = part }
                     if protectorSmash then
