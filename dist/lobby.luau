@@ -312,6 +312,7 @@ local controls = {}
 local errors, lastErrors = {}, {}
 local configPath = "DungeonQuestObsidian-config.json"
 local storedDodgeMemory = nil
+local storedAdaptiveMemory = nil
 local saveReady, saveDirty, saveVersion = false, false, 0
 local lastMemorySave = 0
 local menuKey = "RightShift"
@@ -338,21 +339,25 @@ end
 
 local function saveConfig()
     local memoryDirty = controller.DodgeMemoryDirty and controller.DodgeMemoryDirty()
-    if not saveReady or (not saveDirty and not memoryDirty) then return end
+    local adaptiveDirty = controller.AdaptiveMemoryDirty and controller.AdaptiveMemoryDirty()
+    if not saveReady or (not saveDirty and not memoryDirty and not adaptiveDirty) then return end
     if type(writefile) ~= "function" then
         errors.config = "Executor file saving is unavailable"
         return
     end
     local ok = pcall(function()
         local memory = controller.GetDodgeMemory and controller.GetDodgeMemory() or storedDodgeMemory
+        local adaptive = controller.GetAdaptiveMemory and controller.GetAdaptiveMemory() or storedAdaptiveMemory
         writefile(configPath, HttpService:JSONEncode({ Version = 1, Config = C, MenuKey = menuKey,
-            DodgeMemory = memory }))
+            DodgeMemory = memory, AdaptiveMemory = adaptive }))
         storedDodgeMemory = memory
+        storedAdaptiveMemory = adaptive
     end)
     if ok then
         saveDirty = false
         errors.config = nil
         if memoryDirty and controller.MarkDodgeMemorySaved then controller.MarkDodgeMemorySaved() end
+        if adaptiveDirty and controller.MarkAdaptiveMemorySaved then controller.MarkAdaptiveMemorySaved() end
     else errors.config = "Could not save settings" end
 end
 
@@ -852,7 +857,8 @@ end
 
 local lastHealth, lastHumanoid, lastSlow = nil, nil, 0
 local function slowTick(now)
-    if controller.DodgeMemoryDirty and controller.DodgeMemoryDirty() and now - lastMemorySave >= 10 then
+    if ((controller.DodgeMemoryDirty and controller.DodgeMemoryDirty())
+        or (controller.AdaptiveMemoryDirty and controller.AdaptiveMemoryDirty())) and now - lastMemorySave >= 10 then
         lastMemorySave = now
         scheduleSave()
     end
@@ -941,7 +947,20 @@ local function slowTick(now)
     setLabel("DodgePlan", string.format("Dodge plan: %s | goal %.1f studs | risk %.1f",
         tostring(hazardSnapshot.plan or "pursuit"), hazardSnapshot.goalDistance or 0, hazardSnapshot.risk or 0))
     setLabel("Navigation", (combatState.pathStatus or "Navigation: idle") .. " | Plans: " .. (combatState.pathComputations or 0))
-    setLabel("Spacing", string.format("Combat distance: %.0f studs", controller.Config.COMBAT_DISTANCE or 0))
+    local nav = combatState.adaptiveNavigation
+    if nav and nav.CurrentRouteEdge then
+        setLabel("Navigation", string.format("Route: %s | learned %.1f | stall %.0f%% | %s",
+            nav.CurrentRouteEdge, nav.RouteEdgeLearnedCost or 0, (nav.StuckScore or 0) * 100,
+            nav.ReplanReason or "committed"))
+    end
+    local mechanic = combatState.mechanicState
+    if mechanic and mechanic.CurrentMechanic ~= "NORMAL" then
+        setLabel("Spacing", string.format("%s | %s | confidence %.0f%% | cost %.1f",
+            mechanic.CurrentMechanic, mechanic.PreferredSide or "unlearned",
+            (mechanic.PolicyConfidence or 0) * 100, mechanic.LearnedDestinationPenalty or 0))
+    else
+        setLabel("Spacing", string.format("Combat distance: %.0f studs", controller.Config.COMBAT_DISTANCE or 0))
+    end
     local damage = combatState.lastDamage
     setLabel("LastDamage", damage and string.format("Last hit: %.0f HP | %.0fs ago", damage.amount, now - damage.at) or "Last hit: none")
     local names = { Completed = "Dungeons Completed", Coins = "Coins Gained", Gems = "Gems Gained", Levels = "Levels Earned", Failed = "Dungeons Failed", Deaths = "Deaths Logged", Freezes = "Freezes Logged", Runs = "Runs Recorded" }
@@ -1100,6 +1119,8 @@ if env.autoloadconfig ~= false then
     if saved then
         storedDodgeMemory = saved.DodgeMemory
         if controller.SetDodgeMemory then controller.SetDodgeMemory(storedDodgeMemory) end
+        storedAdaptiveMemory = saved.AdaptiveMemory
+        if controller.SetAdaptiveMemory then controller.SetAdaptiveMemory(storedAdaptiveMemory) end
     end
 end
 saveReady = true

@@ -482,11 +482,14 @@ local function connect(signal, callback)
     return connection
 end
 
+local adaptiveMemory = AdaptiveMemory.new()
+local adaptiveNavigation = AdaptiveNavigation.new(adaptiveMemory)
 local northernMechanics = NorthernLandsController.new({
     workspace = Workspace,
     player = player,
     threatGeometry = ThreatGeometry,
     connect = connect,
+    memory = adaptiveMemory,
 })
 state.mechanicState = northernMechanics.State
 
@@ -527,6 +530,9 @@ do
     end
 end
 local function trackInstance(instance)
+    if instance:IsA("BasePart") and instance.Name:lower() == "checkpoint" then
+        state.routeAnchors, state.routeScannedAt = {}, -math.huge
+    end
     if state.hazardLabelFolder and instance:IsDescendantOf(state.hazardLabelFolder) then return end
     if instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
         humanoidModels[instance] = instance.Parent
@@ -555,6 +561,9 @@ local function trackInstance(instance)
 end
 connect(Workspace.DescendantAdded, trackInstance)
 connect(Workspace.DescendantRemoving, function(instance)
+    if instance:IsA("BasePart") and instance.Name:lower() == "checkpoint" then
+        state.routeAnchors, state.routeScannedAt = {}, -math.huge
+    end
     local sample = threatParts[instance]
     if sample and sample.zone then sample.removedAt = os.clock() else threatParts[instance] = nil end
     safeSpots[instance] = nil
@@ -867,9 +876,25 @@ local function mapRouteGoal(rootPart, now)
         state.routeInitialized = true
         initializeRouteProgress(rootPart)
     end
+    local edge = adaptiveNavigation.edge
+    if edge and edge.anchor and edge.anchor.part.Parent
+        and (rootPart.Position - edge.goal).Magnitude < 12
+        and not hasBlockingRay(rootPart.Position, edge.goal, rootPart.Parent, edge.anchor.part) then
+        local reached = edge.anchor
+        adaptiveNavigation:Outcome(true, "chosen room entrance reached", now)
+        if not state.routeProgress or reached.order > state.routeProgress.order
+            or reached.order == state.routeProgress.order and reached.name > state.routeProgress.name then
+            state.routeProgress = { order = reached.order, name = reached.name }
+        end
+        while state.routeAnchors[state.routeAnchorIndex] do
+            local item = state.routeAnchors[state.routeAnchorIndex]
+            if item.order > reached.order or item.order == reached.order and item.name > reached.name then break end
+            state.routeAnchorIndex = state.routeAnchorIndex + 1
+        end
+    end
     while true do
         local anchor = state.routeAnchors[state.routeAnchorIndex]
-        if not anchor then return nil end
+        if not anchor then adaptiveNavigation:Cancel("room graph complete"); return nil end
         if not anchor.part.Parent then
             state.routeAnchors, state.routeScannedAt = {}, -math.huge
             refreshRouteAnchors(now)
@@ -882,10 +907,23 @@ local function mapRouteGoal(rootPart, now)
         -- because its XZ projection is nearby.
         if flat <= 12 and math.abs(delta.Y) <= 9
             and not hasBlockingRay(rootPart.Position, anchor.part.Position, rootPart.Parent, anchor.part) then
+            if adaptiveNavigation.edge and adaptiveNavigation.edge.anchor == anchor then
+                adaptiveNavigation:Outcome(true, "checkpoint advancement", now)
+            else
+                adaptiveNavigation:Cancel("different checkpoint reached")
+            end
             state.routeProgress = { order = anchor.order, name = anchor.name }
             state.routeAnchorIndex = state.routeAnchorIndex + 1
         else
-            return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+            local goal, selected = adaptiveNavigation:Goal(rootPart, state.currentTarget, state.routeAnchors,
+                state.routeProgress, state.routeDungeon, now, function(position)
+                    local blocked = hasBlockingRay(rootPart.Position, position, rootPart.Parent, anchor.part)
+                    local risk = ThreatGeometry.risk(state.activeZones, position, CFG.HAZARD_MARGIN)
+                    local safe = ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, position, CFG.HAZARD_MARGIN)
+                    return (blocked and 100 or 0) + risk * 1000 + (safe and 0 or 1000)
+                end)
+            state.adaptiveNavigation = adaptiveNavigation.debug
+            return goal, selected
         end
     end
 end
@@ -1099,6 +1137,7 @@ local function createPath(startPosition, endPosition, mode, now)
         { AgentRadius = CFG.AGENT_RADIUS, AgentHeight = CFG.AGENT_HEIGHT, AgentCanJump = CFG.AGENT_CAN_JUMP, AgentJumpHeight = CFG.AGENT_JUMP_HEIGHT, AgentMaxSlope = CFG.AGENT_MAX_SLOPE, WaypointSpacing = CFG.WAYPOINT_SPACING },
         { AgentRadius = math.max(1.5, CFG.AGENT_RADIUS - 0.5), AgentHeight = CFG.AGENT_HEIGHT, AgentCanJump = true, AgentJumpHeight = CFG.AGENT_JUMP_HEIGHT + 2, AgentMaxSlope = CFG.AGENT_MAX_SLOPE, WaypointSpacing = 3 },
     }
+    local bestPath, bestPoints, bestCost, bestExposure
     for _, configuration in ipairs(configurations) do
         local path = PathfindingService:CreatePath(configuration)
         state.pathComputations = state.pathComputations + 1
@@ -1106,12 +1145,32 @@ local function createPath(startPosition, endPosition, mode, now)
         if ok and path.Status == Enum.PathStatus.Success then
             local waypoints = path:GetWaypoints()
             if #waypoints >= 2 then
-                state.failedPaths[key] = nil
-                return path, waypoints
+                local cost, exposure, previous = 0, 0, startPosition
+                for _, waypoint in ipairs(waypoints) do
+                    local point = waypoint.Position + Vector3.new(0, 2.5, 0)
+                    local learned = adaptiveNavigation:LocalCost(previous, point)
+                    cost = cost + (point - previous).Magnitude + learned / #waypoints
+                    exposure = exposure + ThreatGeometry.risk(state.activeZones, point, CFG.HAZARD_MARGIN)
+                    if not ThreatGeometry.segmentSafe(state.activeZones, previous, point, CFG.HAZARD_MARGIN) then
+                        exposure = exposure + 1
+                    end
+                    for _, enemy in ipairs(state.nearbyEnemies) do
+                        if enemy.root.Parent then cost = cost + math.max(0, enemy.radius - (enemy.root.Position - point).Magnitude) * 8 end
+                    end
+                    previous = point
+                end
+                if not bestCost or exposure < bestExposure or exposure == bestExposure and cost < bestCost then
+                    if bestPath then bestPath:Destroy() end
+                    bestPath, bestPoints, bestCost, bestExposure = path, waypoints, cost, exposure
+                else path:Destroy() end
+            else
+                path:Destroy()
             end
+        else
+            path:Destroy()
         end
-        path:Destroy()
     end
+    if bestPath then state.failedPaths[key] = nil; return bestPath, bestPoints end
     state.failedPaths[key] = now
     return nil
 end
@@ -1148,7 +1207,11 @@ end
 -- Steering uses Humanoid:MoveTo. (Humanoid:Move is input-path and gets
 -- swallowed from an executor context, which once froze the bot solid.)
 local function issueMove(humanoid, position, mode, now, bypass)
+    if mode == "evade" or mode == "mechanic" or mode == "hold" then
+        state.adaptiveLocalAttempt = nil
+    end
     local function safetyHold(root)
+        state.adaptiveLocalAttempt = nil
         if state.motionMode ~= "safety-hold" or now - state.lastMoveToCall >= 0.35 then
             humanoid:MoveTo(root.Position)
             state.lastMoveToCall = now
@@ -1209,9 +1272,13 @@ local function chooseFallbackStep(rootPart, goal, target)
     for key, at in pairs(state.fallbackVisits) do if now - at > 15 then state.fallbackVisits[key] = nil end end
     for _, direction in ipairs(directions) do
         local candidate = groundPosition(rootPart.Position + direction * 8, rootPart.Parent, target)
-        if walkingSegmentClear(rootPart, candidate, target) then
+        if walkingSegmentClear(rootPart, candidate, target)
+            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
+            and safeEnemyStep(rootPart.Position, candidate) then
             local key = math.floor(candidate.X / 6) .. ":" .. math.floor(candidate.Z / 6)
-            local score = (candidate - goal).Magnitude + (state.fallbackVisits[key] and 40 or 0)
+            local learned = adaptiveNavigation:LocalCost(rootPart.Position, candidate)
+            local score = (candidate - goal).Magnitude + (state.fallbackVisits[key] and 40 or 0) + learned
+                + math.max(0, 8 - enemyClearance(candidate)) * 12
             if not bestScore or score < bestScore then best, bestScore = candidate, score end
         end
     end
@@ -1281,6 +1348,28 @@ end
 
 local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not goal then return end
+    if mode ~= "map-route" and adaptiveNavigation.edge then
+        adaptiveNavigation:Cancel("local objective owns movement")
+    end
+    local localAttempt = state.adaptiveLocalAttempt
+    -- Only score a continuously pursued fallback for the same objective.
+    -- Mechanics, waiting, and replacement goals cancel evidence, not fail it.
+    if localAttempt and (now - localAttempt.lastAt > 1 or localAttempt.mode ~= mode
+        or (localAttempt.objective - goal).Magnitude > 2 or state.fallbackGoal ~= localAttempt.goal) then
+        state.adaptiveLocalAttempt, localAttempt = nil, nil
+    end
+    if localAttempt then localAttempt.lastAt = now end
+    if localAttempt and (rootPart.Position - localAttempt.goal).Magnitude < 4 then
+        adaptiveNavigation:LocalOutcome(localAttempt.start, localAttempt.goal, true)
+        state.adaptiveLocalAttempt = nil
+    elseif localAttempt and now - localAttempt.at > 8 then
+        adaptiveNavigation:LocalOutcome(localAttempt.start, localAttempt.goal, false)
+        state.adaptiveLocalAttempt = nil
+    end
+    if state.fallbackGoal and not state.adaptiveLocalAttempt then
+        state.adaptiveLocalAttempt = { start = rootPart.Position, goal = state.fallbackGoal, at = now,
+            lastAt = now, objective = goal, mode = mode }
+    end
     -- Flying targets bob up and down; a climb goal set during an upward bob
     -- goes stale when the target comes back down. Drop it instead of pacing
     -- between tiers.
@@ -1357,6 +1446,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         state.pathUpdateTime = now
         state.pathPending = true
         local generation = state.pathGeneration
+        local routeEpoch = adaptiveNavigation.epoch
         local startPosition = rootPart.Position
         task.spawn(function()
         local recoveryGoal
@@ -1374,7 +1464,8 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             return
         end
         if state.closed or not state.running or humanoid.Health <= 0 or generation ~= state.pathGeneration
-            or player.Character ~= rootPart.Parent or not target.Parent
+            or player.Character ~= rootPart.Parent or target and not target.Parent
+            or mode == "map-route" and routeEpoch ~= adaptiveNavigation.epoch
             or not state.motionGoal or (state.motionGoal - goal).Magnitude > 8 then
             if path then path:Destroy() end
             return
@@ -1403,6 +1494,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             visualizeWaypoints(waypoints, state.currentWaypointIndex)
             state.pathStatus = (recoveryGoal and "Recovering to higher ground: " or "Pathfinding: ") .. #waypoints .. " waypoints"
         else
+            if mode == "map-route" then adaptiveNavigation:Outcome(false, "local path unavailable", os.clock()) end
             if #state.waypoints > 0 and not state.pathBlocked then return end
             clearPath()
             local fallback = nil
@@ -1529,6 +1621,28 @@ end
 local function updateProgress(humanoid, rootPart, goal, target, now)
     if now - state.lastStuckCheck < CFG.STUCK_CHECK_INTERVAL then return false end
     state.lastStuckCheck = now
+    local remaining
+    if #state.waypoints > 0 then
+        remaining = 0
+        local previous = rootPart.Position
+        for index = state.currentWaypointIndex, #state.waypoints do
+            local point = state.waypoints[index].Position
+            remaining = remaining + (point - previous).Magnitude
+            previous = point
+        end
+        remaining = remaining + (previous - goal).Magnitude
+    end
+    if adaptiveNavigation:Progress(rootPart.Position, goal, remaining, now) then
+        local attempt = state.adaptiveLocalAttempt
+        if attempt then
+            adaptiveNavigation:LocalOutcome(attempt.start, attempt.goal, false)
+            state.adaptiveLocalAttempt = nil
+        end
+        state.pathBlocked = true
+        state.pathUpdateTime = 0
+        state.fallbackGoal = nil
+        state.routeFails = (state.routeFails or 0) + 1
+    end
     -- Follow the active waypoint, not the distant enemy: a valid path may
     -- initially lead away from the final goal to get around a wall.
     local waypoint = state.waypoints[state.currentWaypointIndex]
@@ -2480,6 +2594,7 @@ local function castSkill()
 end
 
 local function stopMovement(humanoid, rootPart)
+    state.adaptiveLocalAttempt = nil
     if state.motionMode == "hold" and not state.motionGoal then return end
     humanoid:MoveTo(rootPart.Position)
     state.motionMode = "hold"
@@ -3047,6 +3162,7 @@ end
 
 local function executeNorthernMechanic(intent, humanoid, rootPart, target, targetRoot, now, distance)
     if not intent then return false end
+    state.adaptiveLocalAttempt = nil
     if state.motionMode ~= "mechanic" and state.motionMode ~= "mechanic-hold" then
         clearPath()
         state.motionGoal, state.fallbackGoal = nil, nil
@@ -3215,6 +3331,7 @@ local function controllerTick()
         return
     end
     if state.currentTarget ~= target then
+        state.adaptiveLocalAttempt = nil
         state.combatIntent = nil
         state.lastProgressGoal = nil
         local previousRoot = state.currentTarget and getRootPart(state.currentTarget)
@@ -3280,6 +3397,20 @@ local function controllerTick()
         faceEnemy(humanoid, rootPart, targetRoot)
         if distance <= CFG.ATTACK_RANGE and not hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then castSkill() end
         return
+    end
+
+    -- Long approaches use the room graph even when a replicated enemy is
+    -- visible across several rooms. Combat and mandatory mechanics remain local.
+    if distance > math.max(60, CFG.ATTACK_RANGE + 12) then
+        local routeGoal, routeAnchor = mapRouteGoal(rootPart, now)
+        if routeGoal then
+            state.navigationPhase = "approach"
+            state.status = "Following room graph: " .. routeAnchor.name
+            restoreFacing()
+            followGoal(humanoid, rootPart, routeGoal, "map-route", now, target)
+            updateProgress(humanoid, rootPart, routeGoal, target, now)
+            return
+        end
     end
 
     -- A combat-distance point on this side of a wall is not an attack position.
@@ -3516,6 +3647,9 @@ end)
 local function setRunning(running)
     if state.closed or state.running == running then return end
     state.running = running
+    adaptiveNavigation:Reset()
+    northernMechanics:Reset()
+    state.adaptiveLocalAttempt = nil
     if state.running then
         state.unreachableTargets = setmetatable({}, { __mode = "k" })
         state.combatIntent, state.lastProgressGoal = nil, nil
@@ -3591,6 +3725,21 @@ local function watchHealth(character)
                 distance = state.targetDist }
             local root = character:FindFirstChild("HumanoidRootPart")
             if root then
+                northernMechanics:ObserveDamage(root, state.activeZones, os.clock())
+                if state.motionGoal and state.motionMode ~= "mechanic" and state.motionMode ~= "mechanic-hold"
+                    and ThreatGeometry.risk(state.activeZones, root.Position, 2) > 0 then
+                    local attempt = state.adaptiveLocalAttempt
+                    if attempt and os.clock() - attempt.lastAt <= 1 then
+                        adaptiveNavigation:LocalOutcome(attempt.start, attempt.goal, false)
+                        state.adaptiveLocalAttempt = nil
+                    end
+                    if adaptiveNavigation.edge and state.motionGoalMode == "map-route"
+                        and state.motionMode ~= "evade"
+                        and os.clock() - (state.lastRouteDamageAt or -math.huge) > 2 then
+                        adaptiveMemory:Observe("route", adaptiveNavigation.edge.key, {}, false)
+                        state.lastRouteDamageAt = os.clock()
+                    end
+                end
                 local nearby = {}
                 local nearestZone, nearestZoneClearance = nil, math.huge
                 for _, zone in ipairs(state.activeZones) do
@@ -3650,6 +3799,9 @@ local function watchHealth(character)
 end
 
 connect(player.CharacterAdded, function(character)
+    adaptiveNavigation:Reset()
+    northernMechanics:Reset()
+    state.adaptiveLocalAttempt = nil
     state.combatIntent, state.lastProgressGoal = nil, nil
     state.escapeLearning = nil
     state.aimObservations = setmetatable({}, { __mode = "k" })
@@ -3738,6 +3890,10 @@ return {
     GetDodgeMemory = exportDodgeMemory,
     DodgeMemoryDirty = function() return state.hazardMemoryDirty end,
     MarkDodgeMemorySaved = function() state.hazardMemoryDirty = false end,
+    SetAdaptiveMemory = function(data) adaptiveMemory:Load(data) end,
+    GetAdaptiveMemory = function() return adaptiveMemory:Export() end,
+    AdaptiveMemoryDirty = function() return adaptiveMemory.dirty end,
+    MarkAdaptiveMemorySaved = function() adaptiveMemory.dirty = false end,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end

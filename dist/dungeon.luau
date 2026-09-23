@@ -447,6 +447,322 @@ end
 return Geometry
 
 end)()
+local AdaptiveMemory = (function()
+-- Small, JSON-safe advisory memory. No Instance references or unbounded logs.
+local Memory = {}
+Memory.__index = Memory
+local LIMITS = { boss = 32, route = 96 }
+local HALF_LIFE = 7 * 24 * 60 * 60
+local function finite(n) return type(n) == "number" and n == n and math.abs(n) < 1e12 end
+local function validKey(s) return type(s) == "string" and #s > 0 and #s <= 180 end
+local function decay(row, now)
+    return 0.5 ^ (math.max(0, now - row.at) / HALF_LIFE)
+end
+local function trim(rows, limit)
+    local count, oldest, at = 0, nil, math.huge
+    for key, row in pairs(rows) do
+        count = count + 1
+        if row.at < at then oldest, at = key, row.at end
+    end
+    if count >= limit and oldest then rows[oldest] = nil end
+end
+function Memory.new(clock)
+    return setmetatable({ clock = clock or os.time, groups = { boss = {}, route = {} }, dirty = false }, Memory)
+end
+function Memory:Observe(group, key, features, success, weight)
+    if not LIMITS[group] or not validKey(key) or type(success) ~= "boolean" then return end
+    local rows, now = self.groups[group], self.clock()
+    weight = finite(weight) and math.max(0.1, math.min(1, weight)) or 1
+    local row = rows[key]
+    if not row then
+        trim(rows, LIMITS[group])
+        row = { at = now, wins = 0, losses = 0, bins = {} }
+        rows[key] = row
+    end
+    -- Recency within a session as well as wall-clock decay; new success can
+    -- reverse an old preference without waiting for the time half-life.
+    local factor = decay(row, now) * 0.96 ^ weight
+    row.wins, row.losses = row.wins * factor, row.losses * factor
+    for _, bin in pairs(row.bins) do
+        bin.wins, bin.losses = bin.wins * factor, bin.losses * factor
+    end
+    local field = success and "wins" or "losses"
+    row[field], row.at = row[field] + weight, now
+    local seen, count = {}, 0
+    for _, feature in ipairs(features or {}) do
+        if validKey(feature) and not seen[feature] and count < 10 then
+            count, seen[feature] = count + 1, true
+            local bin = row.bins[feature]
+            if not bin then trim(row.bins, 48); bin = { wins = 0, losses = 0, at = now }; row.bins[feature] = bin end
+            bin[field], bin.at = bin[field] + weight, now
+        end
+    end
+    self.dirty = true
+end
+function Memory:Cost(group, key, features)
+    local row = self.groups[group] and self.groups[group][key]
+    if not row then return 0, 0 end
+    local factor, total, confidence, count = decay(row, self.clock()), 0, 0, 0
+    local function add(wins, losses)
+        wins, losses = wins * factor, losses * factor
+        local n = wins + losses
+        local c = n / (n + 6)
+        total, confidence, count = total + (losses - wins) / (n + 4) * c, confidence + c, count + 1
+    end
+    if group == "route" then add(row.wins, row.losses) end
+    for _, feature in ipairs(features or {}) do
+        local bin = row.bins[feature]
+        if bin then add(bin.wins, bin.losses) end
+    end
+    if count == 0 then return 0, 0 end
+    return math.max(-24, math.min(24, total / count * 24)), confidence / count
+end
+function Memory:Export()
+    -- Detached copy so serialization or a caller cannot mutate live evidence.
+    local result = { Version = 1, Groups = { boss = {}, route = {} } }
+    for group, rows in pairs(self.groups) do
+        for key, row in pairs(rows) do
+            local copy = { at = row.at, wins = row.wins, losses = row.losses, bins = {} }
+            for feature, bin in pairs(row.bins) do
+                copy.bins[feature] = { at = bin.at, wins = bin.wins, losses = bin.losses }
+            end
+            result.Groups[group][key] = copy
+        end
+    end
+    return result
+end
+function Memory:Load(data)
+    if type(data) ~= "table" or data.Version ~= 1 or type(data.Groups) ~= "table" then return end
+    local now, groups = self.clock(), { boss = {}, route = {} }
+    local function clean(row)
+        if type(row) ~= "table" or not finite(row.at) or not finite(row.wins) or not finite(row.losses)
+            or row.at > now + 60 or row.at < 0 or row.wins < 0 or row.losses < 0 then return nil end
+        return { at = row.at, wins = math.min(32, row.wins), losses = math.min(32, row.losses) }
+    end
+    for group, limit in pairs(LIMITS) do
+        local count = 0
+        if type(data.Groups[group]) == "table" then
+            for key, source in pairs(data.Groups[group]) do
+                if count >= limit then break end
+                local row = clean(source)
+                if validKey(key) and row then
+                    count, row.bins = count + 1, {}
+                    local bins = 0
+                    if type(source.bins) == "table" then
+                        for feature, sample in pairs(source.bins) do
+                            if bins >= 48 then break end
+                            local bin = clean(sample)
+                            if validKey(feature) and bin then row.bins[feature], bins = bin, bins + 1 end
+                        end
+                    end
+                    groups[group][key] = row
+                end
+            end
+        end
+    end
+    self.groups, self.dirty = groups, false
+end
+return Memory
+
+end)()
+local AdaptiveNavigation = (function()
+-- Authored checkpoint layers form a directed room graph. Multiple checkpoints
+-- in one room are alternative entrances, never evidence of an arbitrary shortcut.
+local Navigation = {}
+Navigation.__index = Navigation
+local function flatDistance(a, b)
+    local x, z = a.X - b.X, a.Z - b.Z
+    return math.sqrt(x * x + z * z)
+end
+local function cell(p)
+    return math.floor(p.X / 12 + 0.5) .. ":" .. math.floor(p.Y / 8 + 0.5) .. ":" .. math.floor(p.Z / 12 + 0.5)
+end
+function Navigation.new(memory)
+    return setmetatable({ memory = memory, debug = {}, failedUntil = {}, epoch = 0 }, Navigation)
+end
+function Navigation:Reset()
+    self.edge, self.watch, self.choice, self.anchors = nil, nil, nil, nil
+    self.failedUntil, self.debug = {}, {}
+    self.epoch = self.epoch + 1
+end
+function Navigation:Rebuild(anchors, dungeon)
+    if self.anchors == anchors and self.dungeon == dungeon then return end
+    self.anchors, self.dungeon, self.layers = anchors, dungeon, {}
+    self.choice, self.edge, self.watch = nil, nil, nil
+    self.epoch = self.epoch + 1
+    for index, anchor in ipairs(anchors) do
+        if index > 96 then break end
+        local layer = self.layers[#self.layers]
+        if not layer or layer.order ~= anchor.order or layer.name ~= anchor.name then
+            layer = { order = anchor.order, name = anchor.name, nodes = {} }
+            table.insert(self.layers, layer)
+        end
+        if #layer.nodes < 8 then
+            table.insert(layer.nodes, { anchor = anchor, index = index,
+                id = anchor.name .. "@" .. cell(anchor.part.Position) })
+        end
+    end
+end
+function Navigation:Key(from, node)
+    return tostring(self.dungeon) .. "/" .. from .. ">" .. node.id
+end
+function Navigation:Cancel(reason)
+    if self.edge or self.choice then self.epoch = self.epoch + 1 end
+    self.choice, self.edge, self.watch = nil, nil, nil
+    self.debug.CurrentRouteEdge, self.debug.RouteEdgeLearnedCost = nil, nil
+    self.debug.ReplanReason = reason
+end
+function Navigation:Outcome(success, reason, now)
+    local edge = self.edge
+    if not edge then return end
+    self.memory:Observe("route", edge.key, {}, success)
+    if not success then
+        self.failedUntil[edge.key] = now + 4
+        local count = 0
+        for key, expiry in pairs(self.failedUntil) do
+            if expiry <= now then self.failedUntil[key] = nil else count = count + 1 end
+        end
+        if count > 96 then self.failedUntil = { [edge.key] = now + 4 } end
+    end
+    self.debug.ReplanReason = reason
+    self.choice, self.edge, self.watch = nil, nil, nil
+    self.epoch = self.epoch + 1
+end
+function Navigation:Goal(root, target, anchors, progress, dungeon, now, cost)
+    self:Rebuild(anchors, dungeon)
+    local targetLayer
+    -- Prefer authored ancestry. Spatial assignment is bounded to checkpoint
+    -- neighborhoods; unknown far enemies cannot pull the route across the map.
+    local targetRoot = target and (target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart)
+    if targetRoot then
+        local best = 65
+        for index, layer in ipairs(self.layers) do
+            for _, node in ipairs(layer.nodes) do
+                if node.anchor.part.Parent then
+                    local parent = target.Parent
+                    local inRoom = false
+                    while parent and parent ~= workspace do
+                        if parent == node.anchor.part.Parent then inRoom = true; break end
+                        parent = parent.Parent
+                    end
+                    local distance = flatDistance(targetRoot.Position, node.anchor.part.Position)
+                    if inRoom or distance < best and math.abs(targetRoot.Position.Y - node.anchor.part.Position.Y) < 14 then
+                        targetLayer, best = index, inRoom and -1 or distance
+                    end
+                end
+            end
+        end
+    end
+    local nextLayer
+    for index, layer in ipairs(self.layers) do
+        if not progress or layer.order > progress.order or layer.order == progress.order and layer.name > progress.name then
+            nextLayer = index; break
+        end
+    end
+    if not nextLayer then self:Cancel("room graph complete"); return nil end
+    if targetLayer and targetLayer < nextLayer then
+        -- Explicit live target in a passed room is the only backward objective
+        -- admitted here. Merely being close to an old checkpoint is insufficient.
+        self:Cancel("live objective in current or previous room")
+        return nil
+    end
+    local signature = tostring(nextLayer) .. ":" .. tostring(targetLayer)
+    if self.choice and self.choice.signature == signature and now < self.choice.untilAt
+        and self.choice.node.anchor.part.Parent then
+        if now - (self.choice.checkedAt or 0) >= 0.15 then
+            self.choice.checkedAt, self.choice.safe = now, cost(self.choice.goal) < 1000
+        end
+        if self.choice.safe then return self.choice.goal, self.choice.node.anchor end
+    end
+    local last = math.min(targetLayer or nextLayer, nextLayer + 3, #self.layers)
+    local from = progress and progress.name or "entry"
+    local downstream = {}
+    -- Bounded backwards dynamic programming over forward room edges.
+    for layerIndex = last, nextLayer, -1 do
+        for _, node in ipairs(self.layers[layerIndex].nodes) do
+            if node.anchor.part.Parent then
+                local continuation
+                if layerIndex < last then
+                    for _, other in ipairs(self.layers[layerIndex + 1].nodes) do
+                        if other.anchor.part.Parent and downstream[other] then
+                            local learned = self.memory:Cost("route", self:Key(node.anchor.name, other), {})
+                            local score = flatDistance(node.anchor.part.Position, other.anchor.part.Position)
+                                + learned + downstream[other]
+                            continuation = math.min(continuation or math.huge, score)
+                        end
+                    end
+                end
+                downstream[node] = continuation or 0
+            end
+        end
+    end
+    local best, bestScore, bestGoal, bestDanger, oldScore, oldDanger
+    for _, node in ipairs(self.layers[nextLayer].nodes) do
+        if node.anchor.part.Parent then
+            local goal = node.anchor.part.Position + Vector3.new(0, 2.5, 0)
+            local key = self:Key(from, node)
+            local learned, confidence = self.memory:Cost("route", key, {})
+            local liveCost = cost(goal)
+            local danger = math.floor(liveCost / 1000)
+            local score = flatDistance(root.Position, goal) + liveCost + learned + (downstream[node] or 0)
+                + ((self.failedUntil[key] or 0) > now and 250 or 0)
+            if self.choice and self.choice.signature == signature and self.choice.node == node then
+                oldScore, oldDanger = score, danger
+            end
+            if not bestScore or danger < bestDanger or danger == bestDanger and score < bestScore then
+                best, bestScore, bestGoal = node, score, goal
+                bestDanger = danger
+                self.debug.RouteEdgeLearnedCost, self.debug.RouteConfidence = learned, confidence
+            end
+        end
+    end
+    if not best then return nil end
+    if oldScore and oldDanger == bestDanger and oldScore < bestScore + 12 then
+        best, bestGoal = self.choice.node, self.choice.goal
+    end
+    local key = self:Key(from, best)
+    self.debug.RouteEdgeLearnedCost, self.debug.RouteConfidence = self.memory:Cost("route", key, {})
+    if not self.edge or self.edge.key ~= key then self.watch = nil; self.epoch = self.epoch + 1 end
+    self.edge = { key = key, goal = bestGoal, anchor = best.anchor }
+    self.choice = { node = best, goal = bestGoal, untilAt = now + 1.5, signature = signature,
+        checkedAt = now, safe = bestDanger == 0 }
+    self.debug.CurrentRouteEdge, self.debug.TargetRoom = key, targetLayer and self.layers[targetLayer].name or "next room"
+    return bestGoal, best.anchor
+end
+function Navigation:Progress(position, goal, remaining, now)
+    local watch = self.watch
+    if not watch or flatDistance(goal, watch.goal) > 6 then
+        self.watch = { goal = goal, best = flatDistance(position, goal), at = now, lastAt = now, remaining = remaining }
+        return false
+    end
+    -- Hazard/mechanic owners suspend route progress monitoring; their elapsed
+    -- time must not be attributed as a navigation failure on resumption.
+    if now - watch.lastAt > 1 then watch.at = now end
+    watch.lastAt = now
+    local distance = flatDistance(position, goal)
+    -- Remaining path length can improve during a necessary detour. It is a
+    -- best-ever measure for this objective, so path replacement cannot reset it.
+    if distance < watch.best - 2 or remaining and watch.remaining and remaining < watch.remaining - 3 then
+        watch.best, watch.at = math.min(watch.best, distance), now
+        if remaining then watch.remaining = math.min(watch.remaining or remaining, remaining) end
+    elseif remaining and not watch.remaining then watch.remaining = remaining end
+    self.debug.StuckScore = math.min(1, (now - watch.at) / 8)
+    if now - watch.at >= 8 then
+        self:Outcome(false, "objective progress stalled", now)
+        self.watch = nil
+        return true
+    end
+    return false
+end
+function Navigation:LocalCost(start, goal)
+    return self.memory:Cost("route", tostring(self.dungeon) .. "/local/" .. cell(start) .. ">" .. cell(goal), {})
+end
+function Navigation:LocalOutcome(start, goal, success)
+    self.memory:Observe("route", tostring(self.dungeon) .. "/local/" .. cell(start) .. ">" .. cell(goal), {}, success)
+end
+return Navigation
+
+end)()
 local NorthernLandsController = (function()
 local NorthernLands = {}
 NorthernLands.__index = NorthernLands
@@ -608,11 +924,13 @@ function NorthernLands.new(options)
     self._workspace = options.workspace or workspace
     self._player = options.player
     self._geometry = options.threatGeometry
+    self._memory = options.memory
     self._connect = options.connect or function(signal, callback) return signal:Connect(callback) end
     self._crystals = {}
     self._safeZoneParts = setmetatable({}, { __mode = "k" })
     self._orbs = setmetatable({}, { __mode = "k" })
     self._orbSamples = setmetatable({}, { __mode = "k" })
+    self._completedTargets = setmetatable({}, { __mode = "k" })
     self._intent = nil
     self._intentUntil = 0
     self._lastPlanAt = -math.huge
@@ -689,8 +1007,19 @@ function NorthernLands:_onEvent(action, data)
     elseif action == "First Boss Slam Land" then
         if self._slam then self._slam.landedAt = now end
     elseif action == "Second Boss Orb Explosion" then
+        local episode = self._episode
+        local crystal = episode and self._crystals[episode.color]
+        local frame = type(data) == "table" and data[1]
+        if episode and episode.mechanic == "ORB_GUIDE" and crystal and crystal.Parent
+            and typeof(frame) == "CFrame" and closestColor(data[2]) == episode.color
+            and now - episode.lastAt <= 1 and episode.orbSeenAt and now - episode.orbSeenAt <= 1
+            and flat(frame.Position - crystal.Position).Magnitude <= 10
+            and episode.orbPosition and flat(frame.Position - episode.orbPosition).Magnitude <= 12 then
+            self:_completeEvidence("matching crystal explosion")
+        end
         self._intentUntil = 0
     elseif action == "Bonus Boss Tall Swirly" or action == "Bonus Boss Tall Swirly Recolor" then
+        self._colorResolved = false
         if type(data) == "table" then
             local color = containsColorName(data[1])
             if color then
@@ -757,6 +1086,7 @@ function NorthernLands:_normal(now)
 end
 
 function NorthernLands:Reset()
+    self._episode = nil
     self._slam = nil
     self._requiredColor = nil
     self._safeColorActive = false
@@ -817,8 +1147,17 @@ function NorthernLands:_pick(context, candidates, desired, options, extraScore)
         local score, grounded, risk, pathSafe = self:_candidateScore(context, candidate, desired, options)
         if score then
             if extraScore then score = score + (extraScore(grounded) or 0) end
-            if not bestScore or score < bestScore then
+            local penalty, confidence = 0, 0
+            if self._memory and self._policy then
+                penalty, confidence = self._memory:Cost("boss", self:_policyKey(context), self:_features(context, grounded))
+            end
+            -- Historical preference only breaks ties between equal current
+            -- exposure classes. It cannot buy a crossing through a safe lane.
+            score = score + penalty
+            if not bestScore or pathSafe and not bestSafe
+                or pathSafe == bestSafe and (risk < bestRisk or risk == bestRisk and score < bestScore) then
                 best, bestScore, bestRisk, bestSafe = grounded, score, risk, pathSafe
+                self.State.PolicyConfidence, self.State.LearnedDestinationPenalty = confidence, penalty
             end
         end
     end
@@ -842,7 +1181,103 @@ function NorthernLands:_commitIntent(context, mechanic, objective, goal, reason,
     }
     self._intent = intent
     self._intentUntil = context.now + lease
+    self:_recordChoice(context, intent, fields)
     return intent
+end
+
+local function cell(position, size)
+    return math.floor(position.X / size + 0.5) .. ":" .. math.floor(position.Z / size + 0.5)
+end
+
+function NorthernLands:_policyKey(context)
+    return tostring(self.State.CurrentBoss or "ODIN_REINCARNATION") .. "/" .. tostring(self._policy)
+        .. "/" .. tostring(self._policyColor or "none")
+end
+
+function NorthernLands:_features(context, goal)
+    local root = context.rootPart.Position
+    local center = context.targetRoot and context.targetRoot.Position or root
+    local radial, movement = unitOr(root - center), unitOr(goal - root)
+    local side = radial:Cross(movement).Y >= 0 and "1" or "-1"
+    local sector = math.floor((math.atan2(goal.Z - center.Z, goal.X - center.X) + math.pi) / (math.pi / 4)) % 8
+    local features = { "side:" .. side, "sector:" .. sector,
+        "distance:" .. math.floor(flat(goal - center).Magnitude / 4 + 0.5),
+        "destination:" .. cell(goal, 10), "segment:" .. cell(root, 16) .. ">" .. cell(goal, 16) }
+    local crystal = self._policyColor and self._crystals[self._policyColor]
+    if self._policy == "ORB_GUIDE" and crystal and crystal.Parent then
+        local offset = flat(goal - crystal.Position)
+        table.insert(features, "standOff:" .. math.floor(offset.Magnitude / 3 + 0.5))
+        table.insert(features, "angle:" .. math.floor((math.atan2(offset.Z, offset.X) + math.pi) / (math.pi / 6)))
+    end
+    return features
+end
+
+function NorthernLands:_recordChoice(context, intent, fields)
+    if not self._memory or not self._policy or intent.mechanic == "RECOVERY" then return end
+    if intent.mechanic == "COLOR_MECHANIC" and self._colorResolved then return end
+    if fields and fields.target and self._completedTargets[fields.target] then return end
+    local key = self:_policyKey(context)
+    local episode = self._episode
+    local target = fields and fields.target
+    if not episode or episode.key ~= key or episode.target ~= target then
+        -- A new target/color is not evidence the previous objective succeeded.
+        episode = { key = key, target = target, started = context.now, choices = {}, damaged = false,
+            mechanic = intent.mechanic, color = self._policyColor }
+        self._episode = episode
+    end
+    local goal = intent.goal or context.rootPart.Position
+    local features = self:_features(context, goal)
+    local signature = table.concat(features, "|")
+    if episode.goal and flat(goal - episode.goal).Magnitude > 4 then
+        episode.corrections = (episode.corrections or 0) + 1
+        episode.reached = false
+    end
+    if signature ~= episode.signature then
+        episode.signature = signature
+        table.insert(episode.choices, features)
+        if #episode.choices > 6 then table.remove(episode.choices, 1) end
+    end
+    episode.features, episode.goal, episode.lastAt = features, goal, context.now
+    for _, zone in ipairs(context.zones) do
+        if zone.id == target then episode.expires = zone.expires; break end
+    end
+    episode.reached = episode.reached or flat(context.rootPart.Position - goal).Magnitude < 4
+    self.State.ChosenPolicy, self.State.ChosenSide = key, features[1]
+    local clockwise = self._memory:Cost("boss", key, { "side:1" })
+    local counterclockwise = self._memory:Cost("boss", key, { "side:-1" })
+    self.State.PreferredSide = clockwise == counterclockwise and "unlearned"
+        or (clockwise < counterclockwise and "side:1" or "side:-1")
+    self.State.Corrections = episode.corrections
+end
+
+function NorthernLands:ObserveDamage(root, zones, now)
+    local episode = self._episode
+    if not episode or now - episode.lastAt > 1 or episode.damaged then return end
+    local risk, threat = self._geometry.risk(zones, root.Position, 2)
+    if risk == 0 then return end -- no client-visible support for attribution
+    episode.damaged = true
+    local features = {}
+    for index, feature in ipairs(episode.features) do features[index] = feature end
+    if self._lastContext then
+        local contact = self:_features(self._lastContext, root.Position)
+        features[2], features[3] = contact[2], contact[3]
+    end
+    self._memory:Observe("boss", episode.key, features, false)
+    self.State.LastOutcome = { result = "damage", policy = episode.key, threat = zoneName(threat),
+        destination = episode.goal, position = root.Position, at = now }
+end
+
+function NorthernLands:_completeEvidence(reason)
+    local episode = self._episode
+    if not episode then return end
+    if not episode.damaged and #episode.choices > 0 then
+        -- One outcome per episode, not one reward per render frame or waypoint.
+        self._memory:Observe("boss", episode.key, episode.features, true)
+        self.State.LastOutcome = { result = reason, policy = episode.key, at = os.clock() }
+    end
+    if episode.target then self._completedTargets[episode.target] = true end
+    if episode.mechanic == "COLOR_MECHANIC" then self._colorResolved = true end
+    self._episode = nil
 end
 
 function NorthernLands:_reuse(context, mechanic, target, drift)
@@ -922,6 +1357,7 @@ function NorthernLands:_orbTargetsPlayer(orb, context)
 end
 
 function NorthernLands:_guideOrb(context, orb, color)
+    self._policy, self._policyColor = "ORB_GUIDE", color
     local crystal = self._crystals[color]
     if not crystal or not crystal.Parent then
         return self:_commitIntent(context, "ORB_SETUP", NorthernLands.Objective.MATCH_COLOR,
@@ -930,12 +1366,27 @@ function NorthernLands:_guideOrb(context, orb, color)
     end
     local velocity = self:_orbVelocity(orb, context.now)
     local predictedOrb = orb.Position + velocity * 0.25
+    local episode = self._episode
+    if episode and episode.target == orb and not episode.efficiencyObserved then
+        local nearMiss = false
+        for otherColor, other in pairs(self._crystals) do
+            if otherColor ~= color and other.Parent and flat(orb.Position - other.Position).Magnitude < 25
+                and self._geometry.segmentDistance(other.Position, orb.Position, context.rootPart.Position) < 8 then
+                nearMiss = true
+            end
+        end
+        if nearMiss or (episode.corrections or 0) >= 8 and context.now - episode.started >= 3 then
+            episode.efficiencyObserved = true
+            self._memory:Observe("boss", episode.key, episode.features, false, 0.25)
+            self.State.LastEfficiencyObservation = nearMiss and "wrong crystal pursuit near miss" or "excessive guidance corrections"
+        end
+    end
     local towardCrystal = unitOr(crystal.Position - predictedOrb)
     local standOff = math.clamp(9 + velocity.Magnitude * 0.06, 9, 14)
     local desired = crystal.Position + towardCrystal * standOff
     local tangent = Vector3.new(-towardCrystal.Z, 0, towardCrystal.X)
     local candidates = {}
-    for _, along in ipairs({ standOff, standOff + 3, math.max(8, standOff - 2) }) do
+    for _, along in ipairs({ standOff, standOff + 3, math.max(8, standOff - 2), 16 }) do
         local base = crystal.Position + towardCrystal * along
         table.insert(candidates, base)
         table.insert(candidates, base + tangent * 3)
@@ -997,6 +1448,7 @@ function NorthernLands:_matchingSafeZones(color)
 end
 
 function NorthernLands:_safeZone(context)
+    self._policy, self._policyColor = "COLOR_MECHANIC", self._requiredColor
     local color = self._requiredColor
     if not color then return nil end
     local zones = self:_matchingSafeZones(color)
@@ -1019,6 +1471,7 @@ function NorthernLands:_safeZone(context)
     end
     if not best then return nil end
     if flat(context.rootPart.Position - best).Magnitude <= bestRadius then
+        self._insideSafeAt = context.now
         return self:_commitIntent(context, "COLOR_MECHANIC", NorthernLands.Objective.HOLD_POSITION,
             context.rootPart.Position, "Holding inside " .. color .. " safe zone", 0.18,
             { mandatory = true, hold = true, deadline = self._safeDeadline })
@@ -1083,6 +1536,7 @@ function NorthernLands:_combinedEscape(context, threat, preferSide)
 end
 
 function NorthernLands:_slamIntent(context, zone)
+    self._policy, self._policyColor = "SLAM_ESCAPE", nil
     self._slam = self._slam or { startedAt = context.now, committed = false, stableAt = context.now }
     local slam = self._slam
     local position = zone and zone.frame.Position or slam.landing
@@ -1128,6 +1582,7 @@ function NorthernLands:_slamIntent(context, zone)
 end
 
 function NorthernLands:_projectileIntent(context, zone)
+    self._policy, self._policyColor = "PROJECTILE_ESCAPE", nil
     local clearance = self._geometry.clearance(zone, context.rootPart.Position, 7, 0.35)
     if clearance > 12 then return nil end
     local reused = self:_reuse(context, "PROJECTILE_ESCAPE", zone.id, 0.25)
@@ -1155,6 +1610,7 @@ function NorthernLands:_projectileIntent(context, zone)
 end
 
 function NorthernLands:_beamSector(context, beams)
+    self._policy, self._policyColor = "BEAM_AVOIDANCE", nil
     local reused = self:_reuse(context, "BEAM_AVOIDANCE", beams[1] and beams[1].id, 0.35)
     if reused then return reused end
     local boss = context.targetRoot.Position
@@ -1164,6 +1620,7 @@ function NorthernLands:_beamSector(context, beams)
     for _, angle in ipairs({ 0, math.pi / 10, -math.pi / 10, math.pi / 5, -math.pi / 5 }) do
         table.insert(candidates, boss + rotate(radial, angle) * distance)
     end
+    for _, spacing in ipairs({ 18, 22, 26 }) do table.insert(candidates, boss + radial * spacing) end
     local function extra(candidate)
         local direction = unitOr(candidate - boss)
         local side = radial:Cross(direction).Y >= 0 and 1 or -1
@@ -1191,6 +1648,7 @@ function NorthernLands:_beamSector(context, beams)
 end
 
 function NorthernLands:_odinGap(context)
+    self._policy, self._policyColor = "SAFE_GAP_TRAVEL", nil
     local attacks = {}
     for _, zone in ipairs(context.zones) do if isOdinAttack(zone) then table.insert(attacks, zone) end end
     if #attacks == 0 then return nil end
@@ -1220,6 +1678,28 @@ function NorthernLands:_odinGap(context)
 end
 
 function NorthernLands:Update(context)
+    self._lastContext = context
+    local episode = self._episode
+    if episode then
+        local now = context.now or os.clock()
+        episode.reached = episode.reached or flat(context.rootPart.Position - episode.goal).Magnitude < 4
+        if episode.mechanic == "ORB_GUIDE" then
+            if episode.target and episode.target.Parent then
+                episode.orbPosition, episode.orbSeenAt = episode.target.Position, now
+            end
+        elseif episode.mechanic == "COLOR_MECHANIC" then
+            if now >= self._safeDeadline + 0.35 and self._safeDeadline > 0
+                and self._insideSafeAt and now - self._insideSafeAt < 0.15 then
+                self:_completeEvidence("held matching zone through deadline")
+            end
+        elseif episode.target and now - episode.started > 0.45 then
+            local exists = false
+            for _, zone in ipairs(context.zones or {}) do if zone.id == episode.target then exists = true; break end end
+            local removed = typeof(episode.target) == "Instance" and not episode.target.Parent
+            local expired = episode.expires and now >= episode.expires
+            if not exists and (removed or expired) and episode.reached then self:_completeEvidence("escaped resolved threat") end
+        end
+    end
     if not isNorthernLands(self._workspace) then
         if self.State.CurrentBoss or self.State.CurrentMechanic ~= "NORMAL" then self:Reset() end
         return nil
@@ -1959,11 +2439,14 @@ local function connect(signal, callback)
     return connection
 end
 
+local adaptiveMemory = AdaptiveMemory.new()
+local adaptiveNavigation = AdaptiveNavigation.new(adaptiveMemory)
 local northernMechanics = NorthernLandsController.new({
     workspace = Workspace,
     player = player,
     threatGeometry = ThreatGeometry,
     connect = connect,
+    memory = adaptiveMemory,
 })
 state.mechanicState = northernMechanics.State
 
@@ -2004,6 +2487,9 @@ do
     end
 end
 local function trackInstance(instance)
+    if instance:IsA("BasePart") and instance.Name:lower() == "checkpoint" then
+        state.routeAnchors, state.routeScannedAt = {}, -math.huge
+    end
     if state.hazardLabelFolder and instance:IsDescendantOf(state.hazardLabelFolder) then return end
     if instance:IsA("Humanoid") and instance.Parent and instance.Parent:IsA("Model") then
         humanoidModels[instance] = instance.Parent
@@ -2032,6 +2518,9 @@ local function trackInstance(instance)
 end
 connect(Workspace.DescendantAdded, trackInstance)
 connect(Workspace.DescendantRemoving, function(instance)
+    if instance:IsA("BasePart") and instance.Name:lower() == "checkpoint" then
+        state.routeAnchors, state.routeScannedAt = {}, -math.huge
+    end
     local sample = threatParts[instance]
     if sample and sample.zone then sample.removedAt = os.clock() else threatParts[instance] = nil end
     safeSpots[instance] = nil
@@ -2344,9 +2833,25 @@ local function mapRouteGoal(rootPart, now)
         state.routeInitialized = true
         initializeRouteProgress(rootPart)
     end
+    local edge = adaptiveNavigation.edge
+    if edge and edge.anchor and edge.anchor.part.Parent
+        and (rootPart.Position - edge.goal).Magnitude < 12
+        and not hasBlockingRay(rootPart.Position, edge.goal, rootPart.Parent, edge.anchor.part) then
+        local reached = edge.anchor
+        adaptiveNavigation:Outcome(true, "chosen room entrance reached", now)
+        if not state.routeProgress or reached.order > state.routeProgress.order
+            or reached.order == state.routeProgress.order and reached.name > state.routeProgress.name then
+            state.routeProgress = { order = reached.order, name = reached.name }
+        end
+        while state.routeAnchors[state.routeAnchorIndex] do
+            local item = state.routeAnchors[state.routeAnchorIndex]
+            if item.order > reached.order or item.order == reached.order and item.name > reached.name then break end
+            state.routeAnchorIndex = state.routeAnchorIndex + 1
+        end
+    end
     while true do
         local anchor = state.routeAnchors[state.routeAnchorIndex]
-        if not anchor then return nil end
+        if not anchor then adaptiveNavigation:Cancel("room graph complete"); return nil end
         if not anchor.part.Parent then
             state.routeAnchors, state.routeScannedAt = {}, -math.huge
             refreshRouteAnchors(now)
@@ -2359,10 +2864,23 @@ local function mapRouteGoal(rootPart, now)
         -- because its XZ projection is nearby.
         if flat <= 12 and math.abs(delta.Y) <= 9
             and not hasBlockingRay(rootPart.Position, anchor.part.Position, rootPart.Parent, anchor.part) then
+            if adaptiveNavigation.edge and adaptiveNavigation.edge.anchor == anchor then
+                adaptiveNavigation:Outcome(true, "checkpoint advancement", now)
+            else
+                adaptiveNavigation:Cancel("different checkpoint reached")
+            end
             state.routeProgress = { order = anchor.order, name = anchor.name }
             state.routeAnchorIndex = state.routeAnchorIndex + 1
         else
-            return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+            local goal, selected = adaptiveNavigation:Goal(rootPart, state.currentTarget, state.routeAnchors,
+                state.routeProgress, state.routeDungeon, now, function(position)
+                    local blocked = hasBlockingRay(rootPart.Position, position, rootPart.Parent, anchor.part)
+                    local risk = ThreatGeometry.risk(state.activeZones, position, CFG.HAZARD_MARGIN)
+                    local safe = ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, position, CFG.HAZARD_MARGIN)
+                    return (blocked and 100 or 0) + risk * 1000 + (safe and 0 or 1000)
+                end)
+            state.adaptiveNavigation = adaptiveNavigation.debug
+            return goal, selected
         end
     end
 end
@@ -2576,6 +3094,7 @@ local function createPath(startPosition, endPosition, mode, now)
         { AgentRadius = CFG.AGENT_RADIUS, AgentHeight = CFG.AGENT_HEIGHT, AgentCanJump = CFG.AGENT_CAN_JUMP, AgentJumpHeight = CFG.AGENT_JUMP_HEIGHT, AgentMaxSlope = CFG.AGENT_MAX_SLOPE, WaypointSpacing = CFG.WAYPOINT_SPACING },
         { AgentRadius = math.max(1.5, CFG.AGENT_RADIUS - 0.5), AgentHeight = CFG.AGENT_HEIGHT, AgentCanJump = true, AgentJumpHeight = CFG.AGENT_JUMP_HEIGHT + 2, AgentMaxSlope = CFG.AGENT_MAX_SLOPE, WaypointSpacing = 3 },
     }
+    local bestPath, bestPoints, bestCost, bestExposure
     for _, configuration in ipairs(configurations) do
         local path = PathfindingService:CreatePath(configuration)
         state.pathComputations = state.pathComputations + 1
@@ -2583,12 +3102,32 @@ local function createPath(startPosition, endPosition, mode, now)
         if ok and path.Status == Enum.PathStatus.Success then
             local waypoints = path:GetWaypoints()
             if #waypoints >= 2 then
-                state.failedPaths[key] = nil
-                return path, waypoints
+                local cost, exposure, previous = 0, 0, startPosition
+                for _, waypoint in ipairs(waypoints) do
+                    local point = waypoint.Position + Vector3.new(0, 2.5, 0)
+                    local learned = adaptiveNavigation:LocalCost(previous, point)
+                    cost = cost + (point - previous).Magnitude + learned / #waypoints
+                    exposure = exposure + ThreatGeometry.risk(state.activeZones, point, CFG.HAZARD_MARGIN)
+                    if not ThreatGeometry.segmentSafe(state.activeZones, previous, point, CFG.HAZARD_MARGIN) then
+                        exposure = exposure + 1
+                    end
+                    for _, enemy in ipairs(state.nearbyEnemies) do
+                        if enemy.root.Parent then cost = cost + math.max(0, enemy.radius - (enemy.root.Position - point).Magnitude) * 8 end
+                    end
+                    previous = point
+                end
+                if not bestCost or exposure < bestExposure or exposure == bestExposure and cost < bestCost then
+                    if bestPath then bestPath:Destroy() end
+                    bestPath, bestPoints, bestCost, bestExposure = path, waypoints, cost, exposure
+                else path:Destroy() end
+            else
+                path:Destroy()
             end
+        else
+            path:Destroy()
         end
-        path:Destroy()
     end
+    if bestPath then state.failedPaths[key] = nil; return bestPath, bestPoints end
     state.failedPaths[key] = now
     return nil
 end
@@ -2625,7 +3164,11 @@ end
 -- Steering uses Humanoid:MoveTo. (Humanoid:Move is input-path and gets
 -- swallowed from an executor context, which once froze the bot solid.)
 local function issueMove(humanoid, position, mode, now, bypass)
+    if mode == "evade" or mode == "mechanic" or mode == "hold" then
+        state.adaptiveLocalAttempt = nil
+    end
     local function safetyHold(root)
+        state.adaptiveLocalAttempt = nil
         if state.motionMode ~= "safety-hold" or now - state.lastMoveToCall >= 0.35 then
             humanoid:MoveTo(root.Position)
             state.lastMoveToCall = now
@@ -2686,9 +3229,13 @@ local function chooseFallbackStep(rootPart, goal, target)
     for key, at in pairs(state.fallbackVisits) do if now - at > 15 then state.fallbackVisits[key] = nil end end
     for _, direction in ipairs(directions) do
         local candidate = groundPosition(rootPart.Position + direction * 8, rootPart.Parent, target)
-        if walkingSegmentClear(rootPart, candidate, target) then
+        if walkingSegmentClear(rootPart, candidate, target)
+            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN)
+            and safeEnemyStep(rootPart.Position, candidate) then
             local key = math.floor(candidate.X / 6) .. ":" .. math.floor(candidate.Z / 6)
-            local score = (candidate - goal).Magnitude + (state.fallbackVisits[key] and 40 or 0)
+            local learned = adaptiveNavigation:LocalCost(rootPart.Position, candidate)
+            local score = (candidate - goal).Magnitude + (state.fallbackVisits[key] and 40 or 0) + learned
+                + math.max(0, 8 - enemyClearance(candidate)) * 12
             if not bestScore or score < bestScore then best, bestScore = candidate, score end
         end
     end
@@ -2758,6 +3305,28 @@ end
 
 local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not goal then return end
+    if mode ~= "map-route" and adaptiveNavigation.edge then
+        adaptiveNavigation:Cancel("local objective owns movement")
+    end
+    local localAttempt = state.adaptiveLocalAttempt
+    -- Only score a continuously pursued fallback for the same objective.
+    -- Mechanics, waiting, and replacement goals cancel evidence, not fail it.
+    if localAttempt and (now - localAttempt.lastAt > 1 or localAttempt.mode ~= mode
+        or (localAttempt.objective - goal).Magnitude > 2 or state.fallbackGoal ~= localAttempt.goal) then
+        state.adaptiveLocalAttempt, localAttempt = nil, nil
+    end
+    if localAttempt then localAttempt.lastAt = now end
+    if localAttempt and (rootPart.Position - localAttempt.goal).Magnitude < 4 then
+        adaptiveNavigation:LocalOutcome(localAttempt.start, localAttempt.goal, true)
+        state.adaptiveLocalAttempt = nil
+    elseif localAttempt and now - localAttempt.at > 8 then
+        adaptiveNavigation:LocalOutcome(localAttempt.start, localAttempt.goal, false)
+        state.adaptiveLocalAttempt = nil
+    end
+    if state.fallbackGoal and not state.adaptiveLocalAttempt then
+        state.adaptiveLocalAttempt = { start = rootPart.Position, goal = state.fallbackGoal, at = now,
+            lastAt = now, objective = goal, mode = mode }
+    end
     -- Flying targets bob up and down; a climb goal set during an upward bob
     -- goes stale when the target comes back down. Drop it instead of pacing
     -- between tiers.
@@ -2834,6 +3403,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         state.pathUpdateTime = now
         state.pathPending = true
         local generation = state.pathGeneration
+        local routeEpoch = adaptiveNavigation.epoch
         local startPosition = rootPart.Position
         task.spawn(function()
         local recoveryGoal
@@ -2851,7 +3421,8 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             return
         end
         if state.closed or not state.running or humanoid.Health <= 0 or generation ~= state.pathGeneration
-            or player.Character ~= rootPart.Parent or not target.Parent
+            or player.Character ~= rootPart.Parent or target and not target.Parent
+            or mode == "map-route" and routeEpoch ~= adaptiveNavigation.epoch
             or not state.motionGoal or (state.motionGoal - goal).Magnitude > 8 then
             if path then path:Destroy() end
             return
@@ -2880,6 +3451,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             visualizeWaypoints(waypoints, state.currentWaypointIndex)
             state.pathStatus = (recoveryGoal and "Recovering to higher ground: " or "Pathfinding: ") .. #waypoints .. " waypoints"
         else
+            if mode == "map-route" then adaptiveNavigation:Outcome(false, "local path unavailable", os.clock()) end
             if #state.waypoints > 0 and not state.pathBlocked then return end
             clearPath()
             local fallback = nil
@@ -3006,6 +3578,28 @@ end
 local function updateProgress(humanoid, rootPart, goal, target, now)
     if now - state.lastStuckCheck < CFG.STUCK_CHECK_INTERVAL then return false end
     state.lastStuckCheck = now
+    local remaining
+    if #state.waypoints > 0 then
+        remaining = 0
+        local previous = rootPart.Position
+        for index = state.currentWaypointIndex, #state.waypoints do
+            local point = state.waypoints[index].Position
+            remaining = remaining + (point - previous).Magnitude
+            previous = point
+        end
+        remaining = remaining + (previous - goal).Magnitude
+    end
+    if adaptiveNavigation:Progress(rootPart.Position, goal, remaining, now) then
+        local attempt = state.adaptiveLocalAttempt
+        if attempt then
+            adaptiveNavigation:LocalOutcome(attempt.start, attempt.goal, false)
+            state.adaptiveLocalAttempt = nil
+        end
+        state.pathBlocked = true
+        state.pathUpdateTime = 0
+        state.fallbackGoal = nil
+        state.routeFails = (state.routeFails or 0) + 1
+    end
     -- Follow the active waypoint, not the distant enemy: a valid path may
     -- initially lead away from the final goal to get around a wall.
     local waypoint = state.waypoints[state.currentWaypointIndex]
@@ -3957,6 +4551,7 @@ local function castSkill()
 end
 
 local function stopMovement(humanoid, rootPart)
+    state.adaptiveLocalAttempt = nil
     if state.motionMode == "hold" and not state.motionGoal then return end
     humanoid:MoveTo(rootPart.Position)
     state.motionMode = "hold"
@@ -4524,6 +5119,7 @@ end
 
 local function executeNorthernMechanic(intent, humanoid, rootPart, target, targetRoot, now, distance)
     if not intent then return false end
+    state.adaptiveLocalAttempt = nil
     if state.motionMode ~= "mechanic" and state.motionMode ~= "mechanic-hold" then
         clearPath()
         state.motionGoal, state.fallbackGoal = nil, nil
@@ -4692,6 +5288,7 @@ local function controllerTick()
         return
     end
     if state.currentTarget ~= target then
+        state.adaptiveLocalAttempt = nil
         state.combatIntent = nil
         state.lastProgressGoal = nil
         local previousRoot = state.currentTarget and getRootPart(state.currentTarget)
@@ -4757,6 +5354,20 @@ local function controllerTick()
         faceEnemy(humanoid, rootPart, targetRoot)
         if distance <= CFG.ATTACK_RANGE and not hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then castSkill() end
         return
+    end
+
+    -- Long approaches use the room graph even when a replicated enemy is
+    -- visible across several rooms. Combat and mandatory mechanics remain local.
+    if distance > math.max(60, CFG.ATTACK_RANGE + 12) then
+        local routeGoal, routeAnchor = mapRouteGoal(rootPart, now)
+        if routeGoal then
+            state.navigationPhase = "approach"
+            state.status = "Following room graph: " .. routeAnchor.name
+            restoreFacing()
+            followGoal(humanoid, rootPart, routeGoal, "map-route", now, target)
+            updateProgress(humanoid, rootPart, routeGoal, target, now)
+            return
+        end
     end
 
     -- A combat-distance point on this side of a wall is not an attack position.
@@ -4993,6 +5604,9 @@ end)
 local function setRunning(running)
     if state.closed or state.running == running then return end
     state.running = running
+    adaptiveNavigation:Reset()
+    northernMechanics:Reset()
+    state.adaptiveLocalAttempt = nil
     if state.running then
         state.unreachableTargets = setmetatable({}, { __mode = "k" })
         state.combatIntent, state.lastProgressGoal = nil, nil
@@ -5068,6 +5682,21 @@ local function watchHealth(character)
                 distance = state.targetDist }
             local root = character:FindFirstChild("HumanoidRootPart")
             if root then
+                northernMechanics:ObserveDamage(root, state.activeZones, os.clock())
+                if state.motionGoal and state.motionMode ~= "mechanic" and state.motionMode ~= "mechanic-hold"
+                    and ThreatGeometry.risk(state.activeZones, root.Position, 2) > 0 then
+                    local attempt = state.adaptiveLocalAttempt
+                    if attempt and os.clock() - attempt.lastAt <= 1 then
+                        adaptiveNavigation:LocalOutcome(attempt.start, attempt.goal, false)
+                        state.adaptiveLocalAttempt = nil
+                    end
+                    if adaptiveNavigation.edge and state.motionGoalMode == "map-route"
+                        and state.motionMode ~= "evade"
+                        and os.clock() - (state.lastRouteDamageAt or -math.huge) > 2 then
+                        adaptiveMemory:Observe("route", adaptiveNavigation.edge.key, {}, false)
+                        state.lastRouteDamageAt = os.clock()
+                    end
+                end
                 local nearby = {}
                 local nearestZone, nearestZoneClearance = nil, math.huge
                 for _, zone in ipairs(state.activeZones) do
@@ -5127,6 +5756,9 @@ local function watchHealth(character)
 end
 
 connect(player.CharacterAdded, function(character)
+    adaptiveNavigation:Reset()
+    northernMechanics:Reset()
+    state.adaptiveLocalAttempt = nil
     state.combatIntent, state.lastProgressGoal = nil, nil
     state.escapeLearning = nil
     state.aimObservations = setmetatable({}, { __mode = "k" })
@@ -5215,6 +5847,10 @@ return {
     GetDodgeMemory = exportDodgeMemory,
     DodgeMemoryDirty = function() return state.hazardMemoryDirty end,
     MarkDodgeMemorySaved = function() state.hazardMemoryDirty = false end,
+    SetAdaptiveMemory = function(data) adaptiveMemory:Load(data) end,
+    GetAdaptiveMemory = function() return adaptiveMemory:Export() end,
+    AdaptiveMemoryDirty = function() return adaptiveMemory.dirty end,
+    MarkAdaptiveMemorySaved = function() adaptiveMemory.dirty = false end,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end
@@ -5305,6 +5941,7 @@ local controls = {}
 local errors, lastErrors = {}, {}
 local configPath = "DungeonQuestObsidian-config.json"
 local storedDodgeMemory = nil
+local storedAdaptiveMemory = nil
 local saveReady, saveDirty, saveVersion = false, false, 0
 local lastMemorySave = 0
 local menuKey = "RightShift"
@@ -5331,21 +5968,25 @@ end
 
 local function saveConfig()
     local memoryDirty = controller.DodgeMemoryDirty and controller.DodgeMemoryDirty()
-    if not saveReady or (not saveDirty and not memoryDirty) then return end
+    local adaptiveDirty = controller.AdaptiveMemoryDirty and controller.AdaptiveMemoryDirty()
+    if not saveReady or (not saveDirty and not memoryDirty and not adaptiveDirty) then return end
     if type(writefile) ~= "function" then
         errors.config = "Executor file saving is unavailable"
         return
     end
     local ok = pcall(function()
         local memory = controller.GetDodgeMemory and controller.GetDodgeMemory() or storedDodgeMemory
+        local adaptive = controller.GetAdaptiveMemory and controller.GetAdaptiveMemory() or storedAdaptiveMemory
         writefile(configPath, HttpService:JSONEncode({ Version = 1, Config = C, MenuKey = menuKey,
-            DodgeMemory = memory }))
+            DodgeMemory = memory, AdaptiveMemory = adaptive }))
         storedDodgeMemory = memory
+        storedAdaptiveMemory = adaptive
     end)
     if ok then
         saveDirty = false
         errors.config = nil
         if memoryDirty and controller.MarkDodgeMemorySaved then controller.MarkDodgeMemorySaved() end
+        if adaptiveDirty and controller.MarkAdaptiveMemorySaved then controller.MarkAdaptiveMemorySaved() end
     else errors.config = "Could not save settings" end
 end
 
@@ -5845,7 +6486,8 @@ end
 
 local lastHealth, lastHumanoid, lastSlow = nil, nil, 0
 local function slowTick(now)
-    if controller.DodgeMemoryDirty and controller.DodgeMemoryDirty() and now - lastMemorySave >= 10 then
+    if ((controller.DodgeMemoryDirty and controller.DodgeMemoryDirty())
+        or (controller.AdaptiveMemoryDirty and controller.AdaptiveMemoryDirty())) and now - lastMemorySave >= 10 then
         lastMemorySave = now
         scheduleSave()
     end
@@ -5934,7 +6576,20 @@ local function slowTick(now)
     setLabel("DodgePlan", string.format("Dodge plan: %s | goal %.1f studs | risk %.1f",
         tostring(hazardSnapshot.plan or "pursuit"), hazardSnapshot.goalDistance or 0, hazardSnapshot.risk or 0))
     setLabel("Navigation", (combatState.pathStatus or "Navigation: idle") .. " | Plans: " .. (combatState.pathComputations or 0))
-    setLabel("Spacing", string.format("Combat distance: %.0f studs", controller.Config.COMBAT_DISTANCE or 0))
+    local nav = combatState.adaptiveNavigation
+    if nav and nav.CurrentRouteEdge then
+        setLabel("Navigation", string.format("Route: %s | learned %.1f | stall %.0f%% | %s",
+            nav.CurrentRouteEdge, nav.RouteEdgeLearnedCost or 0, (nav.StuckScore or 0) * 100,
+            nav.ReplanReason or "committed"))
+    end
+    local mechanic = combatState.mechanicState
+    if mechanic and mechanic.CurrentMechanic ~= "NORMAL" then
+        setLabel("Spacing", string.format("%s | %s | confidence %.0f%% | cost %.1f",
+            mechanic.CurrentMechanic, mechanic.PreferredSide or "unlearned",
+            (mechanic.PolicyConfidence or 0) * 100, mechanic.LearnedDestinationPenalty or 0))
+    else
+        setLabel("Spacing", string.format("Combat distance: %.0f studs", controller.Config.COMBAT_DISTANCE or 0))
+    end
     local damage = combatState.lastDamage
     setLabel("LastDamage", damage and string.format("Last hit: %.0f HP | %.0fs ago", damage.amount, now - damage.at) or "Last hit: none")
     local names = { Completed = "Dungeons Completed", Coins = "Coins Gained", Gems = "Gems Gained", Levels = "Levels Earned", Failed = "Dungeons Failed", Deaths = "Deaths Logged", Freezes = "Freezes Logged", Runs = "Runs Recorded" }
@@ -6093,6 +6748,8 @@ if env.autoloadconfig ~= false then
     if saved then
         storedDodgeMemory = saved.DodgeMemory
         if controller.SetDodgeMemory then controller.SetDodgeMemory(storedDodgeMemory) end
+        storedAdaptiveMemory = saved.AdaptiveMemory
+        if controller.SetAdaptiveMemory then controller.SetAdaptiveMemory(storedAdaptiveMemory) end
     end
 end
 saveReady = true

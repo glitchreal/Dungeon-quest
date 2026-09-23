@@ -158,11 +158,13 @@ function NorthernLands.new(options)
     self._workspace = options.workspace or workspace
     self._player = options.player
     self._geometry = options.threatGeometry
+    self._memory = options.memory
     self._connect = options.connect or function(signal, callback) return signal:Connect(callback) end
     self._crystals = {}
     self._safeZoneParts = setmetatable({}, { __mode = "k" })
     self._orbs = setmetatable({}, { __mode = "k" })
     self._orbSamples = setmetatable({}, { __mode = "k" })
+    self._completedTargets = setmetatable({}, { __mode = "k" })
     self._intent = nil
     self._intentUntil = 0
     self._lastPlanAt = -math.huge
@@ -239,8 +241,19 @@ function NorthernLands:_onEvent(action, data)
     elseif action == "First Boss Slam Land" then
         if self._slam then self._slam.landedAt = now end
     elseif action == "Second Boss Orb Explosion" then
+        local episode = self._episode
+        local crystal = episode and self._crystals[episode.color]
+        local frame = type(data) == "table" and data[1]
+        if episode and episode.mechanic == "ORB_GUIDE" and crystal and crystal.Parent
+            and typeof(frame) == "CFrame" and closestColor(data[2]) == episode.color
+            and now - episode.lastAt <= 1 and episode.orbSeenAt and now - episode.orbSeenAt <= 1
+            and flat(frame.Position - crystal.Position).Magnitude <= 10
+            and episode.orbPosition and flat(frame.Position - episode.orbPosition).Magnitude <= 12 then
+            self:_completeEvidence("matching crystal explosion")
+        end
         self._intentUntil = 0
     elseif action == "Bonus Boss Tall Swirly" or action == "Bonus Boss Tall Swirly Recolor" then
+        self._colorResolved = false
         if type(data) == "table" then
             local color = containsColorName(data[1])
             if color then
@@ -307,6 +320,7 @@ function NorthernLands:_normal(now)
 end
 
 function NorthernLands:Reset()
+    self._episode = nil
     self._slam = nil
     self._requiredColor = nil
     self._safeColorActive = false
@@ -367,8 +381,17 @@ function NorthernLands:_pick(context, candidates, desired, options, extraScore)
         local score, grounded, risk, pathSafe = self:_candidateScore(context, candidate, desired, options)
         if score then
             if extraScore then score = score + (extraScore(grounded) or 0) end
-            if not bestScore or score < bestScore then
+            local penalty, confidence = 0, 0
+            if self._memory and self._policy then
+                penalty, confidence = self._memory:Cost("boss", self:_policyKey(context), self:_features(context, grounded))
+            end
+            -- Historical preference only breaks ties between equal current
+            -- exposure classes. It cannot buy a crossing through a safe lane.
+            score = score + penalty
+            if not bestScore or pathSafe and not bestSafe
+                or pathSafe == bestSafe and (risk < bestRisk or risk == bestRisk and score < bestScore) then
                 best, bestScore, bestRisk, bestSafe = grounded, score, risk, pathSafe
+                self.State.PolicyConfidence, self.State.LearnedDestinationPenalty = confidence, penalty
             end
         end
     end
@@ -392,7 +415,103 @@ function NorthernLands:_commitIntent(context, mechanic, objective, goal, reason,
     }
     self._intent = intent
     self._intentUntil = context.now + lease
+    self:_recordChoice(context, intent, fields)
     return intent
+end
+
+local function cell(position, size)
+    return math.floor(position.X / size + 0.5) .. ":" .. math.floor(position.Z / size + 0.5)
+end
+
+function NorthernLands:_policyKey(context)
+    return tostring(self.State.CurrentBoss or "ODIN_REINCARNATION") .. "/" .. tostring(self._policy)
+        .. "/" .. tostring(self._policyColor or "none")
+end
+
+function NorthernLands:_features(context, goal)
+    local root = context.rootPart.Position
+    local center = context.targetRoot and context.targetRoot.Position or root
+    local radial, movement = unitOr(root - center), unitOr(goal - root)
+    local side = radial:Cross(movement).Y >= 0 and "1" or "-1"
+    local sector = math.floor((math.atan2(goal.Z - center.Z, goal.X - center.X) + math.pi) / (math.pi / 4)) % 8
+    local features = { "side:" .. side, "sector:" .. sector,
+        "distance:" .. math.floor(flat(goal - center).Magnitude / 4 + 0.5),
+        "destination:" .. cell(goal, 10), "segment:" .. cell(root, 16) .. ">" .. cell(goal, 16) }
+    local crystal = self._policyColor and self._crystals[self._policyColor]
+    if self._policy == "ORB_GUIDE" and crystal and crystal.Parent then
+        local offset = flat(goal - crystal.Position)
+        table.insert(features, "standOff:" .. math.floor(offset.Magnitude / 3 + 0.5))
+        table.insert(features, "angle:" .. math.floor((math.atan2(offset.Z, offset.X) + math.pi) / (math.pi / 6)))
+    end
+    return features
+end
+
+function NorthernLands:_recordChoice(context, intent, fields)
+    if not self._memory or not self._policy or intent.mechanic == "RECOVERY" then return end
+    if intent.mechanic == "COLOR_MECHANIC" and self._colorResolved then return end
+    if fields and fields.target and self._completedTargets[fields.target] then return end
+    local key = self:_policyKey(context)
+    local episode = self._episode
+    local target = fields and fields.target
+    if not episode or episode.key ~= key or episode.target ~= target then
+        -- A new target/color is not evidence the previous objective succeeded.
+        episode = { key = key, target = target, started = context.now, choices = {}, damaged = false,
+            mechanic = intent.mechanic, color = self._policyColor }
+        self._episode = episode
+    end
+    local goal = intent.goal or context.rootPart.Position
+    local features = self:_features(context, goal)
+    local signature = table.concat(features, "|")
+    if episode.goal and flat(goal - episode.goal).Magnitude > 4 then
+        episode.corrections = (episode.corrections or 0) + 1
+        episode.reached = false
+    end
+    if signature ~= episode.signature then
+        episode.signature = signature
+        table.insert(episode.choices, features)
+        if #episode.choices > 6 then table.remove(episode.choices, 1) end
+    end
+    episode.features, episode.goal, episode.lastAt = features, goal, context.now
+    for _, zone in ipairs(context.zones) do
+        if zone.id == target then episode.expires = zone.expires; break end
+    end
+    episode.reached = episode.reached or flat(context.rootPart.Position - goal).Magnitude < 4
+    self.State.ChosenPolicy, self.State.ChosenSide = key, features[1]
+    local clockwise = self._memory:Cost("boss", key, { "side:1" })
+    local counterclockwise = self._memory:Cost("boss", key, { "side:-1" })
+    self.State.PreferredSide = clockwise == counterclockwise and "unlearned"
+        or (clockwise < counterclockwise and "side:1" or "side:-1")
+    self.State.Corrections = episode.corrections
+end
+
+function NorthernLands:ObserveDamage(root, zones, now)
+    local episode = self._episode
+    if not episode or now - episode.lastAt > 1 or episode.damaged then return end
+    local risk, threat = self._geometry.risk(zones, root.Position, 2)
+    if risk == 0 then return end -- no client-visible support for attribution
+    episode.damaged = true
+    local features = {}
+    for index, feature in ipairs(episode.features) do features[index] = feature end
+    if self._lastContext then
+        local contact = self:_features(self._lastContext, root.Position)
+        features[2], features[3] = contact[2], contact[3]
+    end
+    self._memory:Observe("boss", episode.key, features, false)
+    self.State.LastOutcome = { result = "damage", policy = episode.key, threat = zoneName(threat),
+        destination = episode.goal, position = root.Position, at = now }
+end
+
+function NorthernLands:_completeEvidence(reason)
+    local episode = self._episode
+    if not episode then return end
+    if not episode.damaged and #episode.choices > 0 then
+        -- One outcome per episode, not one reward per render frame or waypoint.
+        self._memory:Observe("boss", episode.key, episode.features, true)
+        self.State.LastOutcome = { result = reason, policy = episode.key, at = os.clock() }
+    end
+    if episode.target then self._completedTargets[episode.target] = true end
+    if episode.mechanic == "COLOR_MECHANIC" then self._colorResolved = true end
+    self._episode = nil
 end
 
 function NorthernLands:_reuse(context, mechanic, target, drift)
@@ -472,6 +591,7 @@ function NorthernLands:_orbTargetsPlayer(orb, context)
 end
 
 function NorthernLands:_guideOrb(context, orb, color)
+    self._policy, self._policyColor = "ORB_GUIDE", color
     local crystal = self._crystals[color]
     if not crystal or not crystal.Parent then
         return self:_commitIntent(context, "ORB_SETUP", NorthernLands.Objective.MATCH_COLOR,
@@ -480,12 +600,27 @@ function NorthernLands:_guideOrb(context, orb, color)
     end
     local velocity = self:_orbVelocity(orb, context.now)
     local predictedOrb = orb.Position + velocity * 0.25
+    local episode = self._episode
+    if episode and episode.target == orb and not episode.efficiencyObserved then
+        local nearMiss = false
+        for otherColor, other in pairs(self._crystals) do
+            if otherColor ~= color and other.Parent and flat(orb.Position - other.Position).Magnitude < 25
+                and self._geometry.segmentDistance(other.Position, orb.Position, context.rootPart.Position) < 8 then
+                nearMiss = true
+            end
+        end
+        if nearMiss or (episode.corrections or 0) >= 8 and context.now - episode.started >= 3 then
+            episode.efficiencyObserved = true
+            self._memory:Observe("boss", episode.key, episode.features, false, 0.25)
+            self.State.LastEfficiencyObservation = nearMiss and "wrong crystal pursuit near miss" or "excessive guidance corrections"
+        end
+    end
     local towardCrystal = unitOr(crystal.Position - predictedOrb)
     local standOff = math.clamp(9 + velocity.Magnitude * 0.06, 9, 14)
     local desired = crystal.Position + towardCrystal * standOff
     local tangent = Vector3.new(-towardCrystal.Z, 0, towardCrystal.X)
     local candidates = {}
-    for _, along in ipairs({ standOff, standOff + 3, math.max(8, standOff - 2) }) do
+    for _, along in ipairs({ standOff, standOff + 3, math.max(8, standOff - 2), 16 }) do
         local base = crystal.Position + towardCrystal * along
         table.insert(candidates, base)
         table.insert(candidates, base + tangent * 3)
@@ -547,6 +682,7 @@ function NorthernLands:_matchingSafeZones(color)
 end
 
 function NorthernLands:_safeZone(context)
+    self._policy, self._policyColor = "COLOR_MECHANIC", self._requiredColor
     local color = self._requiredColor
     if not color then return nil end
     local zones = self:_matchingSafeZones(color)
@@ -569,6 +705,7 @@ function NorthernLands:_safeZone(context)
     end
     if not best then return nil end
     if flat(context.rootPart.Position - best).Magnitude <= bestRadius then
+        self._insideSafeAt = context.now
         return self:_commitIntent(context, "COLOR_MECHANIC", NorthernLands.Objective.HOLD_POSITION,
             context.rootPart.Position, "Holding inside " .. color .. " safe zone", 0.18,
             { mandatory = true, hold = true, deadline = self._safeDeadline })
@@ -633,6 +770,7 @@ function NorthernLands:_combinedEscape(context, threat, preferSide)
 end
 
 function NorthernLands:_slamIntent(context, zone)
+    self._policy, self._policyColor = "SLAM_ESCAPE", nil
     self._slam = self._slam or { startedAt = context.now, committed = false, stableAt = context.now }
     local slam = self._slam
     local position = zone and zone.frame.Position or slam.landing
@@ -678,6 +816,7 @@ function NorthernLands:_slamIntent(context, zone)
 end
 
 function NorthernLands:_projectileIntent(context, zone)
+    self._policy, self._policyColor = "PROJECTILE_ESCAPE", nil
     local clearance = self._geometry.clearance(zone, context.rootPart.Position, 7, 0.35)
     if clearance > 12 then return nil end
     local reused = self:_reuse(context, "PROJECTILE_ESCAPE", zone.id, 0.25)
@@ -705,6 +844,7 @@ function NorthernLands:_projectileIntent(context, zone)
 end
 
 function NorthernLands:_beamSector(context, beams)
+    self._policy, self._policyColor = "BEAM_AVOIDANCE", nil
     local reused = self:_reuse(context, "BEAM_AVOIDANCE", beams[1] and beams[1].id, 0.35)
     if reused then return reused end
     local boss = context.targetRoot.Position
@@ -714,6 +854,7 @@ function NorthernLands:_beamSector(context, beams)
     for _, angle in ipairs({ 0, math.pi / 10, -math.pi / 10, math.pi / 5, -math.pi / 5 }) do
         table.insert(candidates, boss + rotate(radial, angle) * distance)
     end
+    for _, spacing in ipairs({ 18, 22, 26 }) do table.insert(candidates, boss + radial * spacing) end
     local function extra(candidate)
         local direction = unitOr(candidate - boss)
         local side = radial:Cross(direction).Y >= 0 and 1 or -1
@@ -741,6 +882,7 @@ function NorthernLands:_beamSector(context, beams)
 end
 
 function NorthernLands:_odinGap(context)
+    self._policy, self._policyColor = "SAFE_GAP_TRAVEL", nil
     local attacks = {}
     for _, zone in ipairs(context.zones) do if isOdinAttack(zone) then table.insert(attacks, zone) end end
     if #attacks == 0 then return nil end
@@ -770,6 +912,28 @@ function NorthernLands:_odinGap(context)
 end
 
 function NorthernLands:Update(context)
+    self._lastContext = context
+    local episode = self._episode
+    if episode then
+        local now = context.now or os.clock()
+        episode.reached = episode.reached or flat(context.rootPart.Position - episode.goal).Magnitude < 4
+        if episode.mechanic == "ORB_GUIDE" then
+            if episode.target and episode.target.Parent then
+                episode.orbPosition, episode.orbSeenAt = episode.target.Position, now
+            end
+        elseif episode.mechanic == "COLOR_MECHANIC" then
+            if now >= self._safeDeadline + 0.35 and self._safeDeadline > 0
+                and self._insideSafeAt and now - self._insideSafeAt < 0.15 then
+                self:_completeEvidence("held matching zone through deadline")
+            end
+        elseif episode.target and now - episode.started > 0.45 then
+            local exists = false
+            for _, zone in ipairs(context.zones or {}) do if zone.id == episode.target then exists = true; break end end
+            local removed = typeof(episode.target) == "Instance" and not episode.target.Parent
+            local expired = episode.expires and now >= episode.expires
+            if not exists and (removed or expired) and episode.reached then self:_completeEvidence("escaped resolved threat") end
+        end
+    end
     if not isNorthernLands(self._workspace) then
         if self.State.CurrentBoss or self.State.CurrentMechanic ~= "NORMAL" then self:Reset() end
         return nil
