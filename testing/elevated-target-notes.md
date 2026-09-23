@@ -51,3 +51,26 @@ character root, so the first-boss stall was not reproduced. These fixes address
 source defects; they are not a claim that live dungeon behavior is now verified.
 Focused checks also include `lua testing/movement-policy.lua` and the existing
 adaptive-memory checks. No gameplay campaign or runtime injection was performed.
+
+## Confirmed passive-beam ownership stall
+
+A later read-only MCP snapshot captured Midgardian Champion at 41.18 studs,
+`BEAM_AVOIDANCE`, `mechanic-hold`, and the status "Holding a local lane between
+passive beams". The mechanic owner cleared the path before normal pursuit could
+run. This was a separate cause from generic elevated navigation. A later damage
+record showed a 388,728,800 HP hit during "Escaping committed slam and beam
+geometry"; that record does not identify which visual attack the user calls a
+tornado.
+
+Passive beam control now releases pursuit when the current position and next
+approach segment are clear of those beams. When a beam blocks the approach,
+grounded local forward/lateral candidates allow progress toward attack range;
+an out-of-range stationary candidate is excluded. A player currently safe never
+trades that safety for range. In-range holding still permits attacks.
+
+Leased mechanic movement rechecks the crossing as well as its destination,
+rejecting new hazards even when the old endpoint remains safe. Unsafe mechanic
+holds request the existing safety controller before executing. The focused
+movement check covers clear-lane release, safe movement around a blocking beam,
+and interruption of an unsafe leased crossing. Live client controls were not
+replaced, and no repeated dungeon tests were run.

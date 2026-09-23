@@ -523,6 +523,12 @@ function NorthernLands:_reuse(context, mechanic, target, drift)
         local goalRisk = self:_risk(context, intent.goal, 3)
         local currentRisk = self:_risk(context, context.rootPart.Position, 3)
         if goalRisk > currentRisk + (drift or 0.2) then return nil end
+        -- New projectiles can cross a leased route while its endpoint remains
+        -- safe. Revalidate the crossing, not just the destination.
+        if not self._geometry.segmentSafe(context.zones, context.rootPart.Position, intent.goal, 3)
+            and not self._geometry.escapeStepSafe(context.zones, context.rootPart.Position, intent.goal, 3) then
+            return nil
+        end
     end
     return intent
 end
@@ -845,12 +851,41 @@ end
 
 function NorthernLands:_beamSector(context, beams)
     self._policy, self._policyColor = "BEAM_AVOIDANCE", nil
+    local root = context.rootPart.Position
+    local boss = context.targetRoot.Position
+    local approach = context.approachGoal or Vector3.new(boss.X, root.Y, boss.Z)
+    local step = approach - root
+    local nextPosition = step.Magnitude > 0.1 and root + step.Unit * math.min(10, step.Magnitude) or root
+    -- Passive beams exist throughout the fight. Their mere presence must not
+    -- take ownership from pursuit while the current lane and next step are safe.
+    if self._geometry.risk(beams, root, 5) == 0
+        and self._geometry.segmentSafe(beams, root, nextPosition, 5) then
+        if self.State.CurrentMechanic == "BEAM_AVOIDANCE" then self:_normal(context.now) end
+        return nil
+    end
     local reused = self:_reuse(context, "BEAM_AVOIDANCE", beams[1] and beams[1].id, 0.35)
     if reused then return reused end
-    local boss = context.targetRoot.Position
+    -- Beam navigation stays on the player's floor even while the boss stands
+    -- on the statue. Nearby choices allow gradual progress through an entrance.
+    boss = Vector3.new(boss.X, root.Y, boss.Z)
     local radial = unitOr(context.rootPart.Position - boss)
     local distance = math.clamp(flat(context.rootPart.Position - boss).Magnitude, 17, 24)
-    local candidates = { context.rootPart.Position }
+    local currentRisk = self:_risk(context, root, 5)
+    local candidates = {}
+    if (root - context.targetRoot.Position).Magnitude <= (context.attackRange or 26) or currentRisk > 0 then
+        table.insert(candidates, root)
+    end
+    local forward = unitOr(approach - root)
+    local tangent = Vector3.new(-forward.Z, 0, forward.X)
+    for _, side in ipairs({ -1, 1 }) do
+        table.insert(candidates, root + tangent * side * 8)
+        table.insert(candidates, root + tangent * side * 14)
+    end
+    for _, ahead in ipairs({ 6, 10 }) do
+        for _, side in ipairs({ -1, 0, 1 }) do
+            table.insert(candidates, root + forward * ahead + tangent * side * 6)
+        end
+    end
     for _, angle in ipairs({ 0, math.pi / 10, -math.pi / 10, math.pi / 5, -math.pi / 5 }) do
         table.insert(candidates, boss + rotate(radial, angle) * distance)
     end
@@ -867,18 +902,24 @@ function NorthernLands:_beamSector(context, beams)
                 openLanes = openLanes + 1
             end
         end
+        local rangeDeficit = math.max(0, (candidate - context.targetRoot.Position).Magnitude
+            - (context.attackRange or 26))
         return anglePenalty + (side == self._sectorSide and 0 or 12) + (2 - openLanes) * 55
+            + rangeDeficit * 12
     end
-    local goal = self:_pick(context, candidates, context.rootPart.Position,
+    local goal, goalRisk, pathSafe = self:_pick(context, candidates, context.rootPart.Position,
         { margin = 5, desiredWeight = 0.2 }, extra)
     if not goal then return nil end
+    if currentRisk == 0 and (goalRisk > 0 or not pathSafe) then return nil end
     local direction = unitOr(goal - boss)
     self._sectorSide = radial:Cross(direction).Y >= 0 and 1 or -1
     local holding = flat(goal - context.rootPart.Position).Magnitude <= 1.75
+    if holding and self:_risk(context, root, 3) > 0 then return nil end
     return self:_commitIntent(context, "BEAM_AVOIDANCE",
         holding and NorthernLands.Objective.HOLD_POSITION or NorthernLands.Objective.ROTATE_AROUND_CENTER,
-        holding and context.rootPart.Position or goal, "Holding a local lane between passive beams", 0.5,
-        { target = beams[1] and beams[1].id, allowAttack = true, hold = holding })
+        holding and context.rootPart.Position or goal,
+        holding and "Waiting for the blocking beam to clear" or "Advancing through a safe beam lane", 0.3,
+        { target = beams[1] and beams[1].id, allowAttack = true, hold = holding, emergencyFirst = holding })
 end
 
 function NorthernLands:_odinGap(context)

@@ -3150,12 +3150,15 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
 end
 
 local function northernMechanicIntent(humanoid, rootPart, target, targetRoot, now)
+    local waypoint = state.waypoints[state.currentWaypointIndex]
     return northernMechanics:Update({
         now = now,
         humanoid = humanoid,
         rootPart = rootPart,
         target = target,
         targetRoot = targetRoot,
+        attackRange = CFG.ATTACK_RANGE,
+        approachGoal = state.fallbackGoal or (waypoint and waypoint.Position + Vector3.new(0, 2.5, 0)),
         zones = state.activeZones,
         ground = function(position)
             return groundPosition(position, rootPart.Parent, target)
@@ -3469,7 +3472,9 @@ local function controllerTick()
     end
     state.prevHealth[target] = targetHumanoid.Health
     local mechanicIntent = northernMechanicIntent(humanoid, rootPart, target, targetRoot, now)
-    local mechanicEmergency = mechanicIntent and mechanicIntent.emergencyFirst
+    local unsafeHold = mechanicIntent and mechanicIntent.hold
+        and ThreatGeometry.risk(state.activeZones, rootPart.Position, 2, 0.25) > 0
+    local mechanicEmergency = mechanicIntent and (mechanicIntent.emergencyFirst or unsafeHold)
         and handleSafety(humanoid, rootPart, target, targetRoot, now)
     if mechanicEmergency then
         state.combatIntent, state.lastProgressGoal = nil, nil
