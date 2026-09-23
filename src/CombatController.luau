@@ -2420,7 +2420,7 @@ end
 
 local function effectiveSpellRange(profile)
     -- Positive game metadata is authoritative; the UI value fills only unknown ranges.
-    return profile.range or (CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE) or CFG.ATTACK_RANGE
+    return profile.range or (CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE) or 26
 end
 
 local function performDodgeTeleport(humanoid, rootPart, destination, target, threat, now)
@@ -2529,16 +2529,27 @@ local function spellUsable(snapshot, rootPart)
     local target = state.currentTarget
     local targetRoot = target and getRootPart(target)
     return isValidTarget(target) and AttackPolicy.damageable(target) and targetRoot ~= nil
-        and AttackPolicy.inRange(rootPart.Position, targetRoot.Position, effectiveSpellRange(profile))
-        and not hasBlockingRay(rootPart.Position, targetRoot.Position, rootPart.Parent, target)
+        and AttackPolicy.canHit(profile, rootPart.Position, targetRoot.Position, effectiveSpellRange(profile),
+            function(origin, destination) return hasBlockingRay(origin, destination, rootPart.Parent, target) end)
 end
 
 local function prepareSpell(_, snapshot)
     local character, humanoid, rootPart = getChar()
     if not character or not humanoid or not rootPart then return false end
     if not spellUsable(snapshot, rootPart) then return false end
-    if not CFG.SMART_FARM then return true end
     local profile = FarmPlanner.profile(snapshot)
+    if profile.geometry == "forwardBurst" then
+        local target = state.currentTarget
+        local targetRoot = target and getRootPart(target)
+        if not targetRoot then return false end
+        state.castAimTarget, state.castAimUntil, state.groupCount = target, os.clock() + 0.35, 1
+        faceEnemy(humanoid, rootPart, targetRoot)
+        -- AlignOrientation takes time to turn. Recheck the actual facing before
+        -- activation so the forward burst is not fired behind the boss.
+        return AttackPolicy.canHit(profile, rootPart.Position, targetRoot.Position,
+            effectiveSpellRange(profile), nil, rootPart.CFrame.LookVector)
+    end
+    if not CFG.SMART_FARM then return true end
     if profile.mode == "target" and state.targetDist > effectiveSpellRange(profile) then return false end
     if profile.mode ~= "splash" then return true end
     local range, radius = effectiveSpellRange(profile), profile.radius or CFG.GROUP_RADIUS
@@ -3192,8 +3203,7 @@ local function executeNorthernMechanic(intent, humanoid, rootPart, target, targe
         issueMove(humanoid, intent.goal, "mechanic", now, true)
     end
     if targetRoot then faceEnemy(humanoid, rootPart, targetRoot) end
-    if intent.allowAttack and target and targetRoot and distance <= CFG.ATTACK_RANGE
-        and not hasBlockingRay(rootPart.Position, targetRoot.Position, rootPart.Parent, target) then
+    if intent.allowAttack and target and targetRoot then
         castSkill()
     end
     return true
@@ -3247,11 +3257,13 @@ end
 
 local function firingPosition(rootPart, target, targetRoot, now)
     local range = 0
+    local profiles = {}
     for _, snapshot in pairs(abilities.Snapshot(now)) do
         local profile = FarmPlanner.profile(snapshot)
         local reach = AttackPolicy.range(profile, profile.mode == "self" and CFG.CLOSE_AOE_RANGE
             or effectiveSpellRange(profile))
         range = math.max(range, reach or 0)
+        if reach then table.insert(profiles, profile) end
     end
     if range == 0 or not AttackPolicy.damageable(target) then return nil end
     local targetDistance = (targetRoot.Position - rootPart.Position).Magnitude
@@ -3259,8 +3271,14 @@ local function firingPosition(rootPart, target, targetRoot, now)
     if targetDistance > math.max(60, range + 16) then return nil end
     local spacing = math.min(CFG.COMBAT_DISTANCE, range * 0.85)
     local function canFire(position)
-        return AttackPolicy.inRange(position, targetRoot.Position, range)
-            and not hasBlockingRay(position, targetRoot.Position, rootPart.Parent, target)
+        for _, profile in ipairs(profiles) do
+            if AttackPolicy.canHit(profile, position, targetRoot.Position,
+                profile.mode == "self" and CFG.CLOSE_AOE_RANGE or effectiveSpellRange(profile),
+                function(origin, destination) return hasBlockingRay(origin, destination, rootPart.Parent, target) end) then
+                return true
+            end
+        end
+        return false
     end
     local currentCanFire = canFire(rootPart.Position)
     if currentCanFire and targetDistance <= spacing + 2 then return rootPart.Position end
@@ -3275,7 +3293,7 @@ local function firingPosition(rootPart, target, targetRoot, now)
     local best, bestCost
     local params = buildRaycastParams(rootPart.Parent, target)
     params.RespectCanCollide = true
-    local currentVisible = not hasBlockingRay(rootPart.Position, targetRoot.Position, rootPart.Parent, target)
+    local currentVisible = currentCanFire or not hasBlockingRay(rootPart.Position, targetRoot.Position, rootPart.Parent, target)
     local currentCost = AttackPolicy.approachScore(targetDistance, 0, currentVisible, range, spacing)
     local function consider(sample, requireWalk)
         local floor = Workspace:Raycast(sample + Vector3.new(0, 4, 0), Vector3.new(0, -12, 0), params)
@@ -3283,7 +3301,7 @@ local function firingPosition(rootPart, target, targetRoot, now)
         local point = floor.Position + Vector3.new(0, 2.5, 0)
         local travel = (point - rootPart.Position).Magnitude
         if travel <= 2 or ThreatGeometry.risk(state.activeZones, point, CFG.HAZARD_MARGIN) > 0 then return end
-        local visible = not hasBlockingRay(point, targetRoot.Position, rootPart.Parent, target)
+        local visible = canFire(point) or not hasBlockingRay(point, targetRoot.Position, rootPart.Parent, target)
         local distance = (point - targetRoot.Position).Magnitude
         local direct = walkingSegmentClear(rootPart, point, target)
             and safeEnemyStep(rootPart.Position, point)
@@ -3339,6 +3357,11 @@ local function controllerTick()
 
     local now = os.clock()
     CFG.ATTACK_RANGE = CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or 26
+    for _, snapshot in pairs(abilities.Snapshot(now)) do
+        local profile = FarmPlanner.profile(snapshot)
+        local reach = AttackPolicy.range(profile, effectiveSpellRange(profile))
+        if reach then CFG.ATTACK_RANGE = math.max(CFG.ATTACK_RANGE, reach) end
+    end
     if CFG.SMART_FARM then
         local snapshots = abilities.Snapshot(now)
         for _, snapshot in pairs(snapshots) do
@@ -3492,7 +3515,7 @@ local function controllerTick()
             end)
         end
         faceEnemy(humanoid, rootPart, targetRoot)
-        if distance <= CFG.ATTACK_RANGE and not hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then castSkill() end
+        castSkill() -- Per-ability preparation decides whether its hit volume reaches the target.
         return
     end
 

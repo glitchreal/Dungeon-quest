@@ -20,6 +20,16 @@ function Planner.profile(snapshot)
     elseif shape == "self" or description:find("around you", 1, true) or description:find("around yourself", 1, true) then mode = "self"
     elseif shape == "splash" or shape == "area" or radius or description:find("explod", 1, true)
         or description:find("nearby enemies", 1, true) then mode = "splash" end
+    -- abilityLocal2 spawns Geyser 40 studs along the caster's facing and
+    -- expands its ring to 92 studs across. Tools expose neither measurement
+    -- (and their child `name` misleadingly says Fireball). Use Tool.Name.
+    -- This is a client-effect envelope for attempting casts, not proof of the
+    -- hidden server hitbox. Explicit radius metadata remains authoritative.
+    if snapshot.name == "Geyser" then
+        return { mode = "splash", range = range or 40, radius = radius or 46,
+            geometry = "forwardBurst", forwardOffset = 40,
+            verifiedRange = range ~= nil, geometrySource = "client-effect" }
+    end
     return { mode = mode, range = range, radius = radius, verifiedRange = range ~= nil }
 end
 

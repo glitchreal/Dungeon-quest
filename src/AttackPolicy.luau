@@ -21,9 +21,26 @@ function Policy.damageable(model)
 end
 
 function Policy.range(profile, fallback)
+    if profile.geometry == "forwardBurst" then return profile.forwardOffset + profile.radius end
     if profile.mode == "self" then return profile.radius or profile.range or fallback end
     if profile.mode == "target" or profile.mode == "splash" then return profile.range or fallback end
     return nil
+end
+
+function Policy.canHit(profile, origin, target, fallback, blocked, facing)
+    if profile.geometry == "forwardBurst" then
+        -- This effect is placed directly ahead; it is not a projectile that
+        -- must raycast into the enemy root. Test the burst volume, including Y.
+        local direction = facing or (target - origin)
+        local length = math.sqrt(direction.X * direction.X + direction.Z * direction.Z)
+        if length < 0.001 then return false end
+        local x = target.X - origin.X - direction.X / length * profile.forwardOffset
+        local y = target.Y - origin.Y
+        local z = target.Z - origin.Z - direction.Z / length * profile.forwardOffset
+        return x*x + y*y + z*z <= profile.radius * profile.radius
+    end
+    return Policy.inRange(origin, target, Policy.range(profile, fallback))
+        and (not blocked or not blocked(origin, target))
 end
 
 function Policy.inRange(origin, target, range)
