@@ -87,6 +87,8 @@ local state = {
     lockedTarget = nil,
     cachedTargets = {},
     lastTargetScan = 0,
+    unreachableTargets = setmetatable({}, { __mode = "k" }),
+    combatIntent = nil,
 
     motionMode = "idle",
     motionGoal = nil,
@@ -214,6 +216,10 @@ local function rememberHazardHit(zone)
     entry.bonus = math.min(5, entry.bonus + 1)
     entry.sequence = state.hazardMemorySequence
     entry.lastHitAt = os.clock()
+    if state.escapeGoal and state.escapeThreatId == zone.id and state.escapeSide
+        and os.clock() - (state.escapePlannedAt or -math.huge) < 1.5 then
+        entry.avoidSide = state.escapeSide
+    end
     state.hazardMemoryDirty = true
 end
 
@@ -660,6 +666,8 @@ local function refreshRouteAnchors(now)
     end)
 end
 
+local hasBlockingRay
+
 local function mapRouteGoal(rootPart, now)
     refreshRouteAnchors(now)
     while true do
@@ -673,7 +681,10 @@ local function mapRouteGoal(rootPart, now)
         end
         local delta = rootPart.Position - anchor.part.Position
         local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
-        if flat <= 28 and math.abs(delta.Y) <= 60 then
+        -- An anchor across a door or on a different floor is not reached just
+        -- because its XZ projection is nearby.
+        if flat <= 12 and math.abs(delta.Y) <= 9
+            and not hasBlockingRay(rootPart.Position, anchor.part.Position, rootPart.Parent, anchor.part) then
             state.routeAnchorIndex = state.routeAnchorIndex + 1
         else
             return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
@@ -713,11 +724,10 @@ local function refreshTargets(rootPart, now)
     state.cachedTargets = targets
 end
 
-local hasBlockingRay
-
 local function getClosestEnemy(rootPart, now)
     refreshTargets(rootPart, now)
-    if now - (state.lastTargetChoice or 0) < 0.15 and isValidTarget(state.lockedTarget) then
+    if now - (state.lastTargetChoice or 0) < 0.15 and isValidTarget(state.lockedTarget)
+        and now >= (state.unreachableTargets[state.lockedTarget] or 0) then
         local root = getRootPart(state.lockedTarget)
         local distance = (rootPart.Position - root.Position).Magnitude
         if distance <= CFG.DETECTION_RADIUS and state.lockedTarget:IsDescendantOf(Workspace) then
@@ -736,17 +746,31 @@ local function getClosestEnemy(rootPart, now)
         end
     end
     table.sort(candidates, function(a, b) return a.distance < b.distance end)
-    local closest = candidates[1]
+    local searchDistance = candidates[1] and math.max(CFG.THREAT_RADIUS, candidates[1].distance + 24) or 0
+    local hasReachable = false
+    for _, candidate in ipairs(candidates) do
+        if candidate.distance > searchDistance then break end
+        if now >= (state.unreachableTargets[candidate.model] or 0) then hasReachable = true; break end
+    end
+    local closest
     local closestIsVisible = false
-    if closest then
+    if #candidates > 0 then
         -- Prefer nearby enemies we can engage over a closer one behind a wall.
-        local searchDistance = math.max(CFG.THREAT_RADIUS, closest.distance + 24)
-        for _, candidate in ipairs(candidates) do
-            if candidate.distance > searchDistance then break end
-            if not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
+        for index, candidate in ipairs(candidates) do
+            if index > 24 or candidate.distance > searchDistance then break end
+            if (not hasReachable or now >= (state.unreachableTargets[candidate.model] or 0))
+                and not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
                 closest = candidate
                 closestIsVisible = true
                 break
+            end
+        end
+        if not closest then
+            for _, candidate in ipairs(candidates) do
+                if not hasReachable or now >= (state.unreachableTargets[candidate.model] or 0) then
+                    closest = candidate
+                    break
+                end
             end
         end
     end
@@ -762,7 +786,9 @@ local function getClosestEnemy(rootPart, now)
         if lockedRoot then
             local lockedDist = (rootPart.Position - lockedRoot.Position).Magnitude
             local lockedVisible = not hasBlockingRay(rootPart.Position, lockedRoot.Position, rootPart.Parent, previousLock)
-            if (not closestIsVisible or lockedVisible) and lockedDist <= pickDist + 20 and lockedDist <= CFG.DETECTION_RADIUS then
+            if now >= (state.unreachableTargets[previousLock] or 0)
+                and (not closestIsVisible or lockedVisible) and lockedDist <= pickDist + 20
+                and lockedDist <= CFG.DETECTION_RADIUS then
                 state.lockedTarget = previousLock
                 return previousLock, lockedDist
             end
@@ -924,17 +950,23 @@ end
 -- Steering uses Humanoid:MoveTo. (Humanoid:Move is input-path and gets
 -- swallowed from an executor context, which once froze the bot solid.)
 local function issueMove(humanoid, position, mode, now, bypass)
+    local function safetyHold(root)
+        if state.motionMode ~= "safety-hold" or now - state.lastMoveToCall >= 0.35 then
+            humanoid:MoveTo(root.Position)
+            state.lastMoveToCall = now
+            state.lastMoveToPosition = root.Position
+        end
+        state.motionMode = "safety-hold"
+    end
     if not bypass and CFG.AUTO_DODGE and #state.activeZones > 0 then
         local root = humanoid.Parent and humanoid.Parent:FindFirstChild("HumanoidRootPart")
         if root then
             local delta = position - root.Position
             local nextPosition = delta.Magnitude > 12 and root.Position + delta.Unit * 12 or position
             if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.HAZARD_MARGIN) then
-                humanoid:MoveTo(root.Position)
-                state.motionMode = "safety-hold"
+                safetyHold(root)
                 state.movementBlocked = true
                 state.blockedByHazard = true
-                state.lastMoveToCall = 0
                 return
             end
         end
@@ -946,10 +978,9 @@ local function issueMove(humanoid, position, mode, now, bypass)
             local reach = math.max(3, humanoid.WalkSpeed * 0.3)
             local step = delta.Magnitude > reach and root.Position + delta.Unit * reach or position
             if not safeEnemyStep(root.Position, step) then
-                humanoid:MoveTo(root.Position)
-                state.motionMode, state.movementBlocked = "safety-hold", true
+                safetyHold(root)
+                state.movementBlocked = true
                 state.lastEscapePlan = -math.huge
-                state.lastMoveToCall = 0
                 return
             end
         end
@@ -961,6 +992,7 @@ local function issueMove(humanoid, position, mode, now, bypass)
         state.lastMoveToPosition = position
     end
     state.motionMode = mode
+    state.movementBlocked, state.blockedByHazard = false, false
 end
 
 local function chooseFallbackStep(rootPart, goal, target)
@@ -1204,11 +1236,24 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
         local flatDist = (Vector3.new(rootPart.Position.X - waypoint.Position.X, 0, rootPart.Position.Z - waypoint.Position.Z)).Magnitude
         if state.watchWp ~= waypoint then
             state.watchWp, state.watchSince, state.watchDist, state.watchSkips = waypoint, now, flatDist, 0
-        elseif now - state.watchSince >= 4 and flatDist > state.watchDist - 1 and (state.watchSkips or 0) < 4 then
-            state.watchSkips = (state.watchSkips or 0) + 1
-            state.currentWaypointIndex = state.currentWaypointIndex + 1
-            state.watchWp, state.watchSince = nil, 0
-            waypoint = state.waypoints[state.currentWaypointIndex]
+        elseif now - state.watchSince >= 4 and flatDist > state.watchDist - 1 then
+            local nextWaypoint = state.waypoints[state.currentWaypointIndex + 1]
+            if nextWaypoint and walkingSegmentClear(rootPart, nextWaypoint.Position, target) then
+                state.currentWaypointIndex = state.currentWaypointIndex + 1
+                state.watchWp, state.watchSince = nil, 0
+                waypoint = nextWaypoint
+            else
+                -- A blocked waypoint is evidence that the current path is
+                -- stale. Skipping it without a clear next segment cuts walls.
+                state.failedPaths[pathKey(rootPart.Position, goal, mode)] = now
+                clearPath()
+                local detour = chooseFallbackStep(rootPart, goal, target)
+                if detour then
+                    state.fallbackGoal, state.fallbackUntil = detour, now + 1.6
+                    issueMove(humanoid, detour, mode, now)
+                end
+                return
+            end
         elseif flatDist < state.watchDist - 1 then
             state.watchSince, state.watchDist = now, flatDist
         end
@@ -1242,7 +1287,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
                     state.fallbackGoal, state.fallbackUntil = fallback, now + 0.6
                     issueMove(humanoid, fallback, mode, now)
                 else
-                    humanoid:MoveTo(rootPart.Position)
+                    issueMove(humanoid, rootPart.Position, "recovery-hold", now, true)
                 end
             end
         end
@@ -1286,15 +1331,24 @@ end
 local function updateProgress(humanoid, rootPart, goal, target, now)
     if now - state.lastStuckCheck < CFG.STUCK_CHECK_INTERVAL then return false end
     state.lastStuckCheck = now
-    local distance = (goal - rootPart.Position).Magnitude
-    local moved = (rootPart.Position - state.lastPosition).Magnitude
+    -- Follow the active waypoint, not the distant enemy: a valid path may
+    -- initially lead away from the final goal to get around a wall.
+    local waypoint = state.waypoints[state.currentWaypointIndex]
+    local progressGoal = waypoint and waypoint.Position or state.fallbackGoal or goal
+    if not state.lastProgressGoal or (progressGoal - state.lastProgressGoal).Magnitude > 3 then
+        state.lastProgressGoal = progressGoal
+        state.lastProgressDistance = math.huge
+        state.stuckStartTime = 0
+    end
+    local distance = (progressGoal - rootPart.Position).Magnitude
     state.lastPosition = rootPart.Position
-    if moved >= CFG.STUCK_MOVE_THRESHOLD or distance < state.lastProgressDistance - 0.25 then
+    if distance < state.lastProgressDistance - 0.35 then
         state.stuckCount = 0
         state.stuckStartTime = 0
         state.lastProgressDistance = distance
         state.lastProgressAt = now
         state.routeFails = 0
+        if target then state.unreachableTargets[target] = nil end
         return false
     end
     state.stuckCount = state.stuckCount + 1
@@ -1309,6 +1363,9 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
     state.stuckStartTime = now
     state.stuckCount = 0
     state.routeFails = (state.routeFails or 0) + 1
+    if target and state.routeFails >= 6 then
+        state.unreachableTargets[target] = now + 6
+    end
     -- NOTE: no clearPath() here. Clearing bumps the path generation, which
     -- discards the in-flight repath result, which stalls again, which clears
     -- again: a permanent loop where no path ever survives to be walked.
@@ -1540,12 +1597,14 @@ local function findEscapeGoal(rootPart, targetRoot)
     local floor = Workspace:Raycast(rootPart.Position, Vector3.new(0, -10, 0), params)
     if not floor then return nil end
     local candidates = {}
-    local originalRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
+    local originalRisk, dangerZone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     local targetOffset = rootPart.Position - targetRoot.Position
     local targetRadial = Vector3.new(targetOffset.X, 0, targetOffset.Z)
     if targetRadial.Magnitude < 0.1 then targetRadial = Vector3.new(1, 0, 0) end
     targetRadial = targetRadial.Unit
-    local orbitDirection = Vector3.new(-targetRadial.Z, 0, targetRadial.X) * state.dodgeSide
+    local memory = dangerZone and state.hazardMemory[hazardMemoryKey(dangerZone)]
+    local preferredSide = memory and memory.avoidSide and -memory.avoidSide or state.dodgeSide
+    local orbitDirection = Vector3.new(-targetRadial.Z, 0, targetRadial.X) * preferredSide
     local originalTargetDistance = Vector3.new(targetOffset.X, 0, targetOffset.Z).Magnitude
     local function combatShapeScore(candidate)
         local candidateOffset = candidate - targetRoot.Position
@@ -1572,7 +1631,7 @@ local function findEscapeGoal(rootPart, targetRoot)
             end
             for _, radius in ipairs({ 5, 10, 18 }) do
                 for _, angle in ipairs({ math.pi / 6, math.pi / 3, math.pi / 2, math.pi * 2 / 3, math.pi }) do
-                    for _, side in ipairs({ state.protectorOrbitSide or 1, -(state.protectorOrbitSide or 1) }) do
+                    for _, side in ipairs({ preferredSide, -preferredSide }) do
                         local candidate = rootPart.Position + (toward * math.cos(angle) + lateral * math.sin(angle) * side) * radius
                         local offset = candidate - targetRoot.Position
                         local distance = Vector3.new(offset.X, 0, offset.Z).Magnitude
@@ -1666,8 +1725,11 @@ local function findEscapeGoal(rootPart, targetRoot)
                                 local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
                                 local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
                                 local targetDistance = (candidate - targetRoot.Position).Magnitude
+                                local moveSide = (candidate - rootPart.Position):Dot(
+                                    Vector3.new(-targetRadial.Z, 0, targetRadial.X)) >= 0 and 1 or -1
                                 local score = survivalRisk * 10000 + comfortRisk * 100 + distance
                                     + math.max(0, targetDistance - math.max(CFG.ATTACK_RANGE, originalTargetDistance + 6)) * 80
+                                    + (moveSide == preferredSide and 0 or 15)
                                 if survivalRisk < initialRisk - 0.1
                                     and (not bestScore or score < bestScore) then
                                     best, bestScore = candidate, score
@@ -2365,6 +2427,25 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     CFG.HAZARD_MARGIN = CFG.HAZARD_MARGIN_BASE
         + math.max(math.clamp(hazardBonus, 0, 8), learnedHazardMargin(rootPart.Position))
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
+    -- Forecast where the current MoveTo will carry the body in the next
+    -- fraction of a second. The hazard geometry itself already projects
+    -- moving hitboxes; this adds the character's own motion to the check.
+    if #state.activeZones > 0 and risk == 0 then
+        local velocity = rootPart.AssemblyLinearVelocity
+        local movement = Vector3.new(velocity.X, 0, velocity.Z) * 0.35
+        if state.motionMode ~= "hold" and now - state.lastMoveToCall < 0.5 then
+            local toward = state.lastMoveToPosition - rootPart.Position
+            toward = Vector3.new(toward.X, 0, toward.Z)
+            if toward.Magnitude > 0.1 then
+                movement = toward.Unit * math.min(toward.Magnitude, humanoid.WalkSpeed * 0.35)
+            end
+        end
+        if movement.Magnitude > 0.5 then
+            local predictedRisk, predictedZone = ThreatGeometry.risk(state.activeZones,
+                rootPart.Position + movement, CFG.HAZARD_MARGIN)
+            if predictedRisk > 0 then risk, zone = predictedRisk, predictedZone end
+        end
+    end
     local routeThreat = state.motionGoal and state.motionGoalMode == "map-route"
         and (state.motionGoal - rootPart.Position).Magnitude > 4
         and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.motionGoal, CFG.HAZARD_MARGIN)
@@ -2517,7 +2598,10 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         state.escapeGoal = nil
         state.lastEscapePlan = -math.huge
     end
-    if risk == 0 and not routeThreat and not state.retreating and not contactThreat and crowd >= crowdLimit
+    local committedEscape = state.escapeGoal and now < (state.escapeCommitUntil or 0)
+        and (state.escapeGoal - rootPart.Position).Magnitude > 2
+    if risk == 0 and not committedEscape and not routeThreat and not state.retreating
+        and not contactThreat and crowd >= crowdLimit
         and not state.movementBlocked and not state.blockedByHazard then
         state.escapeGoal, state.threatReactionAt = nil, nil
         return false
@@ -2579,7 +2663,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             return true
         end
     end
-    if now - state.lastEscapePlan < 0.12 then return true end
+    if now - state.lastEscapePlan < (risk > 0 and 0.08 or 0.12) then return true end
     state.lastEscapePlan = now
     local goal, escapeMargin, escapeReason = findEscapeGoal(rootPart, targetRoot)
     if not goal and (risk > 0 or state.blockedByHazard) then
@@ -2616,6 +2700,15 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.escapeCommitUntil = escapeMargin and now + 0.9 or now + 0.45
     state.escapeStartRisk = risk
     state.escapeThreatId = zone and zone.id or nil
+    local radial = rootPart.Position - targetRoot.Position
+    radial = Vector3.new(radial.X, 0, radial.Z)
+    if radial.Magnitude > 0.1 then
+        local tangent = Vector3.new(-radial.Z, 0, radial.X).Unit
+        state.escapeSide = (goal - rootPart.Position):Dot(tangent) >= 0 and 1 or -1
+    else
+        state.escapeSide = nil
+    end
+    state.escapePlannedAt = now
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
     dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now,
@@ -2625,6 +2718,52 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     logThreat("escape", state.escapeReason)
     issueMove(humanoid, goal, "evade", now, escapeMargin ~= nil)
     return true
+end
+
+-- Keep a chosen combat orbit point briefly. Re-sample when the enemy moves,
+-- the route becomes unsafe, or a dodge takes ownership of movement.
+local function combatPosition(rootPart, target, targetRoot, baseGoal, now)
+    local intent = state.combatIntent
+    if intent and intent.target == target and now < intent.untilAt
+        and (intent.goal - rootPart.Position).Magnitude > 1.5
+        and (targetRoot.Position - intent.targetPosition).Magnitude < 3
+        and ThreatGeometry.risk(state.activeZones, intent.goal, CFG.HAZARD_MARGIN) == 0
+        and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, intent.goal, CFG.HAZARD_MARGIN) then
+        local recentlyChecked = now - intent.routeCheckedAt < 0.15
+            and (rootPart.Position - intent.routeCheckedFrom).Magnitude < 3
+        if recentlyChecked then return intent.goal end
+        if walkingSegmentClear(rootPart, intent.goal, target) then
+            intent.routeCheckedAt, intent.routeCheckedFrom = now, rootPart.Position
+            return intent.goal
+        end
+    end
+    local radial = baseGoal - targetRoot.Position
+    radial = Vector3.new(radial.X, 0, radial.Z)
+    if radial.Magnitude < 0.1 then radial = rootPart.Position - targetRoot.Position end
+    radial = Vector3.new(radial.X, 0, radial.Z)
+    if radial.Magnitude < 0.1 then radial = Vector3.new(1, 0, 0) end
+    local tangent = Vector3.new(-radial.Z, 0, radial.X).Unit
+    local best, bestSide, bestScore
+    for _, side in ipairs({ state.dodgeSide, -state.dodgeSide }) do
+        local candidate = groundPosition(baseGoal + tangent * side * 4, rootPart.Parent, target)
+        if walkingSegmentClear(rootPart, candidate, target)
+            and safeEnemyStep(rootPart.Position, candidate)
+            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, CFG.HAZARD_MARGIN) then
+            local risk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+            local targetDistance = (candidate - targetRoot.Position).Magnitude
+            local score = risk * 1000 + math.abs(targetDistance - CFG.COMBAT_DISTANCE) * 2
+                + (side == state.dodgeSide and 0 or 12)
+            if not bestScore or score < bestScore then
+                best, bestSide, bestScore = candidate, side, score
+            end
+        end
+    end
+    if best then state.dodgeSide = bestSide end
+    local goal = best or baseGoal
+    state.combatIntent = { target = target, targetPosition = targetRoot.Position,
+        goal = goal, untilAt = now + 0.65, routeCheckedAt = now,
+        routeCheckedFrom = rootPart.Position }
+    return goal
 end
 
 local function controllerTick()
@@ -2702,6 +2841,8 @@ local function controllerTick()
         return
     end
     if state.currentTarget ~= target then
+        state.combatIntent = nil
+        state.lastProgressGoal = nil
         local previousRoot = state.currentTarget and getRootPart(state.currentTarget)
         if not previousRoot or (previousRoot.Position - targetRoot.Position).Magnitude > 4 then
             clearPath()
@@ -2745,6 +2886,7 @@ local function controllerTick()
     state.prevHealth[target] = targetHumanoid.Health
     refreshSafety(rootPart, now)
     if handleSafety(humanoid, rootPart, target, targetRoot, now) then
+        state.combatIntent, state.lastProgressGoal = nil, nil
         state.navigationPhase = "evade"
         if CFG.AUTO_ABILITIES and CFG.SMART_FARM then
             abilities.TryCast(now, CFG.SKILL_COOLDOWN, function(slot, snapshot)
@@ -2819,6 +2961,7 @@ local function controllerTick()
             end
         end
         if shouldHold then
+            state.unreachableTargets[target] = now + 8
             if not state.wanderGoal or now > (state.wanderUntil or 0)
                 or (state.wanderGoal - rootPart.Position).Magnitude <= CFG.WAYPOINT_REACH_THRESHOLD then
                 -- Wall-follow: the target sits behind a wall and pacing into
@@ -2909,8 +3052,8 @@ local function controllerTick()
         local offset = rootPart.Position - targetRoot.Position
         local flat = Vector3.new(offset.X, 0, offset.Z)
         if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
-        local tangent = Vector3.new(-flat.Z, 0, flat.X).Unit * state.dodgeSide * 4
-        local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE + tangent, character, target)
+        local basePosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+        local desiredPosition = combatPosition(rootPart, target, targetRoot, basePosition, now)
         if (desiredPosition - rootPart.Position).Magnitude > 1 then
             followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
         end
@@ -2934,22 +3077,9 @@ local function controllerTick()
             flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi / 6):VectorToWorldSpace(radial)
         end
     end
-    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
-    -- Idle creep (Protector): with no active threats, blink small steps
-    -- toward the hold instead of only walking. Closes distance between
-    -- volleys so the fight happens at sidestep range, not cross-arena.
-    -- Budget + same-threat cooldown bound it; dodges always win ties.
-    if protectorRear and #state.activeZones == 0 then
-        local creepDelta = desiredPosition - rootPart.Position
-        if creepDelta.Magnitude > 15 then
-            local step = rootPart.Position + creepDelta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, creepDelta.Magnitude)
-            if safeEnemyStep(rootPart.Position, step)
-                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, step, CFG.HAZARD_MARGIN)
-                and walkingSegmentClear(rootPart, step, target) then
-                performDodgeTeleport(humanoid, rootPart, step, target, "creep", now)
-            end
-        end
-    end
+    local basePosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+    local desiredPosition = protectorRear
+        and combatPosition(rootPart, target, targetRoot, basePosition, now) or basePosition
     if (Vector3.new(desiredPosition.X - rootPart.Position.X, 0, desiredPosition.Z - rootPart.Position.Z)).Magnitude < 2 then
         stopMovement(humanoid, rootPart)
         if distance <= CFG.ATTACK_RANGE then castSkill() end
@@ -2996,6 +3126,8 @@ local function setRunning(running)
     if state.closed or state.running == running then return end
     state.running = running
     if state.running then
+        state.unreachableTargets = setmetatable({}, { __mode = "k" })
+        state.combatIntent, state.lastProgressGoal = nil, nil
         state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
@@ -3124,6 +3256,7 @@ local function watchHealth(character)
 end
 
 connect(player.CharacterAdded, function(character)
+    state.combatIntent, state.lastProgressGoal = nil, nil
     state.protectorOrbitSide = nil
     state.protectorEscapeVisits = nil
     state.threatReactionAt = nil
@@ -3157,7 +3290,8 @@ local function loadDodgeMemory(data)
             local hits = math.clamp(math.floor(tonumber(source.Hits) or 0), 0, 100)
             local bonus = math.clamp(math.floor(tonumber(source.Bonus) or 0), 0, 5)
             sequence = sequence + 1
-            memory[key] = { hits = hits, bonus = bonus, sequence = sequence }
+            local avoidSide = source.AvoidSide == 1 and 1 or source.AvoidSide == -1 and -1 or nil
+            memory[key] = { hits = hits, bonus = bonus, sequence = sequence, avoidSide = avoidSide }
             count = count + 1
         end
     end
@@ -3167,7 +3301,7 @@ end
 local function exportDodgeMemory()
     local entries = {}
     for key, entry in pairs(state.hazardMemory) do
-        entries[key] = { Hits = entry.hits, Bonus = entry.bonus }
+        entries[key] = { Hits = entry.hits, Bonus = entry.bonus, AvoidSide = entry.avoidSide }
     end
     return { Version = 1, Entries = entries }
 end

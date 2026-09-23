@@ -83,6 +83,10 @@ attack and adds up to five studs of planning clearance for later encounters.
 The memory is limited to 24 attack types and saved with the account's Obsidian
 settings when executor file saving is available. It does not infer attacks that
 the client cannot see.
+If a committed escape from that same visible attack still takes damage, the
+memory also records the failed orbit side. Later escape scoring favors the
+opposite side when it is reachable and safe; wall, enemy, and hazard checks
+still decide the final route.
 Solo Hitless Safety is enabled by default. While alone it keeps dodge protection
 active, scans threats from farther away, increases telegraph margins and projectile
 lookahead, retains named attack parts that activate later in the run, and treats
@@ -98,6 +102,13 @@ invalidates the old route; switches within a close group preserve smooth walking
 When a target is replicated through a wall, the controller follows the dungeon's
 ordered room checkpoints. This applies dynamically to every map that exposes
 checkpoint parts and avoids cutting across folded rooms or locked doors.
+Checkpoints are reached only when close on the same floor with a clear segment.
+Navigation measures progress toward its active waypoint, briefly deprioritizes
+repeatedly unreachable targets when alternatives exist, and replans a blocked
+waypoint rather than skipping through a wall. Combat keeps a short-lived orbit
+goal until the target moves or the route becomes unsafe. Dodging preempts that
+goal, and ordinary walking resumes combat positioning afterward. Bounded blinks
+are reserved for evasive movement rather than idle travel toward a boss.
 
 Abilities use the equipped tools' real cooldowns and the game's normal
 `localEvent` / `abilityUsed` activation path. The scheduler skips unavailable
