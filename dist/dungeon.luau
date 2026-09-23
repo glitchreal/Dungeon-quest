@@ -260,7 +260,18 @@ local function clearanceSingle(zone, position, margin, arrivalTime)
         return Vector2.new(point.Y, point.Z).Magnitude - projectedCircleRadius(zone, arrivalTime) - margin
     end
     if zone.shape == "Projectile" then
-        return Geometry.segmentDistance(position, zone.frame.Position, zone.frame.Position + zone.velocity * zone.lookahead)
+        local center = zone.frame.Position
+        if arrivalTime and arrivalTime > 0 then
+            local future = os.clock() + arrivalTime
+            if zone.expires and future > zone.expires then return math.huge end
+            if zone.origin and zone.travel and zone.starts and zone.duration then
+                center = (zone.origin + zone.travel * math.clamp((future - zone.starts) / zone.duration, 0, 1)).Position
+            else
+                center = center + zone.velocity * math.min(arrivalTime, 1.5)
+            end
+        end
+        local lookahead = arrivalTime and math.min(zone.lookahead, 0.4) or zone.lookahead
+        return Geometry.segmentDistance(position, center, center + zone.velocity * lookahead)
             - math.max(half.X, half.Y, half.Z) - margin
     end
     local height = math.abs(point.Y) - half.Y - BASE_MARGIN
@@ -355,14 +366,14 @@ function Geometry.circleExits(zone, position, margin)
     return needNear, axis, needFar, -axis
 end
 
-function Geometry.risk(zones, position, margin)
+function Geometry.risk(zones, position, margin, arrivalTime)
     local risk, nearest = 0, nil
     local seen = {}
     for _, zone in ipairs(zones) do
         local key = geometryKey(zone)
         if not seen[key] then
             seen[key] = true
-            local clearance = Geometry.clearance(zone, position, margin)
+            local clearance = Geometry.clearance(zone, position, margin, arrivalTime)
             if clearance < 0 then
                 risk = risk + 1 + clearance * clearance
                 if not nearest or clearance < nearest.clearance then nearest = { zone = zone, clearance = clearance } end
@@ -375,6 +386,7 @@ end
 function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
     local relevant = {}
     local seen = {}
+    local length = (endPosition - startPosition).Magnitude
     local padding = math.sqrt(2 * margin * margin + 16)
     for _, zone in ipairs(zones) do
         local key = geometryKey(zone)
@@ -382,6 +394,9 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
             seen[key] = true
             local travel = (zone.moving or zone.shape == "Projectile")
                 and zone.velocity.Magnitude * zone.lookahead or 0
+            if zone.shape == "Projectile" then
+                travel = travel + zone.velocity.Magnitude * math.min(length / 16, 1.5)
+            end
             local radius = zone.size.Magnitude * 0.5 + padding + travel
                 + (zone.aimOffset and zone.aimOffset.Magnitude or 0)
                 + math.min(16, (zone.radialGrowth or 0) * 0.45)
@@ -391,7 +406,6 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
         end
     end
     if #relevant == 0 then return true end
-    local length = (endPosition - startPosition).Magnitude
     local steps = math.max(1, math.ceil(length * 2))
     local initial = {}
     local previousRisk = 0
@@ -908,7 +922,10 @@ end
 local function learnedHazardMargin(position)
     local bonus = 0
     for _, zone in ipairs(state.activeZones) do
-        if (zone.frame.Position - position).Magnitude < 40 then
+        -- A long beam can reach the player while its center is over a hundred
+        -- studs away. Distance to the hitbox, not its center, decides whether
+        -- past damage from this attack should widen the dodge margin.
+        if ThreatGeometry.clearance(zone, position, 0) < 40 then
             local entry = state.hazardMemory[hazardMemoryKey(zone)]
             if entry then bonus = math.max(bonus, entry.bonus) end
         end
@@ -2468,6 +2485,8 @@ local function findEscapeGoal(rootPart, targetRoot)
     -- especially when a beam or slam is active at the same time.
     do
         local initialRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+        local playerHumanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
+        local walkSpeed = math.max(1, playerHumanoid and playerHumanoid.WalkSpeed or 16)
         local severeNonProjectile = false
         for _, activeZone in ipairs(state.activeZones) do
             if activeZone.shape ~= "Projectile"
@@ -2488,9 +2507,15 @@ local function findEscapeGoal(rootPart, targetRoot)
                             local candidate = groundPosition(rootPart.Position + lateral * side * distance,
                                 rootPart.Parent, targetRoot.Parent)
                             if walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor)
-                                and safeEnemyStep(rootPart.Position, candidate) then
-                                local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
-                                local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                                and safeEnemyStep(rootPart.Position, candidate)
+                                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, 2) then
+                                local arrival = math.min(1.5, distance / walkSpeed)
+                                local survivalRisk = math.max(
+                                    ThreatGeometry.risk(state.activeZones, candidate, 2),
+                                    ThreatGeometry.risk(state.activeZones, candidate, 2, arrival))
+                                local comfortRisk = math.max(
+                                    ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN),
+                                    ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN, arrival))
                                 local targetDistance = (candidate - targetRoot.Position).Magnitude
                                 local moveSide = (candidate - rootPart.Position):Dot(
                                     Vector3.new(-targetRadial.Z, 0, targetRadial.X)) >= 0 and 1 or -1

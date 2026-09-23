@@ -318,7 +318,10 @@ end
 local function learnedHazardMargin(position)
     local bonus = 0
     for _, zone in ipairs(state.activeZones) do
-        if (zone.frame.Position - position).Magnitude < 40 then
+        -- A long beam can reach the player while its center is over a hundred
+        -- studs away. Distance to the hitbox, not its center, decides whether
+        -- past damage from this attack should widen the dodge margin.
+        if ThreatGeometry.clearance(zone, position, 0) < 40 then
             local entry = state.hazardMemory[hazardMemoryKey(zone)]
             if entry then bonus = math.max(bonus, entry.bonus) end
         end
@@ -1878,6 +1881,8 @@ local function findEscapeGoal(rootPart, targetRoot)
     -- especially when a beam or slam is active at the same time.
     do
         local initialRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+        local playerHumanoid = rootPart.Parent:FindFirstChildOfClass("Humanoid")
+        local walkSpeed = math.max(1, playerHumanoid and playerHumanoid.WalkSpeed or 16)
         local severeNonProjectile = false
         for _, activeZone in ipairs(state.activeZones) do
             if activeZone.shape ~= "Projectile"
@@ -1898,9 +1903,15 @@ local function findEscapeGoal(rootPart, targetRoot)
                             local candidate = groundPosition(rootPart.Position + lateral * side * distance,
                                 rootPart.Parent, targetRoot.Parent)
                             if walkingSegmentClear(rootPart, candidate, targetRoot.Parent, params, floor)
-                                and safeEnemyStep(rootPart.Position, candidate) then
-                                local survivalRisk = ThreatGeometry.risk(state.activeZones, candidate, 2)
-                                local comfortRisk = ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN)
+                                and safeEnemyStep(rootPart.Position, candidate)
+                                and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, candidate, 2) then
+                                local arrival = math.min(1.5, distance / walkSpeed)
+                                local survivalRisk = math.max(
+                                    ThreatGeometry.risk(state.activeZones, candidate, 2),
+                                    ThreatGeometry.risk(state.activeZones, candidate, 2, arrival))
+                                local comfortRisk = math.max(
+                                    ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN),
+                                    ThreatGeometry.risk(state.activeZones, candidate, CFG.HAZARD_MARGIN, arrival))
                                 local targetDistance = (candidate - targetRoot.Position).Magnitude
                                 local moveSide = (candidate - rootPart.Position):Dot(
                                     Vector3.new(-targetRadial.Z, 0, targetRadial.X)) >= 0 and 1 or -1
