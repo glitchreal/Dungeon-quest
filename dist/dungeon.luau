@@ -732,6 +732,9 @@ local state = {
     routeDungeon = nil,
     routeAnchors = {},
     routeAnchorIndex = 1,
+    routeProgress = nil,
+    routeInitialized = false,
+    routeHasCombat = false,
     routeScannedAt = -math.huge,
     hazardSnapshot = { at = 0, risk = 0, items = {}, plan = "idle", goalDistance = 0 },
     hazardLabelFolder = nil,
@@ -1338,6 +1341,10 @@ local function refreshRouteAnchors(now)
     local name = dungeonName()
     if state.routeDungeon == name and #state.routeAnchors > 0 then return end
     if state.routeDungeon == name and now - state.routeScannedAt < 2 then return end
+    if state.routeDungeon ~= name then
+        state.routeProgress = nil
+        state.routeInitialized = false
+    end
     state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = name, {}, 1
     state.routeScannedAt = now
     local dungeon = Workspace:FindFirstChild("dungeon")
@@ -1353,17 +1360,54 @@ local function refreshRouteAnchors(now)
     table.sort(state.routeAnchors, function(a, b)
         return a.order < b.order or a.order == b.order and a.name < b.name
     end)
+    local progress = state.routeProgress
+    if progress then
+        while state.routeAnchors[state.routeAnchorIndex] do
+            local anchor = state.routeAnchors[state.routeAnchorIndex]
+            if anchor.order > progress.order or anchor.order == progress.order and anchor.name > progress.name then break end
+            state.routeAnchorIndex = state.routeAnchorIndex + 1
+        end
+    end
 end
 
 local hasBlockingRay
 
+local function syncRouteToCurrentRoom(rootPart, maxDistance)
+    local nearestIndex, nearestDistance
+    for index = state.routeAnchorIndex, #state.routeAnchors do
+        local anchor = state.routeAnchors[index]
+        if anchor.part.Parent then
+            local delta = rootPart.Position - anchor.part.Position
+            local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
+            if flat <= maxDistance and math.abs(delta.Y) <= 12
+                and (not nearestDistance or flat < nearestDistance)
+                and not hasBlockingRay(rootPart.Position, anchor.part.Position, rootPart.Parent, anchor.part) then
+                nearestIndex, nearestDistance = index, flat
+            end
+        end
+    end
+    if nearestIndex then
+        local anchor = state.routeAnchors[nearestIndex]
+        state.routeProgress = { order = anchor.order, name = anchor.name }
+        state.routeAnchorIndex = nearestIndex + 1
+    end
+end
+
 local function mapRouteGoal(rootPart, now)
     refreshRouteAnchors(now)
+    if not state.routeInitialized and #state.routeAnchors > 0 then
+        state.routeInitialized = true
+        -- The first route request may come after several visible fights.
+        -- Start from the checkpoint in the current room, not room one.
+        if state.kills > 0 or state.routeHasCombat then
+            syncRouteToCurrentRoom(rootPart, 40)
+        end
+    end
     while true do
         local anchor = state.routeAnchors[state.routeAnchorIndex]
         if not anchor then return nil end
         if not anchor.part.Parent then
-            state.routeDungeon, state.routeScannedAt = nil, -math.huge
+            state.routeAnchors, state.routeScannedAt = {}, -math.huge
             refreshRouteAnchors(now)
             anchor = state.routeAnchors[state.routeAnchorIndex]
             if not anchor then return nil end
@@ -1374,6 +1418,7 @@ local function mapRouteGoal(rootPart, now)
         -- because its XZ projection is nearby.
         if flat <= 12 and math.abs(delta.Y) <= 9
             and not hasBlockingRay(rootPart.Position, anchor.part.Position, rootPart.Parent, anchor.part) then
+            state.routeProgress = { order = anchor.order, name = anchor.name }
             state.routeAnchorIndex = state.routeAnchorIndex + 1
         else
             return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
@@ -3644,6 +3689,7 @@ local function controllerTick()
         state.wallVisits, state.wallFlips = {}, 0
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
+    if #state.routeAnchors > 0 then mapRouteGoal(rootPart, now) end
     -- Doomed round: same target for 3 minutes with zero kills and zero damage
     -- dealt (e.g. mob under the map behind a wall that never opens). Solo
     -- only, so nobody else's run is ever touched. Leaves via teleToLobby.
@@ -3825,6 +3871,13 @@ local function controllerTick()
         return
     end
     state.navigationPhase = "combat"
+    if distance <= CFG.ATTACK_RANGE then
+        state.routeHasCombat = true
+        if #state.routeAnchors > 0 and now - (state.lastRouteSync or -math.huge) >= 1 then
+            state.lastRouteSync = now
+            syncRouteToCurrentRoom(rootPart, 18)
+        end
+    end
     faceEnemy(humanoid, rootPart, targetRoot)
 
     if protectorApproach then
@@ -3938,6 +3991,7 @@ local function setRunning(running)
         state.routeFails, state.wanderGoal, state.wanderUntil = 0, nil, 0
         state.wallSide, state.wallVisits, state.wallFlips = nil, {}, 0
         state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = nil, {}, 1
+        state.routeProgress, state.routeInitialized, state.routeHasCombat = nil, false, false
         state.routeScannedAt = -math.huge
         state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
@@ -4064,6 +4118,7 @@ connect(player.CharacterAdded, function(character)
     state.fallbackGoal, state.fallbackUntil = nil, 0
     state.lastPlayerHealth, state.lastTargetScan = nil, 0
     state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = nil, {}, 1
+    state.routeProgress, state.routeInitialized, state.routeHasCombat = nil, false, false
     state.routeScannedAt = -math.huge
     state.pathUpdateTime = 0
     state.stuckStartTime, state.stuckCount = 0, 0
