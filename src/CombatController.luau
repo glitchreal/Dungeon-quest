@@ -273,13 +273,14 @@ end
 local function clearHazardLabels()
     for key, entry in pairs(state.hazardLabels) do
         if entry.gui then entry.gui:Destroy() end
-        if entry.anchor then entry.anchor:Destroy() end
+        if entry.anchor and entry.anchor.Parent == state.hazardLabelFolder then entry.anchor:Destroy() end
         state.hazardLabels[key] = nil
     end
     if state.hazardLabelFolder then
         state.hazardLabelFolder:Destroy()
         state.hazardLabelFolder = nil
     end
+    state.lastHazardLabelUpdate = nil
 end
 
 local function updateHazardLabels(rootPart)
@@ -289,35 +290,45 @@ local function updateHazardLabels(rootPart)
     end
     local playerGui = player:FindFirstChildOfClass("PlayerGui")
     if not playerGui then return end
+    local now = os.clock()
+    if state.lastHazardLabelUpdate and now - state.lastHazardLabelUpdate < 0.15 then return end
+    state.lastHazardLabelUpdate = now
+    if state.hazardLabelFolder and not state.hazardLabelFolder.Parent then clearHazardLabels() end
     if not state.hazardLabelFolder then
         state.hazardLabelFolder = Instance.new("Folder")
         state.hazardLabelFolder.Name = "ObsidianHazardLabelAnchors"
         state.hazardLabelFolder.Parent = Workspace
     end
-    local active = {}
-    local shown = 0
+    local nearby = {}
     for _, zone in ipairs(state.activeZones) do
-        if shown >= 12 then break end
+        local clearance = ThreatGeometry.clearance(zone, rootPart.Position, 0)
+        if clearance < 30 then table.insert(nearby, { zone = zone, clearance = clearance }) end
+    end
+    table.sort(nearby, function(a, b) return a.clearance < b.clearance end)
+    local active = {}
+    for index = 1, math.min(6, #nearby) do
+        local zone = nearby[index].zone
         local name, shape = hazardDisplayName(zone), hazardDisplayShape(zone)
         local position = zone.frame.Position
-        local key = table.concat({ name, shape, math.floor(position.X / 3), math.floor(position.Y / 3), math.floor(position.Z / 3) }, ":")
+        local key = zone.id or table.concat({ name, shape, math.floor(position.X / 3), math.floor(position.Y / 3), math.floor(position.Z / 3) }, ":")
         if not active[key] then
             active[key] = true
-            shown = shown + 1
-            local clearance = ThreatGeometry.clearance(zone, rootPart.Position, 0)
+            local clearance = nearby[index].clearance
             local planningClearance = ThreatGeometry.clearance(zone, rootPart.Position, CFG.HAZARD_MARGIN)
             local decision = planningClearance < 0 and "DODGE" or "WATCH"
             local entry = state.hazardLabels[key]
-            local anchor = typeof(zone.id) == "Instance" and zone.id:IsA("BasePart") and zone.id or nil
+            if entry and (not entry.anchor or entry.anchor.Parent ~= state.hazardLabelFolder or not entry.gui or not entry.gui.Parent) then
+                if entry.gui then entry.gui:Destroy() end
+                if entry.anchor and entry.anchor.Parent == state.hazardLabelFolder then entry.anchor:Destroy() end
+                state.hazardLabels[key] = nil
+                entry = nil
+            end
             if not entry then
-                entry = {}
-                if not anchor then
-                    anchor = Instance.new("Part")
-                    anchor.Name = "HazardLabelAnchor"
-                    anchor.Anchored, anchor.CanCollide, anchor.CanTouch, anchor.CanQuery = true, false, false, false
-                    anchor.Transparency, anchor.Size = 1, Vector3.new(0.2, 0.2, 0.2)
-                    anchor.Parent = state.hazardLabelFolder
-                end
+                local anchor = Instance.new("Part")
+                anchor.Name = "HazardLabelAnchor"
+                anchor.Anchored, anchor.CanCollide, anchor.CanTouch, anchor.CanQuery = true, false, false, false
+                anchor.Transparency, anchor.Size = 1, Vector3.new(0.2, 0.2, 0.2)
+                anchor.Parent = state.hazardLabelFolder
                 local gui = Instance.new("BillboardGui")
                 gui.Name = "HazardLabel"
                 gui.AlwaysOnTop, gui.MaxDistance = true, 180
@@ -334,14 +345,7 @@ local function updateHazardLabels(rootPart)
                 entry = { gui = gui, anchor = anchor, label = label }
                 state.hazardLabels[key] = entry
             end
-            if not entry.anchor.Parent then entry.anchor.Parent = state.hazardLabelFolder end
-            if entry.anchor ~= anchor and anchor then
-                entry.anchor = anchor
-                entry.gui.Adornee = anchor
-            end
-            if entry.anchor ~= zone.id then
-                pcall(function() entry.anchor.CFrame = zone.frame end)
-            end
+            entry.anchor.CFrame = zone.frame
             entry.label.Text = string.format("%s | %s\n%s %.1f", decision, name, shape, clearance)
             entry.label.TextColor3 = planningClearance < 0 and Color3.fromRGB(255, 90, 80)
                 or planningClearance < 3 and Color3.fromRGB(255, 210, 80)
