@@ -482,6 +482,14 @@ local function connect(signal, callback)
     return connection
 end
 
+local northernMechanics = NorthernLandsController.new({
+    workspace = Workspace,
+    player = player,
+    threatGeometry = ThreatGeometry,
+    connect = connect,
+})
+state.mechanicState = northernMechanics.State
+
 local humanoidModels = {}
 -- PrecastHitbox and similar effects are transient BaseParts. Tracking additions
 -- lets the dodge check remain cheap and catches indicators created under Workspace.
@@ -813,17 +821,51 @@ local function syncRouteToCurrentRoom(rootPart, maxDistance)
         state.routeProgress = { order = anchor.order, name = anchor.name }
         state.routeAnchorIndex = nearestIndex + 1
     end
+    return nearestIndex, nearestDistance
+end
+
+local function initializeRouteProgress(rootPart)
+    -- The loader may start in the middle of a run. Controller-local kill and
+    -- combat counters are then still zero, so using them to decide whether to
+    -- synchronize sends the route back to room one. Always accept a nearby,
+    -- visible checkpoint as authored proof of the current room.
+    local synced = syncRouteToCurrentRoom(rootPart, 55)
+    if synced or #state.routeAnchors < 2 then return end
+
+    -- Large rooms can put their checkpoint outside the local radius. Only use
+    -- the broader search when a later visible checkpoint is substantially
+    -- closer than the first remaining anchor; this avoids skipping room one
+    -- from the dungeon spawn while still repairing mid-run attachment.
+    local first = state.routeAnchors[state.routeAnchorIndex]
+    if not first or not first.part.Parent then return end
+    local firstDistance = Vector3.new(rootPart.Position.X - first.part.Position.X, 0,
+        rootPart.Position.Z - first.part.Position.Z).Magnitude
+    local bestIndex, bestDistance
+    for index = state.routeAnchorIndex + 1, #state.routeAnchors do
+        local anchor = state.routeAnchors[index]
+        if anchor.part.Parent then
+            local delta = rootPart.Position - anchor.part.Position
+            local distance = Vector3.new(delta.X, 0, delta.Z).Magnitude
+            if distance <= 120 and math.abs(delta.Y) <= 14
+                and distance + 28 < firstDistance
+                and (not bestDistance or distance < bestDistance)
+                and not hasBlockingRay(rootPart.Position, anchor.part.Position, rootPart.Parent, anchor.part) then
+                bestIndex, bestDistance = index, distance
+            end
+        end
+    end
+    if bestIndex then
+        local anchor = state.routeAnchors[bestIndex]
+        state.routeProgress = { order = anchor.order, name = anchor.name }
+        state.routeAnchorIndex = bestIndex + 1
+    end
 end
 
 local function mapRouteGoal(rootPart, now)
     refreshRouteAnchors(now)
     if not state.routeInitialized and #state.routeAnchors > 0 then
         state.routeInitialized = true
-        -- The first route request may come after several visible fights.
-        -- Start from the checkpoint in the current room, not room one.
-        if state.kills > 0 or state.routeHasCombat then
-            syncRouteToCurrentRoom(rootPart, 40)
-        end
+        initializeRouteProgress(rootPart)
     end
     while true do
         local anchor = state.routeAnchors[state.routeAnchorIndex]
@@ -2985,6 +3027,52 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     return true
 end
 
+local function northernMechanicIntent(humanoid, rootPart, target, targetRoot, now)
+    return northernMechanics:Update({
+        now = now,
+        humanoid = humanoid,
+        rootPart = rootPart,
+        target = target,
+        targetRoot = targetRoot,
+        zones = state.activeZones,
+        ground = function(position)
+            return groundPosition(position, rootPart.Parent, target)
+        end,
+        walkable = function(position)
+            return walkingSegmentClear(rootPart, position, target)
+                and safeEnemyStep(rootPart.Position, position)
+        end,
+    })
+end
+
+local function executeNorthernMechanic(intent, humanoid, rootPart, target, targetRoot, now, distance)
+    if not intent then return false end
+    if state.motionMode ~= "mechanic" and state.motionMode ~= "mechanic-hold" then
+        clearPath()
+        state.motionGoal, state.fallbackGoal = nil, nil
+    end
+    state.escapeGoal, state.escapeUntil, state.escapeReason = nil, 0, nil
+    state.combatIntent, state.lastProgressGoal = nil, nil
+    state.navigationPhase = "mechanic"
+    state.status = intent.reason or ("Solving " .. tostring(intent.mechanic))
+    if intent.hold or not intent.goal
+        or Vector3.new(intent.goal.X - rootPart.Position.X, 0, intent.goal.Z - rootPart.Position.Z).Magnitude <= 1.5 then
+        stopMovement(humanoid, rootPart)
+        state.motionMode = "mechanic-hold"
+    else
+        if intent.forceBlink then
+            dodgeAlongEscape(humanoid, rootPart, intent.goal, target, intent.threat, now, true)
+        end
+        issueMove(humanoid, intent.goal, "mechanic", now, true)
+    end
+    if targetRoot then faceEnemy(humanoid, rootPart, targetRoot) end
+    if intent.allowAttack and target and targetRoot and distance <= CFG.ATTACK_RANGE
+        and not hasBlockingRay(rootPart.Position, targetRoot.Position, rootPart.Parent, target) then
+        castSkill()
+    end
+    return true
+end
+
 -- Keep a chosen combat orbit point briefly. Re-sample when the enemy moves,
 -- the route becomes unsafe, or a dodge takes ownership of movement.
 local function combatPosition(rootPart, target, targetRoot, baseGoal, now)
@@ -3081,6 +3169,8 @@ local function controllerTick()
         state.retreating = false
         state.targetName, state.targetDist = "None", 0
         state.currentTarget, state.lockedTarget = nil, nil
+        local mechanicIntent = northernMechanicIntent(humanoid, rootPart, nil, nil, now)
+        if executeNorthernMechanic(mechanicIntent, humanoid, rootPart, nil, nil, now, math.huge) then return end
         if CFG.AUTO_DODGE then
             local currentRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
             if currentRisk > 0 then
@@ -3169,6 +3259,16 @@ local function controllerTick()
         end
     end
     state.prevHealth[target] = targetHumanoid.Health
+    local mechanicIntent = northernMechanicIntent(humanoid, rootPart, target, targetRoot, now)
+    local mechanicEmergency = mechanicIntent and mechanicIntent.emergencyFirst
+        and handleSafety(humanoid, rootPart, target, targetRoot, now)
+    if mechanicEmergency then
+        state.combatIntent, state.lastProgressGoal = nil, nil
+        state.navigationPhase = "evade"
+        faceEnemy(humanoid, rootPart, targetRoot)
+        return
+    end
+    if executeNorthernMechanic(mechanicIntent, humanoid, rootPart, target, targetRoot, now, distance) then return end
     if handleSafety(humanoid, rootPart, target, targetRoot, now) then
         state.combatIntent, state.lastProgressGoal = nil, nil
         state.navigationPhase = "evade"
@@ -3624,7 +3724,7 @@ local function exportDodgeMemory()
     return { Version = 1, Entries = entries }
 end
 
-print("[EnemyWalker] loaded: original-local radial-overlap-v3, event-driven hazards, bounded teleport dodges")
+print("[EnemyWalker] loaded: northern-mechanics-v1, event-driven hazards, bounded teleport dodges")
 
 return {
     Config = CFG,
