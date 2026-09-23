@@ -1954,6 +1954,46 @@ end
 return Planner
 
 end)()
+local AttackPolicy = (function()
+-- Attack reach is independent of whether the enemy's floor is walkable.
+local Policy = {}
+local blockedFlags = { invulnerable = true, invincible = true, immune = true,
+    damageable = false, candamage = false, canbedamaged = false, attackable = false }
+
+function Policy.damageable(model)
+    if not model or not model.Parent then return false end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return false end
+    -- Only explicit boolean damage-state evidence is authoritative. Anchored,
+    -- elevation, animation and a generic Active flag do not imply immunity.
+    for _, instance in ipairs({ model, humanoid }) do
+        for name, value in pairs(instance:GetAttributes()) do
+            if type(value) == "boolean" and blockedFlags[name:lower()] == value then return false end
+        end
+        for _, child in ipairs(instance:GetChildren()) do
+            if child:IsA("BoolValue") and blockedFlags[child.Name:lower()] == child.Value then return false end
+        end
+    end
+    return true
+end
+
+function Policy.range(profile, fallback)
+    if profile.mode == "self" then return profile.radius or profile.range or fallback end
+    if profile.mode == "target" or profile.mode == "splash" then return profile.range or fallback end
+    return nil
+end
+
+function Policy.inRange(origin, target, range)
+    return range ~= nil and (target - origin).Magnitude <= range
+end
+
+function Policy.horizontalRange(range, height)
+    return math.sqrt(math.max(0, range * range - height * height))
+end
+
+return Policy
+
+end)()
 local function createController()
 -- Obsidian dungeon combat controller; creates no separate UI.
 -- The controller has one movement owner: dodge goals preempt combat goals,
@@ -4481,21 +4521,26 @@ local function spellUsable(snapshot, rootPart)
     end
     if profile.mode == "self" then
         for _, enemy in ipairs(state.nearbyEnemies) do
-            if isValidTarget(enemy.model) and (enemy.root.Position - rootPart.Position).Magnitude <= (profile.radius or profile.range or CFG.CLOSE_AOE_RANGE) then
+            if isValidTarget(enemy.model) and AttackPolicy.damageable(enemy.model)
+                and not hasBlockingRay(rootPart.Position, enemy.root.Position, rootPart.Parent, enemy.model)
+                and (enemy.root.Position - rootPart.Position).Magnitude <= (profile.radius or profile.range or CFG.CLOSE_AOE_RANGE) then
                 return true
             end
         end
         return false
     end
-    if state.targetDist > effectiveSpellRange(profile) then return false end
-    return true
+    local target = state.currentTarget
+    local targetRoot = target and getRootPart(target)
+    return isValidTarget(target) and AttackPolicy.damageable(target) and targetRoot ~= nil
+        and AttackPolicy.inRange(rootPart.Position, targetRoot.Position, effectiveSpellRange(profile))
+        and not hasBlockingRay(rootPart.Position, targetRoot.Position, rootPart.Parent, target)
 end
 
 local function prepareSpell(_, snapshot)
-    if not CFG.SMART_FARM then return true end
     local character, humanoid, rootPart = getChar()
     if not character or not humanoid or not rootPart then return false end
     if not spellUsable(snapshot, rootPart) then return false end
+    if not CFG.SMART_FARM then return true end
     local profile = FarmPlanner.profile(snapshot)
     if profile.mode == "target" and state.targetDist > effectiveSpellRange(profile) then return false end
     if profile.mode ~= "splash" then return true end
@@ -4506,7 +4551,7 @@ local function prepareSpell(_, snapshot)
         or now - plan.at >= 0.2 or not isValidTarget(plan.target) then
         local candidates = {}
         for _, model in ipairs(state.cachedTargets) do
-            if isValidTarget(model) then
+            if isValidTarget(model) and AttackPolicy.damageable(model) then
                 local root = getRootPart(model)
                 local distance = (root.Position - rootPart.Position).Magnitude
                 if distance <= range then
@@ -4533,7 +4578,7 @@ local function prepareSpell(_, snapshot)
         state.farmPlan = plan
     end
     local target = plan.target
-    if not isValidTarget(target) then return false end
+    if not isValidTarget(target) or not AttackPolicy.damageable(target) then return false end
     local targetRoot = getRootPart(target)
     if (targetRoot.Position - rootPart.Position).Magnitude > range
         or hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then return false end
@@ -5192,6 +5237,64 @@ local function combatPosition(rootPart, target, targetRoot, baseGoal, now)
     return goal
 end
 
+local function firingPosition(rootPart, target, targetRoot, now)
+    local range = 0
+    for _, snapshot in pairs(abilities.Snapshot(now)) do
+        local profile = FarmPlanner.profile(snapshot)
+        local reach = AttackPolicy.range(profile, profile.mode == "self" and CFG.CLOSE_AOE_RANGE
+            or effectiveSpellRange(profile))
+        range = math.max(range, reach or 0)
+    end
+    if range == 0 or not AttackPolicy.damageable(target) then return nil end
+    local function canFire(position)
+        return AttackPolicy.inRange(position, targetRoot.Position, range)
+            and not hasBlockingRay(position, targetRoot.Position, rootPart.Parent, target)
+    end
+    if canFire(rootPart.Position) then return rootPart.Position end
+    local cached = state.firingPosition
+    if cached and cached.target == target and now - cached.at < 0.5
+        and (cached.origin - rootPart.Position).Magnitude < 4
+        and (cached.targetPosition - targetRoot.Position).Magnitude < 3
+        and (not cached.goal or canFire(cached.goal)
+            and ThreatGeometry.risk(state.activeZones, cached.goal, CFG.HAZARD_MARGIN) == 0
+            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, cached.goal, CFG.HAZARD_MARGIN)) then
+        return cached.goal
+    end
+    local best, bestCost
+    local params = buildRaycastParams(rootPart.Parent, target)
+    params.RespectCanCollide = true
+    -- Probe from the player's floor, not from above the enemy's platform.
+    -- Only choose locally walkable, hazard-free firing positions; otherwise
+    -- retain the regular doorway/stair navigation fallback.
+    for _, radius in ipairs({ 8, 16 }) do
+        for index = 0, 7 do
+            local angle = index * math.pi / 4
+            local sample = rootPart.Position + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+            local floor = Workspace:Raycast(sample + Vector3.new(0, 4, 0), Vector3.new(0, -12, 0), params)
+            if floor and floor.Normal.Y >= 0.55 then
+                local point = floor.Position + Vector3.new(0, 2.5, 0)
+                if canFire(point) and walkingSegmentClear(rootPart, point, target)
+                    and safeEnemyStep(rootPart.Position, point)
+                    and ThreatGeometry.risk(state.activeZones, point, CFG.HAZARD_MARGIN) == 0
+                    and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, point, CFG.HAZARD_MARGIN) then
+                    local cost = (point - rootPart.Position).Magnitude
+                    if not bestCost or cost < bestCost then best, bestCost = point, cost end
+                end
+            end
+        end
+    end
+    state.firingPosition = { target = target, targetPosition = targetRoot.Position,
+        origin = rootPart.Position, at = now, goal = best }
+    return best
+end
+
+local function combatGroundPosition(rootPart, target, targetRoot, direction)
+    local height = targetRoot.Position.Y - rootPart.Position.Y
+    local spacing = math.min(CFG.COMBAT_DISTANCE, AttackPolicy.horizontalRange(CFG.ATTACK_RANGE * 0.9, height))
+    local center = Vector3.new(targetRoot.Position.X, rootPart.Position.Y, targetRoot.Position.Z)
+    return groundPosition(center + direction * spacing, rootPart.Parent, target)
+end
+
 local function controllerTick()
     if not state.running or state.closed then return end
     local character, humanoid, rootPart = getChar()
@@ -5354,6 +5457,34 @@ local function controllerTick()
         faceEnemy(humanoid, rootPart, targetRoot)
         if distance <= CFG.ATTACK_RANGE and not hasBlockingRay(rootPart.Position, targetRoot.Position, character, target) then castSkill() end
         return
+    end
+
+    if not AttackPolicy.damageable(target) then
+        state.status = "Waiting for damageable phase: " .. target.Name
+        stopMovement(humanoid, rootPart)
+        faceEnemy(humanoid, rootPart, targetRoot)
+        return
+    end
+    -- Mechanic/safety owners ran first. Attack eligibility does not depend on
+    -- reaching the target's floor or entering a particular boss animation.
+    faceEnemy(humanoid, rootPart, targetRoot)
+    castSkill()
+    if not protectorRear and math.abs(targetRoot.Position.Y - rootPart.Position.Y) > 6 then
+        local firingGoal = firingPosition(rootPart, target, targetRoot, now)
+        if firingGoal then
+            state.navigationPhase = "combat"
+            state.status = "Attacking from ground: " .. target.Name
+            state.routeFails, state.climbDySince = 0, nil
+            state.unreachableTargets[target] = nil
+            adaptiveNavigation:Cancel("reachable firing position")
+            if (firingGoal - rootPart.Position).Magnitude <= 2 then
+                stopMovement(humanoid, rootPart)
+            else
+                followGoal(humanoid, rootPart, firingGoal, "combat", now, target)
+                updateProgress(humanoid, rootPart, firingGoal, target, now)
+            end
+            return
+        end
     end
 
     -- Long approaches use the room graph even when a replicated enemy is
@@ -5531,7 +5662,7 @@ local function controllerTick()
         local offset = rootPart.Position - targetRoot.Position
         local flat = Vector3.new(offset.X, 0, offset.Z)
         if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
-        local basePosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+        local basePosition = combatGroundPosition(rootPart, target, targetRoot, flat.Unit)
         local desiredPosition = combatPosition(rootPart, target, targetRoot, basePosition, now)
         if (desiredPosition - rootPart.Position).Magnitude > 1 then
             followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
@@ -5556,7 +5687,9 @@ local function controllerTick()
             flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi / 6):VectorToWorldSpace(radial)
         end
     end
-    local basePosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+    local basePosition = protectorRear
+        and groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+        or combatGroundPosition(rootPart, target, targetRoot, flat.Unit)
     local desiredPosition = protectorRear
         and combatPosition(rootPart, target, targetRoot, basePosition, now) or basePosition
     if (Vector3.new(desiredPosition.X - rootPart.Position.X, 0, desiredPosition.Z - rootPart.Position.Z)).Magnitude < 2 then
