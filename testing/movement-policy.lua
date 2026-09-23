@@ -71,4 +71,23 @@ solver._intent={mechanic="PROJECTILE_ESCAPE",goal=v(25,0,0)}
 solver._intentUntil=10
 assert(solver:_reuse(context,"PROJECTILE_ESCAPE",nil,0.2) == nil,
     "a newly unsafe crossing invalidates a leased mechanic route even when its endpoint is safe")
+local slam = block(0,67)
+slam.shape, slam.size, slam.id, slam.live = "Sphere", v(67,67,67), {}, true
+assert(Geometry.clearance(slam,v(34,0,0),0) == Geometry.clearance(slam,v(0,0,34),0),
+    "spherical slam clearance must not depend on the warning cylinder's axis")
+assert(Geometry.radialRadiusAtHeight(slam,v(0,0,0),5) == 38.5)
+assert(Geometry.radialRadiusAtHeight(slam,v(0,50,0),5) == nil)
+context.zones, context.now = {slam}, 2
+solver._intent, solver._slam = nil, nil
+solver._escapeSide = 1
+local escape = solver:_slamIntent(context,slam)
+assert(solver._slam.committed, "visible overlapping slam starts escape without waiting in bait phase")
+assert(escape and Geometry.clearance(slam,escape.goal,5) > 0,
+    "escape must clear the 67-stud hitbox rather than stop at the old 21-stud sample radius")
+assert(escape.allowAttack, "slam movement must permit independently validated casting")
+local shot = block(0,8)
+context.zones = {shot}
+solver._intent = nil
+assert(solver:_projectileIntent(context,shot).allowAttack,
+    "projectile evasion does not disable eligible abilities")
 print("Movement policy checks passed")

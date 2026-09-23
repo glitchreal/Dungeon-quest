@@ -186,7 +186,7 @@ local function hazardDisplayName(zone)
 end
 
 local function hazardDisplayShape(zone)
-    if zone.shape == "Cylinder" then return "radial" end
+    if zone.shape == "Cylinder" or zone.shape == "Sphere" then return "radial" end
     if zone.shape == "Projectile" then return "projectile" end
     if zone.shape == "ProtectorSmash" then return "expanding" end
     if zone.shape == "Block" then
@@ -1832,8 +1832,8 @@ local function refreshSafety(rootPart, now)
                     local geometryVelocity = geometryPart.AssemblyLinearVelocity
                     if geometryVelocity.Magnitude < 1 then geometryVelocity = velocity end
                     local cylinder = geometryPart:IsA("Part") and geometryPart.Shape == Enum.PartType.Cylinder
-                        or part:IsA("Part") and part.Shape == Enum.PartType.Cylinder
-                    local shape = projectile and "Projectile" or (cylinder and "Cylinder" or "Block")
+                    local sphere = geometryPart:IsA("Part") and geometryPart.Shape == Enum.PartType.Ball
+                    local shape = projectile and "Projectile" or (sphere and "Sphere" or (cylinder and "Cylinder" or "Block"))
                     local radialGrowth = 0
                     if shape == "Cylinder" and geometryPart.Size.X <= 4 then
                         local radius = math.max(geometryPart.Size.Y, geometryPart.Size.Z) * 0.5
@@ -2536,7 +2536,7 @@ end
 local function prepareSpell(_, snapshot)
     local character, humanoid, rootPart = getChar()
     if not character or not humanoid or not rootPart then return false end
-    if not spellUsable(snapshot, rootPart) then return false end
+    if not spellUsable(snapshot, rootPart) then return false, "no damageable target in spell reach" end
     local profile = FarmPlanner.profile(snapshot)
     if profile.geometry == "forwardBurst" then
         local target = state.currentTarget
@@ -2546,8 +2546,10 @@ local function prepareSpell(_, snapshot)
         faceEnemy(humanoid, rootPart, targetRoot)
         -- AlignOrientation takes time to turn. Recheck the actual facing before
         -- activation so the forward burst is not fired behind the boss.
-        return AttackPolicy.canHit(profile, rootPart.Position, targetRoot.Position,
+        local aligned = AttackPolicy.canHit(profile, rootPart.Position, targetRoot.Position,
             effectiveSpellRange(profile), nil, rootPart.CFrame.LookVector)
+        if not aligned then return false, "turning Geyser toward target" end
+        return true
     end
     if not CFG.SMART_FARM then return true end
     if profile.mode == "target" and state.targetDist > effectiveSpellRange(profile) then return false end
@@ -2598,9 +2600,11 @@ local function prepareSpell(_, snapshot)
 end
 
 local function castSkill()
-    if not CFG.AUTO_ABILITIES then return end
+    if not CFG.AUTO_ABILITIES then state.castStatus = "abilities disabled"; return end
     local now = os.clock()
-    if abilities.TryCast(now, CFG.SKILL_COOLDOWN, prepareSpell) then state.lastSkillTime = now end
+    local requested, reason = abilities.TryCast(now, CFG.SKILL_COOLDOWN, prepareSpell)
+    state.castStatus = reason
+    if requested then state.lastSkillTime = now end
 end
 
 local function stopMovement(humanoid, rootPart)
@@ -3503,6 +3507,7 @@ local function controllerTick()
         state.combatIntent, state.lastProgressGoal = nil, nil
         state.navigationPhase = "evade"
         faceEnemy(humanoid, rootPart, targetRoot)
+        castSkill()
         return
     end
     if executeNorthernMechanic(mechanicIntent, humanoid, rootPart, target, targetRoot, now, distance) then return end

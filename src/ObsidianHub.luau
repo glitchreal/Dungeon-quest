@@ -674,7 +674,7 @@ local function slowTick(now)
     setLabel("CombatTarget", "Target: " .. (combatState.targetName or "none") .. " | " .. math.floor(combatState.targetDist or 0) .. " studs")
     local targetHumanoid = combatState.currentTarget and combatState.currentTarget:FindFirstChildOfClass("Humanoid")
     setLabel("CombatHealth", targetHumanoid and ("Target HP: " .. math.ceil(targetHumanoid.Health) .. "/" .. math.ceil(targetHumanoid.MaxHealth)) or "Target HP: -")
-    setLabel("FarmAim", C.SmartFarm and ("Last splash aim: " .. (combatState.groupCount or 0) .. " nearby enemies (estimate)") or "Smart farming: off")
+    setLabel("FarmAim", "Casting: " .. (combatState.castStatus or "waiting for combat"))
     local abilityStatus = controller.AbilityStatus and controller.AbilityStatus() or {}
     for _, slot in ipairs({ "q", "e" }) do
         local ability = abilityStatus[slot]

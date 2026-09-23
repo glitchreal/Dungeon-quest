@@ -74,3 +74,34 @@ holds request the existing safety controller before executing. The focused
 movement check covers clear-lane release, safe movement around a blocking beam,
 and interruption of an unsafe leased crossing. Live client controls were not
 replaced, and no repeated dungeon tests were run.
+
+## Slam shape, escape distance, and attack suppression
+
+Another read-only inspection confirmed the current Geyser forward-burst profile
+was loaded and cast counters increased. Its most recent damage record was a
+747,451,392 HP hit during "Escaping committed slam and beam geometry".
+The replicated `enemyProjectiles.firstBossJumpSlam` template has a cylindrical
+4×67×67 warning marker rotated -90 degrees and a spherical 67×67×67 hitbox with
+zero rotation. The scanner used the hitbox frame but inherited Cylinder from
+the marker. Collision shape now comes exclusively from the actual geometry part;
+spheres have orientation-independent clearance.
+
+The old escape candidates stopped at 21 studs, which cannot exit this slam from
+near its center. New candidates lie beyond the actual radial boundary at the
+player's height, with wall/hazard checks retained. The controller starts leaving
+an overlapping visible slam without consuming a bait delay. These are walking
+goals; blink distance and rolling budgets are unchanged. Destination forecasting
+uses actual walking travel time rather than capping it at 1.5 seconds.
+
+Slam bait/escape and projectile escape now permit independent validated casting
+after their movement decision. Emergency movement can also cast after facing;
+damageability, spell geometry, actual facing and cooldown checks remain active.
+The existing FarmAim label now reports cast status, including cooldown, busy
+casting, reach rejection, alignment, or a cast request. Requests still count as
+confirmed casts only when the game exposes their cooldown transition.
+
+The offline movement check covers spherical symmetry, radius at player height,
+immediate escape, destinations outside the 67-stud slam, and attack permission
+during slam/projectile movement. This confirms policy behavior, not live survival
+or statue-phase damage after the patch. No runtime replacement or dungeon loop
+was performed.

@@ -29,6 +29,9 @@ end
 local function clearanceSingle(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
+    if zone.shape == "Sphere" then
+        return (position - zone.frame.Position).Magnitude - math.max(half.X, half.Y, half.Z) - margin
+    end
     if zone.shape == "ProtectorSmash" then
         -- Smash corridors earn extra margin: they expand after being modeled
         -- and every recent death landed a few studs inside the modeled edge.
@@ -75,6 +78,21 @@ local function clearanceSingle(zone, position, margin, arrivalTime)
     local height = math.abs(point.Y) - half.Y - BASE_MARGIN
     if height > 0 then return height end
     return math.max(math.abs(point.X) - half.X - margin, math.abs(point.Z) - half.Z - margin)
+end
+
+-- Horizontal boundary of a radial hitbox at the player's current height.
+-- Collision shape/frame belong to the hitbox, not its floor warning marker.
+function Geometry.radialRadiusAtHeight(zone, position, margin)
+    if zone.shape == "Sphere" then
+        local radius = math.max(zone.size.X, zone.size.Y, zone.size.Z) * 0.5 + margin
+        local height = math.abs(position.Y - zone.frame.Position.Y)
+        if height >= radius then return nil end
+        return math.sqrt(radius * radius - height * height)
+    elseif zone.shape == "Cylinder" and math.abs(zone.frame.RightVector.Y) > 0.8 then
+        if math.abs(position.Y - zone.frame.Position.Y) > zone.size.X * 0.5 + BASE_MARGIN then return nil end
+        return projectedCircleRadius(zone, 0.35) + margin
+    end
+    return nil
 end
 
 function Geometry.clearance(zone, position, margin, arrivalTime)

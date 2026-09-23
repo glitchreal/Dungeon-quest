@@ -231,6 +231,9 @@ end
 local function clearanceSingle(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
+    if zone.shape == "Sphere" then
+        return (position - zone.frame.Position).Magnitude - math.max(half.X, half.Y, half.Z) - margin
+    end
     if zone.shape == "ProtectorSmash" then
         -- Smash corridors earn extra margin: they expand after being modeled
         -- and every recent death landed a few studs inside the modeled edge.
@@ -277,6 +280,21 @@ local function clearanceSingle(zone, position, margin, arrivalTime)
     local height = math.abs(point.Y) - half.Y - BASE_MARGIN
     if height > 0 then return height end
     return math.max(math.abs(point.X) - half.X - margin, math.abs(point.Z) - half.Z - margin)
+end
+
+-- Horizontal boundary of a radial hitbox at the player's current height.
+-- Collision shape/frame belong to the hitbox, not its floor warning marker.
+function Geometry.radialRadiusAtHeight(zone, position, margin)
+    if zone.shape == "Sphere" then
+        local radius = math.max(zone.size.X, zone.size.Y, zone.size.Z) * 0.5 + margin
+        local height = math.abs(position.Y - zone.frame.Position.Y)
+        if height >= radius then return nil end
+        return math.sqrt(radius * radius - height * height)
+    elseif zone.shape == "Cylinder" and math.abs(zone.frame.RightVector.Y) > 0.8 then
+        if math.abs(position.Y - zone.frame.Position.Y) > zone.size.X * 0.5 + BASE_MARGIN then return nil end
+        return projectedCircleRadius(zone, 0.35) + margin
+    end
+    return nil
 end
 
 function Geometry.clearance(zone, position, margin, arrivalTime)
@@ -1164,7 +1182,7 @@ function NorthernLands:_candidateScore(context, candidate, desired, options)
     candidate = self:_ground(context, candidate)
     if context.walkable and not context.walkable(candidate) then return nil end
     local distance = flat(candidate - context.rootPart.Position).Magnitude
-    local arrival = math.min(1.5, distance / math.max(context.humanoid.WalkSpeed, 1))
+    local arrival = distance / math.max(context.humanoid.WalkSpeed, 1)
     local risk = self:_risk(context, candidate, options.margin or 4, arrival)
     local worst, sum = self:_pathRisk(context, candidate, options.margin or 3)
     local pathSafe = self._geometry.segmentSafe(context.zones, context.rootPart.Position, candidate,
@@ -1554,6 +1572,18 @@ function NorthernLands:_combinedEscape(context, threat, preferSide)
     local radial = unitOr(root - bossPosition)
     local tangent = Vector3.new(-radial.Z, 0, radial.X)
     local candidates = {}
+    if threat then
+        local radius = self._geometry.radialRadiusAtHeight(threat, root, 5)
+        if radius and radius < 90 then
+            local center = Vector3.new(threat.frame.Position.X, root.Y, threat.frame.Position.Z)
+            local away = unitOr(root - center, radial)
+            for index = 0, 11 do
+                -- Candidate walking goals can exceed a blink's 8-stud limit.
+                -- The tactical teleport controller still enforces that limit.
+                table.insert(candidates, center + rotate(away, index * math.pi / 6) * (radius + 2))
+            end
+        end
+    end
     for _, distance in ipairs({ 10, 15, 21 }) do
         for index = 0, 11 do
             local direction = rotate(radial, index * math.pi / 6)
@@ -1592,6 +1622,9 @@ function NorthernLands:_slamIntent(context, zone)
         slam.lastPosition = position
     end
     if zone and zone.live and slam.stableAt and context.now - slam.stableAt >= 0.12 then slam.committed = true end
+    -- A visible damaging footprint already overlapping the player is enough
+    -- evidence to leave now. Do not spend its warning window baiting in place.
+    if zone and self:_risk(context, context.rootPart.Position, 5) > 0 then slam.committed = true end
     if context.now - slam.startedAt >= 0.55 then slam.committed = true end
 
     if not slam.committed then
@@ -1601,12 +1634,12 @@ function NorthernLands:_slamIntent(context, zone)
             if goal and goalRisk < currentRisk then
                 return self:_commitIntent(context, "SLAM_BAIT", NorthernLands.Objective.BAIT_POSITION,
                     goal, "Preserving a clear slam escape lane", 0.2,
-                    { target = zone and zone.id, threat = zone and zone.id })
+                    { target = zone and zone.id, threat = zone and zone.id, allowAttack = true })
             end
         end
         return self:_commitIntent(context, "SLAM_BAIT", NorthernLands.Objective.BAIT_POSITION,
             context.rootPart.Position, "Baiting Midgardian jump slam", 0.14,
-            { target = zone and zone.id, hold = true })
+            { target = zone and zone.id, hold = true, allowAttack = true })
     end
 
     local reused = self:_reuse(context, "SLAM_ESCAPE", zone and zone.id, 0.5)
@@ -1618,7 +1651,7 @@ function NorthernLands:_slamIntent(context, zone)
     slam.escapeAt = context.now
     return self:_commitIntent(context, "SLAM_ESCAPE", NorthernLands.Objective.ESCAPE_AREA,
         goal, "Escaping committed slam and beam geometry", 0.55,
-        { target = zone and zone.id, threat = zone and zone.id,
+        { target = zone and zone.id, threat = zone and zone.id, allowAttack = true,
             forceBlink = currentRisk > 0 and goalRisk < currentRisk })
 end
 
@@ -1647,7 +1680,8 @@ function NorthernLands:_projectileIntent(context, zone)
     local currentRisk = self:_risk(context, context.rootPart.Position, 4)
     return self:_commitIntent(context, "PROJECTILE_ESCAPE", NorthernLands.Objective.CROSS_CORRIDOR,
         goal, "Crossing Northern projectile corridor", 0.38,
-        { target = zone.id, threat = zone.id, forceBlink = currentRisk > 0 and goalRisk < currentRisk })
+        { target = zone.id, threat = zone.id, allowAttack = true,
+            forceBlink = currentRisk > 0 and goalRisk < currentRisk })
 end
 
 function NorthernLands:_beamSector(context, beams)
@@ -1940,29 +1974,38 @@ function Abilities.new(player, onConfirmed)
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local busy = character and character:FindFirstChild("busyCasting")
             local peaceful = player:FindFirstChild("peaceful")
-            if not humanoid or humanoid.Health <= 0 or (busy and busy.Value)
-                or (peaceful and peaceful.Value) or userInput:GetFocusedTextBox() then return false end
-            if now - lastAttempt < interval then return false end
+            if not humanoid or humanoid.Health <= 0 then return false, "character unavailable" end
+            if busy and busy.Value then return false, "busy casting" end
+            if peaceful and peaceful.Value then return false, "peaceful state" end
+            if userInput:GetFocusedTextBox() then return false, "typing" end
+            if now - lastAttempt < interval then return false, "cast interval" end
+            local reason = "cooldown or awaiting confirmation"
             for _, slot in ipairs({ preferred, preferred == "q" and "e" or "q" }) do
                 local tool = slots[slot]
                 local snapshot = snapshots[slot]
                 local pending = tool and requests[tool]
-                if tool and snapshot.cooldown <= 0 and (not pending or now >= pending.retryAt)
-                    and (not prepare or prepare(slot, snapshot)) then
-                    local event = tool:FindFirstChild("localEvent")
-                    local remote = remotes:FindFirstChild("abilityUsed")
-                    if event and event:IsA("BindableEvent") and remote and remote:IsA("RemoteEvent") then
-                        local length = tool:FindFirstChild("cooldownLength")
-                        local retry = math.max(0.75, tonumber(length and length.Value) or 1)
-                        requests[tool] = { at = now, retryAt = now + retry, confirmed = false }
-                        lastAttempt, preferred = now, slot == "q" and "e" or "q"
-                        event:Fire()
-                        remote:FireServer(slot, tool)
-                        return true
+                if tool and snapshot.cooldown <= 0 and (not pending or now >= pending.retryAt) then
+                    local ready, detail = true, nil
+                    if prepare then ready, detail = prepare(slot, snapshot) end
+                    if not ready then
+                        reason = detail or "target or aim not ready"
+                    else
+                        local event = tool:FindFirstChild("localEvent")
+                        local remote = remotes:FindFirstChild("abilityUsed")
+                        if event and event:IsA("BindableEvent") and remote and remote:IsA("RemoteEvent") then
+                            local length = tool:FindFirstChild("cooldownLength")
+                            local retry = math.max(0.75, tonumber(length and length.Value) or 1)
+                            requests[tool] = { at = now, retryAt = now + retry, confirmed = false }
+                            lastAttempt, preferred = now, slot == "q" and "e" or "q"
+                            event:Fire()
+                            remote:FireServer(slot, tool)
+                            return true, "cast requested: " .. tool.Name
+                        end
+                        reason = "ability activation unavailable"
                     end
                 end
             end
-            return false
+            return false, reason
         end,
     }
 end
@@ -2293,7 +2336,7 @@ local function hazardDisplayName(zone)
 end
 
 local function hazardDisplayShape(zone)
-    if zone.shape == "Cylinder" then return "radial" end
+    if zone.shape == "Cylinder" or zone.shape == "Sphere" then return "radial" end
     if zone.shape == "Projectile" then return "projectile" end
     if zone.shape == "ProtectorSmash" then return "expanding" end
     if zone.shape == "Block" then
@@ -3939,8 +3982,8 @@ local function refreshSafety(rootPart, now)
                     local geometryVelocity = geometryPart.AssemblyLinearVelocity
                     if geometryVelocity.Magnitude < 1 then geometryVelocity = velocity end
                     local cylinder = geometryPart:IsA("Part") and geometryPart.Shape == Enum.PartType.Cylinder
-                        or part:IsA("Part") and part.Shape == Enum.PartType.Cylinder
-                    local shape = projectile and "Projectile" or (cylinder and "Cylinder" or "Block")
+                    local sphere = geometryPart:IsA("Part") and geometryPart.Shape == Enum.PartType.Ball
+                    local shape = projectile and "Projectile" or (sphere and "Sphere" or (cylinder and "Cylinder" or "Block"))
                     local radialGrowth = 0
                     if shape == "Cylinder" and geometryPart.Size.X <= 4 then
                         local radius = math.max(geometryPart.Size.Y, geometryPart.Size.Z) * 0.5
@@ -4643,7 +4686,7 @@ end
 local function prepareSpell(_, snapshot)
     local character, humanoid, rootPart = getChar()
     if not character or not humanoid or not rootPart then return false end
-    if not spellUsable(snapshot, rootPart) then return false end
+    if not spellUsable(snapshot, rootPart) then return false, "no damageable target in spell reach" end
     local profile = FarmPlanner.profile(snapshot)
     if profile.geometry == "forwardBurst" then
         local target = state.currentTarget
@@ -4653,8 +4696,10 @@ local function prepareSpell(_, snapshot)
         faceEnemy(humanoid, rootPart, targetRoot)
         -- AlignOrientation takes time to turn. Recheck the actual facing before
         -- activation so the forward burst is not fired behind the boss.
-        return AttackPolicy.canHit(profile, rootPart.Position, targetRoot.Position,
+        local aligned = AttackPolicy.canHit(profile, rootPart.Position, targetRoot.Position,
             effectiveSpellRange(profile), nil, rootPart.CFrame.LookVector)
+        if not aligned then return false, "turning Geyser toward target" end
+        return true
     end
     if not CFG.SMART_FARM then return true end
     if profile.mode == "target" and state.targetDist > effectiveSpellRange(profile) then return false end
@@ -4705,9 +4750,11 @@ local function prepareSpell(_, snapshot)
 end
 
 local function castSkill()
-    if not CFG.AUTO_ABILITIES then return end
+    if not CFG.AUTO_ABILITIES then state.castStatus = "abilities disabled"; return end
     local now = os.clock()
-    if abilities.TryCast(now, CFG.SKILL_COOLDOWN, prepareSpell) then state.lastSkillTime = now end
+    local requested, reason = abilities.TryCast(now, CFG.SKILL_COOLDOWN, prepareSpell)
+    state.castStatus = reason
+    if requested then state.lastSkillTime = now end
 end
 
 local function stopMovement(humanoid, rootPart)
@@ -5610,6 +5657,7 @@ local function controllerTick()
         state.combatIntent, state.lastProgressGoal = nil, nil
         state.navigationPhase = "evade"
         faceEnemy(humanoid, rootPart, targetRoot)
+        castSkill()
         return
     end
     if executeNorthernMechanic(mechanicIntent, humanoid, rootPart, target, targetRoot, now, distance) then return end
@@ -6849,7 +6897,7 @@ local function slowTick(now)
     setLabel("CombatTarget", "Target: " .. (combatState.targetName or "none") .. " | " .. math.floor(combatState.targetDist or 0) .. " studs")
     local targetHumanoid = combatState.currentTarget and combatState.currentTarget:FindFirstChildOfClass("Humanoid")
     setLabel("CombatHealth", targetHumanoid and ("Target HP: " .. math.ceil(targetHumanoid.Health) .. "/" .. math.ceil(targetHumanoid.MaxHealth)) or "Target HP: -")
-    setLabel("FarmAim", C.SmartFarm and ("Last splash aim: " .. (combatState.groupCount or 0) .. " nearby enemies (estimate)") or "Smart farming: off")
+    setLabel("FarmAim", "Casting: " .. (combatState.castStatus or "waiting for combat"))
     local abilityStatus = controller.AbilityStatus and controller.AbilityStatus() or {}
     for _, slot in ipairs({ "q", "e" }) do
         local ability = abilityStatus[slot]

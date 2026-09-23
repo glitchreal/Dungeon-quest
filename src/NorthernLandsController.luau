@@ -363,7 +363,7 @@ function NorthernLands:_candidateScore(context, candidate, desired, options)
     candidate = self:_ground(context, candidate)
     if context.walkable and not context.walkable(candidate) then return nil end
     local distance = flat(candidate - context.rootPart.Position).Magnitude
-    local arrival = math.min(1.5, distance / math.max(context.humanoid.WalkSpeed, 1))
+    local arrival = distance / math.max(context.humanoid.WalkSpeed, 1)
     local risk = self:_risk(context, candidate, options.margin or 4, arrival)
     local worst, sum = self:_pathRisk(context, candidate, options.margin or 3)
     local pathSafe = self._geometry.segmentSafe(context.zones, context.rootPart.Position, candidate,
@@ -753,6 +753,18 @@ function NorthernLands:_combinedEscape(context, threat, preferSide)
     local radial = unitOr(root - bossPosition)
     local tangent = Vector3.new(-radial.Z, 0, radial.X)
     local candidates = {}
+    if threat then
+        local radius = self._geometry.radialRadiusAtHeight(threat, root, 5)
+        if radius and radius < 90 then
+            local center = Vector3.new(threat.frame.Position.X, root.Y, threat.frame.Position.Z)
+            local away = unitOr(root - center, radial)
+            for index = 0, 11 do
+                -- Candidate walking goals can exceed a blink's 8-stud limit.
+                -- The tactical teleport controller still enforces that limit.
+                table.insert(candidates, center + rotate(away, index * math.pi / 6) * (radius + 2))
+            end
+        end
+    end
     for _, distance in ipairs({ 10, 15, 21 }) do
         for index = 0, 11 do
             local direction = rotate(radial, index * math.pi / 6)
@@ -791,6 +803,9 @@ function NorthernLands:_slamIntent(context, zone)
         slam.lastPosition = position
     end
     if zone and zone.live and slam.stableAt and context.now - slam.stableAt >= 0.12 then slam.committed = true end
+    -- A visible damaging footprint already overlapping the player is enough
+    -- evidence to leave now. Do not spend its warning window baiting in place.
+    if zone and self:_risk(context, context.rootPart.Position, 5) > 0 then slam.committed = true end
     if context.now - slam.startedAt >= 0.55 then slam.committed = true end
 
     if not slam.committed then
@@ -800,12 +815,12 @@ function NorthernLands:_slamIntent(context, zone)
             if goal and goalRisk < currentRisk then
                 return self:_commitIntent(context, "SLAM_BAIT", NorthernLands.Objective.BAIT_POSITION,
                     goal, "Preserving a clear slam escape lane", 0.2,
-                    { target = zone and zone.id, threat = zone and zone.id })
+                    { target = zone and zone.id, threat = zone and zone.id, allowAttack = true })
             end
         end
         return self:_commitIntent(context, "SLAM_BAIT", NorthernLands.Objective.BAIT_POSITION,
             context.rootPart.Position, "Baiting Midgardian jump slam", 0.14,
-            { target = zone and zone.id, hold = true })
+            { target = zone and zone.id, hold = true, allowAttack = true })
     end
 
     local reused = self:_reuse(context, "SLAM_ESCAPE", zone and zone.id, 0.5)
@@ -817,7 +832,7 @@ function NorthernLands:_slamIntent(context, zone)
     slam.escapeAt = context.now
     return self:_commitIntent(context, "SLAM_ESCAPE", NorthernLands.Objective.ESCAPE_AREA,
         goal, "Escaping committed slam and beam geometry", 0.55,
-        { target = zone and zone.id, threat = zone and zone.id,
+        { target = zone and zone.id, threat = zone and zone.id, allowAttack = true,
             forceBlink = currentRisk > 0 and goalRisk < currentRisk })
 end
 
@@ -846,7 +861,8 @@ function NorthernLands:_projectileIntent(context, zone)
     local currentRisk = self:_risk(context, context.rootPart.Position, 4)
     return self:_commitIntent(context, "PROJECTILE_ESCAPE", NorthernLands.Objective.CROSS_CORRIDOR,
         goal, "Crossing Northern projectile corridor", 0.38,
-        { target = zone.id, threat = zone.id, forceBlink = currentRisk > 0 and goalRisk < currentRisk })
+        { target = zone.id, threat = zone.id, allowAttack = true,
+            forceBlink = currentRisk > 0 and goalRisk < currentRisk })
 end
 
 function NorthernLands:_beamSector(context, beams)

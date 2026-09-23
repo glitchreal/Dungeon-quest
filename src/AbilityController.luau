@@ -61,29 +61,38 @@ function Abilities.new(player, onConfirmed)
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             local busy = character and character:FindFirstChild("busyCasting")
             local peaceful = player:FindFirstChild("peaceful")
-            if not humanoid or humanoid.Health <= 0 or (busy and busy.Value)
-                or (peaceful and peaceful.Value) or userInput:GetFocusedTextBox() then return false end
-            if now - lastAttempt < interval then return false end
+            if not humanoid or humanoid.Health <= 0 then return false, "character unavailable" end
+            if busy and busy.Value then return false, "busy casting" end
+            if peaceful and peaceful.Value then return false, "peaceful state" end
+            if userInput:GetFocusedTextBox() then return false, "typing" end
+            if now - lastAttempt < interval then return false, "cast interval" end
+            local reason = "cooldown or awaiting confirmation"
             for _, slot in ipairs({ preferred, preferred == "q" and "e" or "q" }) do
                 local tool = slots[slot]
                 local snapshot = snapshots[slot]
                 local pending = tool and requests[tool]
-                if tool and snapshot.cooldown <= 0 and (not pending or now >= pending.retryAt)
-                    and (not prepare or prepare(slot, snapshot)) then
-                    local event = tool:FindFirstChild("localEvent")
-                    local remote = remotes:FindFirstChild("abilityUsed")
-                    if event and event:IsA("BindableEvent") and remote and remote:IsA("RemoteEvent") then
-                        local length = tool:FindFirstChild("cooldownLength")
-                        local retry = math.max(0.75, tonumber(length and length.Value) or 1)
-                        requests[tool] = { at = now, retryAt = now + retry, confirmed = false }
-                        lastAttempt, preferred = now, slot == "q" and "e" or "q"
-                        event:Fire()
-                        remote:FireServer(slot, tool)
-                        return true
+                if tool and snapshot.cooldown <= 0 and (not pending or now >= pending.retryAt) then
+                    local ready, detail = true, nil
+                    if prepare then ready, detail = prepare(slot, snapshot) end
+                    if not ready then
+                        reason = detail or "target or aim not ready"
+                    else
+                        local event = tool:FindFirstChild("localEvent")
+                        local remote = remotes:FindFirstChild("abilityUsed")
+                        if event and event:IsA("BindableEvent") and remote and remote:IsA("RemoteEvent") then
+                            local length = tool:FindFirstChild("cooldownLength")
+                            local retry = math.max(0.75, tonumber(length and length.Value) or 1)
+                            requests[tool] = { at = now, retryAt = now + retry, confirmed = false }
+                            lastAttempt, preferred = now, slot == "q" and "e" or "q"
+                            event:Fire()
+                            remote:FireServer(slot, tool)
+                            return true, "cast requested: " .. tool.Name
+                        end
+                        reason = "ability activation unavailable"
                     end
                 end
             end
-            return false
+            return false, reason
         end,
     }
 end
