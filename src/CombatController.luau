@@ -2803,6 +2803,21 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             state.escapeThreatId = nil
             state.lastEscapePlan = -math.huge
         end
+        -- A familiar attack can move or expand without changing its ID.
+        -- Check the next walking step against the latest geometry so a
+        -- committed route cannot carry us deeper into that same hitbox.
+        if state.escapeGoal then
+            local delta = state.escapeGoal - rootPart.Position
+            if delta.Magnitude > 0.1 then
+                local nextStep = rootPart.Position + delta.Unit * math.min(delta.Magnitude, humanoid.WalkSpeed * 0.25)
+                local currentExposure = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+                local nextExposure = ThreatGeometry.risk(state.activeZones, nextStep, 2)
+                if nextExposure > currentExposure + 0.1 then
+                    state.escapeGoal = nil
+                    state.lastEscapePlan = -math.huge
+                end
+            end
+        end
         -- Commit to the escape walk: the plan was validated at selection and
         -- replans correct course within a fraction of a second. Re-validating
         -- strict per-tick checks is what used to freeze the character
@@ -2843,7 +2858,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             return true
         end
     end
-    if now - state.lastEscapePlan < (risk > 0 and 0.08 or 0.12) then return true end
+    if risk == 0 and now - state.lastEscapePlan < 0.12 then return true end
     state.lastEscapePlan = now
     local goal, escapeMargin, escapeReason = findEscapeGoal(rootPart, targetRoot)
     if not goal and (risk > 0 or state.blockedByHazard) then
@@ -2984,13 +2999,32 @@ local function controllerTick()
             state.prevHealth[model] = trackedHumanoid.Health
         end
     end
+    refreshSafety(rootPart, now)
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
         state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
-        state.escapeGoal, state.lastThreatPart = nil, nil
-        state.status, state.targetName, state.targetDist = "Waiting for wave", "None", 0
+        state.targetName, state.targetDist = "None", 0
         state.currentTarget, state.lockedTarget = nil, nil
+        if CFG.AUTO_DODGE then
+            local currentRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
+            if currentRisk > 0 then
+                local goal = state.escapeGoal
+                if not goal or now >= (state.escapeUntil or 0) or (goal - rootPart.Position).Magnitude <= 2
+                    or ThreatGeometry.risk(state.activeZones, goal, CFG.HAZARD_MARGIN) >= currentRisk - 0.1
+                    or not walkingSegmentClear(rootPart, goal, nil) then
+                    goal = findEmergencySideStep(rootPart, nil) or findLeastBadStep(rootPart, nil)
+                    state.escapeGoal, state.escapeUntil = goal, now + 0.5
+                end
+                if goal and ThreatGeometry.risk(state.activeZones, goal, CFG.HAZARD_MARGIN) < currentRisk - 0.1 then
+                    state.status = "Escaping lingering attack"
+                    issueMove(humanoid, goal, "evade", now, true)
+                    return
+                end
+            end
+        end
+        state.escapeGoal, state.lastThreatPart = nil, nil
+        state.status = "Waiting for wave"
         stopMovement(humanoid, rootPart)
         state.pathStatus = "Pathfinding: waiting for next wave"
         return
@@ -3059,7 +3093,6 @@ local function controllerTick()
         end
     end
     state.prevHealth[target] = targetHumanoid.Health
-    refreshSafety(rootPart, now)
     if handleSafety(humanoid, rootPart, target, targetRoot, now) then
         state.combatIntent, state.lastProgressGoal = nil, nil
         state.navigationPhase = "evade"
@@ -3368,6 +3401,7 @@ local function watchHealth(character)
     state.healthConnection = connect(humanoid.HealthChanged, function(health)
         if state.running and not state.closed and character == player.Character and health < previous - 0.01 then
             state.damageEvents = state.damageEvents + 1
+            state.lastSafetyScan = -math.huge
             state.lastDamage = { amount = previous - health, at = os.clock(), health = health,
                 mode = state.motionMode, status = state.status, hazards = #state.activeZones,
                 distance = state.targetDist }
