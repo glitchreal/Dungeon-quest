@@ -9,6 +9,20 @@ end
 local function cell(p)
     return math.floor(p.X / 12 + 0.5) .. ":" .. math.floor(p.Y / 8 + 0.5) .. ":" .. math.floor(p.Z / 12 + 0.5)
 end
+function Navigation.StartWaypoint(waypoints, position, canReach)
+    local best, bestDistance
+    -- Only join a nearby, reachable prefix. A later waypoint across a wall
+    -- or on a stacked floor is not a valid shortcut into the middle of a path.
+    for index, waypoint in ipairs(waypoints) do
+        if index > 12 then break end
+        local distance = (waypoint.Position - position).Magnitude
+        if distance <= 24 and canReach(waypoint.Position) and (not bestDistance or distance < bestDistance) then
+            best, bestDistance = index, distance
+        end
+        if tostring(waypoint.Action) == "Enum.PathWaypointAction.Jump" then break end
+    end
+    return best
+end
 function Navigation.new(memory)
     return setmetatable({ memory = memory, debug = {}, failedUntil = {}, epoch = 0 }, Navigation)
 end
@@ -39,8 +53,11 @@ function Navigation:Key(from, node)
     return tostring(self.dungeon) .. "/" .. from .. ">" .. node.id
 end
 function Navigation:Cancel(reason)
-    if self.edge or self.choice then self.epoch = self.epoch + 1 end
-    self.choice, self.edge, self.watch = nil, nil, nil
+    if self.edge or self.choice then
+        self.epoch = self.epoch + 1
+        self.watch = nil
+    end
+    self.choice, self.edge = nil, nil
     self.debug.CurrentRouteEdge, self.debug.RouteEdgeLearnedCost = nil, nil
     self.debug.ReplanReason = reason
 end

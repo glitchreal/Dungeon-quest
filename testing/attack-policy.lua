@@ -35,4 +35,8 @@ assert(Policy.horizontalRange(25,30) == 0)
 assert(Policy.range({mode="target",range=40},26) == 40)
 assert(Policy.range({mode="self",radius=10},26) == 10)
 assert(Policy.range({mode="heal",range=40},26) == nil)
+assert(Policy.approachScore(34, 16, true, 26, 20) < Policy.approachScore(50, 0, true, 26, 20),
+    "approach can improve while both positions are outside casting range")
+assert(Policy.approachScore(21, 5, true, 26, 20) < Policy.approachScore(26, 0, true, 26, 20),
+    "being barely in range does not prevent closing to combat spacing")
 print("Attack policy checks passed")

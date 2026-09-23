@@ -34,4 +34,11 @@ function Policy.horizontalRange(range, height)
     return math.sqrt(math.max(0, range * range - height * height))
 end
 
+function Policy.approachScore(distance, travel, visible, range, spacing)
+    -- Out-of-range ground points still make useful approach objectives.
+    -- Favor closing the range deficit before optimizing travel or spacing.
+    return math.max(0, distance - range) * 8 + math.abs(distance - spacing)
+        + travel * 0.2 + (visible and 0 or 20)
+end
+
 return Policy

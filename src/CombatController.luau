@@ -870,7 +870,7 @@ local function initializeRouteProgress(rootPart)
     end
 end
 
-local function mapRouteGoal(rootPart, now)
+local function mapRouteGoal(rootPart, now, observeOnly)
     refreshRouteAnchors(now)
     if not state.routeInitialized and #state.routeAnchors > 0 then
         state.routeInitialized = true
@@ -915,6 +915,7 @@ local function mapRouteGoal(rootPart, now)
             state.routeProgress = { order = anchor.order, name = anchor.name }
             state.routeAnchorIndex = state.routeAnchorIndex + 1
         else
+            if observeOnly then return nil end
             local goal, selected = adaptiveNavigation:Goal(rootPart, state.currentTarget, state.routeAnchors,
                 state.routeProgress, state.routeDungeon, now, function(position)
                     local blocked = hasBlockingRay(rootPart.Position, position, rootPart.Parent, anchor.part)
@@ -1080,7 +1081,7 @@ local function walkingSegmentClear(rootPart, destination, target, params, startF
     if not startFloor then return false end
     local startPosition = rootPart.Position
     local flat = Vector3.new(destination.X - startPosition.X, 0, destination.Z - startPosition.Z)
-    if flat.Magnitude < 0.1 then return true end
+    if flat.Magnitude < 0.1 then return math.abs(destination.Y - startPosition.Y) <= 4.5 end
     local previousY = startFloor.Position.Y
     local steps = math.max(1, math.ceil(flat.Magnitude / 3))
     for i = 1, steps do
@@ -1097,6 +1098,9 @@ local function walkingSegmentClear(rootPart, destination, target, params, startF
         previousY = ground.Position.Y
     end
     local endPosition = startPosition + flat + Vector3.new(0, previousY - startFloor.Position.Y, 0)
+    -- A clear XZ projection is not a walk to a platform above that floor.
+    -- Waypoint floor positions may be one hip-height below the root goal.
+    if math.abs(destination.Y - endPosition.Y) > 4.5 then return false end
     local right = Vector3.new(-flat.Z, 0, flat.X).Unit * math.min(CFG.AGENT_RADIUS, 1.5)
     for _, offset in ipairs({ Vector3.zero, right, -right }) do
         if hasBlockingRay(startPosition + offset, endPosition + offset, rootPart.Parent, target) then return false end
@@ -1224,7 +1228,9 @@ local function issueMove(humanoid, position, mode, now, bypass)
         if root then
             local delta = position - root.Position
             local nextPosition = delta.Magnitude > 12 and root.Position + delta.Unit * 12 or position
-            if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.HAZARD_MARGIN) then
+            if not ThreatGeometry.segmentSafe(state.activeZones, root.Position, nextPosition, CFG.HAZARD_MARGIN)
+                and not (mode == "evade" and ThreatGeometry.escapeStepSafe(
+                    state.activeZones, root.Position, nextPosition, CFG.HAZARD_MARGIN)) then
                 safetyHold(root)
                 state.movementBlocked = true
                 state.blockedByHazard = true
@@ -1471,6 +1477,15 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             return
         end
         if path and waypoints then
+            local joinIndex = AdaptiveNavigation.StartWaypoint(waypoints, rootPart.Position, function(position)
+                return walkingSegmentClear(rootPart, position, target)
+            end)
+            if not joinIndex then
+                path:Destroy()
+                state.pathUpdateTime = 0
+                state.pathStatus = "Path start no longer reachable: replanning"
+                return
+            end
             clearPath()
             state.terrainRecovery = recoveryGoal
             state.pathObject = path
@@ -1478,16 +1493,7 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             state.pathGoal, state.pathMode = recoveryGoal or goal, recoveryGoal and "terrain-recovery" or mode
             if recoveryGoal then state.motionGoal, state.motionGoalMode = recoveryGoal, "terrain-recovery" end
             state.waypoints = waypoints
-            state.currentWaypointIndex = 1
-            -- Computation can finish after we have walked beyond its start.
-            local nearestDistance = math.huge
-            for index, waypoint in ipairs(waypoints) do
-                local distance = (rootPart.Position - waypoint.Position).Magnitude
-                if distance < nearestDistance then
-                    nearestDistance = distance
-                    state.currentWaypointIndex = index
-                end
-            end
+            state.currentWaypointIndex = joinIndex
             state.pathBlockedConn = path.Blocked:Connect(function(blockedIndex)
                 if blockedIndex >= state.currentWaypointIndex then state.pathBlocked = true end
             end)
@@ -1601,21 +1607,9 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
 end
 
 local function chooseRecoveryGoal(rootPart, goal, target)
-    local delta = goal - rootPart.Position
-    local flat = Vector3.new(delta.X, 0, delta.Z)
-    if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
-    flat = flat.Unit
-    local candidates = {}
-    for index = 0, 7 do
-        local angle = index * math.pi / 4
-        local direction = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), angle):VectorToWorldSpace(flat)
-        table.insert(candidates, rootPart.Position + direction * 8)
-    end
-    for _, candidate in ipairs(candidates) do
-        candidate = groundPosition(candidate, rootPart.Parent, target)
-        if walkingSegmentClear(rootPart, candidate, target) then return candidate end
-    end
-    return nil
+    -- Recovery must obey the same hazard/enemy checks and visited-cell costs
+    -- as normal local navigation, otherwise it repeatedly walks into a guard.
+    return chooseFallbackStep(rootPart, goal, target)
 end
 
 local function updateProgress(humanoid, rootPart, goal, target, now)
@@ -2860,9 +2854,17 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             if predictedRisk > 0 then risk, zone = predictedRisk, predictedZone end
         end
     end
-    local routeThreat = state.motionGoal and state.motionGoalMode == "map-route"
-        and (state.motionGoal - rootPart.Position).Magnitude > 4
-        and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.motionGoal, CFG.HAZARD_MARGIN)
+    -- Inspect the next movement segment, not a straight chord through all
+    -- intervening rooms. The path may already go around the distant hazard.
+    local waypoint = state.waypoints[state.currentWaypointIndex]
+    local routeStep = state.fallbackGoal or (waypoint and waypoint.Position + Vector3.new(0, 2.5, 0))
+        or state.motionGoal
+    if routeStep then
+        local delta = routeStep - rootPart.Position
+        routeStep = delta.Magnitude >= 0.1 and rootPart.Position + delta.Unit * math.min(delta.Magnitude, 12) or nil
+    end
+    local routeThreat = routeStep and state.motionGoalMode == "map-route"
+        and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, routeStep, CFG.HAZARD_MARGIN)
     state.lastThreatPart = zone and zone.id
     -- Jump-over: thin homing rectangles are cleared by leaving the ground as
     -- they pass under. Only when the zone top is within jump apex (~6 studs)
@@ -3249,45 +3251,69 @@ local function firingPosition(rootPart, target, targetRoot, now)
         range = math.max(range, reach or 0)
     end
     if range == 0 or not AttackPolicy.damageable(target) then return nil end
+    local targetDistance = (targetRoot.Position - rootPart.Position).Magnitude
+    -- Leave travel across rooms to the room graph.
+    if targetDistance > math.max(60, range + 16) then return nil end
+    local spacing = math.min(CFG.COMBAT_DISTANCE, range * 0.85)
     local function canFire(position)
         return AttackPolicy.inRange(position, targetRoot.Position, range)
             and not hasBlockingRay(position, targetRoot.Position, rootPart.Parent, target)
     end
-    if canFire(rootPart.Position) then return rootPart.Position end
+    local currentCanFire = canFire(rootPart.Position)
+    if currentCanFire and targetDistance <= spacing + 2 then return rootPart.Position end
     local cached = state.firingPosition
     if cached and cached.target == target and now - cached.at < 0.5
         and (cached.origin - rootPart.Position).Magnitude < 4
         and (cached.targetPosition - targetRoot.Position).Magnitude < 3
-        and (not cached.goal or canFire(cached.goal)
-            and ThreatGeometry.risk(state.activeZones, cached.goal, CFG.HAZARD_MARGIN) == 0
-            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, cached.goal, CFG.HAZARD_MARGIN)) then
+        and cached.range == range
+        and (not cached.goal or ThreatGeometry.risk(state.activeZones, cached.goal, CFG.HAZARD_MARGIN) == 0) then
         return cached.goal
     end
     local best, bestCost
     local params = buildRaycastParams(rootPart.Parent, target)
     params.RespectCanCollide = true
-    -- Probe from the player's floor, not from above the enemy's platform.
-    -- Only choose locally walkable, hazard-free firing positions; otherwise
-    -- retain the regular doorway/stair navigation fallback.
+    local currentVisible = not hasBlockingRay(rootPart.Position, targetRoot.Position, rootPart.Parent, target)
+    local currentCost = AttackPolicy.approachScore(targetDistance, 0, currentVisible, range, spacing)
+    local function consider(sample, requireWalk)
+        local floor = Workspace:Raycast(sample + Vector3.new(0, 4, 0), Vector3.new(0, -12, 0), params)
+        if not floor or floor.Normal.Y < 0.55 or floor.Instance.Name:lower():find("lava", 1, true) then return end
+        local point = floor.Position + Vector3.new(0, 2.5, 0)
+        local travel = (point - rootPart.Position).Magnitude
+        if travel <= 2 or ThreatGeometry.risk(state.activeZones, point, CFG.HAZARD_MARGIN) > 0 then return end
+        local visible = not hasBlockingRay(point, targetRoot.Position, rootPart.Parent, target)
+        local distance = (point - targetRoot.Position).Magnitude
+        local direct = walkingSegmentClear(rootPart, point, target)
+            and safeEnemyStep(rootPart.Position, point)
+            and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, point, CFG.HAZARD_MARGIN)
+        if requireWalk and not direct then return end
+        if not requireWalk and not (visible and distance <= range) then return end
+        local cost = AttackPolicy.approachScore(distance, travel, visible, range, spacing)
+            + math.max(0, adaptiveNavigation:LocalCost(rootPart.Position, point))
+        if requireWalk and cost >= currentCost - 1 then return end
+        if not direct then cost = cost + 12 end
+        if not bestCost or cost < bestCost then best, bestCost = point, cost end
+    end
+    -- Close the distance in safe ground steps even before a firing point is
+    -- within reach. The old all-or-nothing search returned only in-range spots.
     for _, radius in ipairs({ 8, 16 }) do
         for index = 0, 7 do
             local angle = index * math.pi / 4
-            local sample = rootPart.Position + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
-            local floor = Workspace:Raycast(sample + Vector3.new(0, 4, 0), Vector3.new(0, -12, 0), params)
-            if floor and floor.Normal.Y >= 0.55 then
-                local point = floor.Position + Vector3.new(0, 2.5, 0)
-                if canFire(point) and walkingSegmentClear(rootPart, point, target)
-                    and safeEnemyStep(rootPart.Position, point)
-                    and ThreatGeometry.risk(state.activeZones, point, CFG.HAZARD_MARGIN) == 0
-                    and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, point, CFG.HAZARD_MARGIN) then
-                    local cost = (point - rootPart.Position).Magnitude
-                    if not bestCost or cost < bestCost then best, bestCost = point, cost end
-                end
-            end
+            consider(rootPart.Position + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius), true)
         end
     end
+    -- A wall may require a path to the firing point, rather than a clear
+    -- straight walk. Feed grounded arena-side points to the normal navmesh.
+    if not best then
+        local radius = math.max(6, AttackPolicy.horizontalRange(spacing, targetRoot.Position.Y - rootPart.Position.Y))
+        for index = 0, 7 do
+            local angle = index * math.pi / 4
+            consider(Vector3.new(targetRoot.Position.X + math.cos(angle) * radius,
+                rootPart.Position.Y, targetRoot.Position.Z + math.sin(angle) * radius), false)
+        end
+    end
+    if not best and currentCanFire then best = rootPart.Position end
     state.firingPosition = { target = target, targetPosition = targetRoot.Position,
-        origin = rootPart.Position, at = now, goal = best }
+        origin = rootPart.Position, at = now, goal = best, range = range }
     return best
 end
 
@@ -3408,7 +3434,10 @@ local function controllerTick()
         state.wallVisits, state.wallFlips = {}, 0
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
-    if #state.routeAnchors > 0 then mapRouteGoal(rootPart, now) end
+    -- Record arrivals without selecting a room route before the movement owner
+    -- is known. Creating then cancelling an edge every combat tick reset the
+    -- objective stall timer and invalidated asynchronous paths unnecessarily.
+    if #state.routeAnchors > 0 then mapRouteGoal(rootPart, now, true) end
     -- Doomed round: same target for 3 minutes with zero kills and zero damage
     -- dealt (e.g. mob under the map behind a wall that never opens). Solo
     -- only, so nobody else's run is ever touched. Leaves via teleToLobby.
@@ -3476,15 +3505,17 @@ local function controllerTick()
         local firingGoal = firingPosition(rootPart, target, targetRoot, now)
         if firingGoal then
             state.navigationPhase = "combat"
-            state.status = "Attacking from ground: " .. target.Name
-            state.routeFails, state.climbDySince = 0, nil
+            state.status = (firingGoal - rootPart.Position).Magnitude <= 2
+                and "Attacking from ground: " .. target.Name or "Approaching elevated target: " .. target.Name
+            state.climbDySince = nil
             state.unreachableTargets[target] = nil
-            adaptiveNavigation:Cancel("reachable firing position")
+            if adaptiveNavigation.edge then adaptiveNavigation:Cancel("ground approach owns movement") end
             if (firingGoal - rootPart.Position).Magnitude <= 2 then
                 stopMovement(humanoid, rootPart)
             else
                 followGoal(humanoid, rootPart, firingGoal, "combat", now, target)
-                updateProgress(humanoid, rootPart, firingGoal, target, now)
+                updateProgress(humanoid, rootPart,
+                    Vector3.new(targetRoot.Position.X, rootPart.Position.Y, targetRoot.Position.Z), target, now)
             end
             return
         end

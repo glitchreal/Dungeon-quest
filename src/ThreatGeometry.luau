@@ -181,6 +181,24 @@ function Geometry.risk(zones, position, margin, arrivalTime)
     return risk, nearest and nearest.zone
 end
 
+function Geometry.escapeStepSafe(zones, startPosition, endPosition, margin)
+    local initial = Geometry.risk(zones, startPosition, margin)
+    if initial <= 0 then return false end
+    for _, zone in ipairs(zones) do
+        -- Check the whole crossing so a thin beam between samples is not missed.
+        if Geometry.clearance(zone, startPosition, margin) >= 0
+            and not Geometry.segmentSafe({ zone }, startPosition, endPosition, margin) then return false end
+    end
+    local previous = initial
+    for step = 1, 4 do
+        local point = startPosition:Lerp(endPosition, step / 4)
+        local risk = Geometry.risk(zones, point, margin)
+        if risk > previous + 0.01 then return false end
+        previous = risk
+    end
+    return previous < initial - 0.01
+end
+
 function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
     local relevant = {}
     local seen = {}
