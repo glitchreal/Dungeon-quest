@@ -768,11 +768,9 @@ local function hazardMemoryKey(zone)
     return string.sub(hazardDisplayName(zone), 1, 48) .. "|" .. hazardDisplayShape(zone)
 end
 
-local function rememberHazardHit(zone)
-    local key = hazardMemoryKey(zone)
+local function memoryFor(key)
     local memory = state.hazardMemory
     local entry = memory[key]
-    if entry and entry.lastHitAt and os.clock() - entry.lastHitAt < 2 then return end
     if not entry then
         local count, oldestKey, oldestSequence = 0, nil, math.huge
         for candidate, value in pairs(memory) do
@@ -780,18 +778,41 @@ local function rememberHazardHit(zone)
             if value.sequence < oldestSequence then oldestKey, oldestSequence = candidate, value.sequence end
         end
         if count >= 24 and oldestKey then memory[oldestKey] = nil end
-        entry = { hits = 0, bonus = 0, sequence = 0 }
+        entry = { hits = 0, bonus = 0, sequence = 0, sides = {} }
         memory[key] = entry
     end
+    return entry
+end
+
+local function observeEscape(key, side, success)
+    if not key or not side then return end
+    local entry = memoryFor(key)
+    entry.sides = entry.sides or {}
+    local sample = entry.sides[tostring(side)] or { count = 0, value = 0.5 }
+    sample.count = math.min(32, sample.count + 1)
+    sample.value = math.clamp(sample.value + 0.25 * ((success and 1 or 0) - sample.value), 0, 1)
+    entry.sides[tostring(side)] = sample
+    if not success then entry.avoidSide = side end
+    state.hazardMemorySequence = state.hazardMemorySequence + 1
+    entry.sequence = state.hazardMemorySequence
+    state.hazardMemoryDirty = true
+end
+
+local function rememberHazardHit(zone)
+    local key = hazardMemoryKey(zone)
+    local entry = memoryFor(key)
+    local learning = state.escapeLearning
+    if learning and not learning.done and learning.key == key
+        and os.clock() - learning.at < 2 then
+        observeEscape(key, learning.side, false)
+        learning.done = true
+    end
+    if entry.lastHitAt and os.clock() - entry.lastHitAt < 2 then return end
     state.hazardMemorySequence = state.hazardMemorySequence + 1
     entry.hits = math.min(100, entry.hits + 1)
     entry.bonus = math.min(5, entry.bonus + 1)
     entry.sequence = state.hazardMemorySequence
     entry.lastHitAt = os.clock()
-    if state.escapeGoal and state.escapeThreatId == zone.id and state.escapeSide
-        and os.clock() - (state.escapePlannedAt or -math.huge) < 1.5 then
-        entry.avoidSide = state.escapeSide
-    end
     state.hazardMemoryDirty = true
 end
 
@@ -804,6 +825,21 @@ local function learnedHazardMargin(position)
         end
     end
     return bonus
+end
+
+local function learnedEscapeSide(entry, fallback)
+    if not entry then return fallback end
+    local left = entry.sides and entry.sides["-1"]
+    local right = entry.sides and entry.sides["1"]
+    local count = (left and left.count or 0) + (right and right.count or 0)
+    if count >= 2 then
+        local leftScore = left and left.value or 0.5
+        local rightScore = right and right.value or 0.5
+        if math.abs(leftScore - rightScore) >= 0.1 then
+            return leftScore > rightScore and -1 or 1
+        end
+    end
+    return entry.avoidSide and -entry.avoidSide or fallback
 end
 
 local function clearHazardLabels()
@@ -2175,7 +2211,7 @@ local function findEscapeGoal(rootPart, targetRoot)
     if targetRadial.Magnitude < 0.1 then targetRadial = Vector3.new(1, 0, 0) end
     targetRadial = targetRadial.Unit
     local memory = dangerZone and state.hazardMemory[hazardMemoryKey(dangerZone)]
-    local preferredSide = memory and memory.avoidSide and -memory.avoidSide or state.dodgeSide
+    local preferredSide = learnedEscapeSide(memory, state.dodgeSide)
     local orbitDirection = Vector3.new(-targetRadial.Z, 0, targetRadial.X) * preferredSide
     local originalTargetDistance = Vector3.new(targetOffset.X, 0, targetOffset.Z).Magnitude
     local function combatShapeScore(candidate)
@@ -2989,6 +3025,69 @@ local function forceSeparationGoal(rootPart, targetRoot, target)
     return best
 end
 
+local function shortEscapeGoal(rootPart, target, goal)
+    local delta = goal - rootPart.Position
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    if flat.Magnitude <= 12 then return goal, false end
+    local startRisk = ThreatGeometry.risk(state.activeZones, rootPart.Position, 2)
+    local best, bestScore, bestRisk
+    for _, distance in ipairs({ 6, 8, 12 }) do
+        local candidate = groundPosition(rootPart.Position + flat.Unit * distance, rootPart.Parent, target)
+        if walkingSegmentClear(rootPart, candidate, target)
+            and safeEnemyStep(rootPart.Position, candidate) then
+            local risk = ThreatGeometry.risk(state.activeZones, candidate, 2)
+            local score = risk - distance * 0.01
+            if (startRisk > 0 or risk == 0) and (not bestScore or score < bestScore) then
+                best, bestScore, bestRisk = candidate, score, risk
+            end
+        end
+    end
+    if not best or startRisk > 0 and bestRisk >= startRisk then
+        local alternate = findLeastBadStep(rootPart, target)
+        if alternate then
+            local alternateRisk = ThreatGeometry.risk(state.activeZones, alternate, 2)
+            if alternateRisk < (bestRisk or math.huge) then return alternate, startRisk > 0 end
+        end
+    end
+    return best or goal, best ~= nil and startRisk > 0
+end
+
+local function trackEscapeChoice(rootPart, targetRoot, zone, goal, now)
+    state.escapeThreatId = zone and zone.id or nil
+    local radial = rootPart.Position - targetRoot.Position
+    radial = Vector3.new(radial.X, 0, radial.Z)
+    if radial.Magnitude <= 0.1 then return end
+    local tangent = Vector3.new(-radial.Z, 0, radial.X).Unit
+    local side = (goal - rootPart.Position):Dot(tangent) >= 0 and 1 or -1
+    state.escapeSide, state.escapePlannedAt = side, now
+    if zone then
+        local key = hazardMemoryKey(zone)
+        local learning = state.escapeLearning
+        if not learning or learning.done or learning.key ~= key or learning.side ~= side
+            or now - learning.at > 1.5 then
+            state.escapeLearning = { key = key, id = zone.id, side = side, at = now,
+                startPosition = rootPart.Position, startDamage = state.damageEvents, done = false }
+        end
+    end
+end
+
+local function updateEscapeLearning(rootPart, now)
+    local learning = state.escapeLearning
+    if not learning or learning.done or now - learning.at < 0.45 then return end
+    if state.damageEvents ~= learning.startDamage then learning.done = true; return end
+    if (rootPart.Position - learning.startPosition).Magnitude >= 3 then
+        for _, zone in ipairs(state.activeZones) do
+            if zone.id == learning.id
+                and ThreatGeometry.clearance(zone, rootPart.Position, 2) > 2 then
+                observeEscape(learning.key, learning.side, true)
+                learning.done = true
+                return
+            end
+        end
+    end
+    if now - learning.at > 1.5 then learning.done = true end
+end
+
 
 local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     if not CFG.AUTO_DODGE then
@@ -2998,6 +3097,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     local hazardBonus = now - (state.hazardMarginBonusAt or 0) < 1.5 and (state.hazardMarginBonus or 0) or 0
     CFG.HAZARD_MARGIN = CFG.HAZARD_MARGIN_BASE
         + math.max(math.clamp(hazardBonus, 0, 8), learnedHazardMargin(rootPart.Position))
+    updateEscapeLearning(rootPart, now)
     local risk, zone = ThreatGeometry.risk(state.activeZones, rootPart.Position, CFG.HAZARD_MARGIN)
     -- Forecast where the current MoveTo will carry the body in the next
     -- fraction of a second. The hazard geometry itself already projects
@@ -3208,6 +3308,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         local postCommitRisk = now >= (state.escapeCommitUntil or 0) and risk > startRisk + 0.5
         if riskEscalated or postCommitRisk then
             state.escapeGoal = nil
+            state.lastEscapePlan = -math.huge
         elseif state.escapeGoal and (state.escapeGoal - rootPart.Position).Magnitude > math.max(3, humanoid.WalkSpeed * 0.25)
             and state.escapeClear then
             local contMargin = state.escapeMargin or CFG.HAZARD_MARGIN
@@ -3219,6 +3320,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             if now >= (state.escapeCommitUntil or 0) and contMargin >= CFG.HAZARD_MARGIN
                 and not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, contMargin) then
                 state.escapeGoal = nil
+                state.lastEscapePlan = -math.huge
             else
             state.status = state.escapeReason or "Avoiding nearby enemies"
             dodgeAlongEscape(humanoid, rootPart, state.escapeGoal, target, zone and zone.id or contactThreat, now)
@@ -3227,6 +3329,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             end
         end
     end
+    if state.escapeGoal and risk > 0 then state.lastEscapePlan = -math.huge end
     state.escapeGoal = nil
     if zone then
         state.threatReactionAt = state.threatReactionAt or now
@@ -3255,6 +3358,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
                 state.escapeClear, state.lastEscapeCheck = true, now
                 state.escapeReason = "Cutting through weakest exposure"
                 state.status = state.escapeReason
+                trackEscapeChoice(rootPart, targetRoot, zone, backup, now)
                 logThreat("escape", state.escapeReason)
                 dodgeAlongEscape(humanoid, rootPart, backup, target, zone and zone.id or contactThreat, now, true)
                 issueMove(humanoid, backup, "evade", now, true)
@@ -3265,22 +3369,16 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         stopMovement(humanoid, rootPart)
         return true
     end
+    local shortGoal, needsBypass = shortEscapeGoal(rootPart, target, goal)
+    goal = shortGoal
+    if needsBypass and not escapeMargin then escapeMargin = 2 end
     clearPath()
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
     state.escapeMargin = escapeMargin or CFG.HAZARD_MARGIN
     state.escapeCommitUntil = escapeMargin and now + 0.9 or now + 0.45
     state.escapeStartRisk = risk
-    state.escapeThreatId = zone and zone.id or nil
-    local radial = rootPart.Position - targetRoot.Position
-    radial = Vector3.new(radial.X, 0, radial.Z)
-    if radial.Magnitude > 0.1 then
-        local tangent = Vector3.new(-radial.Z, 0, radial.X).Unit
-        state.escapeSide = (goal - rootPart.Position):Dot(tangent) >= 0 and 1 or -1
-    else
-        state.escapeSide = nil
-    end
-    state.escapePlannedAt = now
+    trackEscapeChoice(rootPart, targetRoot, zone, goal, now)
     state.escapeClear, state.lastEscapeCheck = true, now
     state.safetyUntil = now + 0.75
     dodgeAlongEscape(humanoid, rootPart, goal, target, zone and zone.id or contactThreat, now,
@@ -3700,6 +3798,7 @@ local function setRunning(running)
     if state.running then
         state.unreachableTargets = setmetatable({}, { __mode = "k" })
         state.combatIntent, state.lastProgressGoal = nil, nil
+        state.escapeLearning = nil
         state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
@@ -3829,6 +3928,7 @@ end
 
 connect(player.CharacterAdded, function(character)
     state.combatIntent, state.lastProgressGoal = nil, nil
+    state.escapeLearning = nil
     state.protectorOrbitSide = nil
     state.protectorEscapeVisits = nil
     state.threatReactionAt = nil
@@ -3863,7 +3963,20 @@ local function loadDodgeMemory(data)
             local bonus = math.clamp(math.floor(tonumber(source.Bonus) or 0), 0, 5)
             sequence = sequence + 1
             local avoidSide = source.AvoidSide == 1 and 1 or source.AvoidSide == -1 and -1 or nil
-            memory[key] = { hits = hits, bonus = bonus, sequence = sequence, avoidSide = avoidSide }
+            local sides = {}
+            if type(source.Sides) == "table" then
+                for _, side in ipairs({ "-1", "1" }) do
+                    local sample = source.Sides[side]
+                    if type(sample) == "table" then
+                        sides[side] = {
+                            count = math.clamp(math.floor(tonumber(sample.Count) or 0), 0, 32),
+                            value = math.clamp(tonumber(sample.Value) or 0.5, 0, 1),
+                        }
+                    end
+                end
+            end
+            memory[key] = { hits = hits, bonus = bonus, sequence = sequence,
+                avoidSide = avoidSide, sides = sides }
             count = count + 1
         end
     end
@@ -3873,7 +3986,12 @@ end
 local function exportDodgeMemory()
     local entries = {}
     for key, entry in pairs(state.hazardMemory) do
-        entries[key] = { Hits = entry.hits, Bonus = entry.bonus, AvoidSide = entry.avoidSide }
+        local sides = {}
+        for side, sample in pairs(entry.sides or {}) do
+            sides[side] = { Count = sample.count, Value = sample.value }
+        end
+        entries[key] = { Hits = entry.hits, Bonus = entry.bonus,
+            AvoidSide = entry.avoidSide, Sides = sides }
     end
     return { Version = 1, Entries = entries }
 end

@@ -87,6 +87,11 @@ If a committed escape from that same visible attack still takes damage, the
 memory also records the failed orbit side. Later escape scoring favors the
 opposite side when it is reachable and safe; wall, enemy, and hazard checks
 still decide the final route.
+The dodge policy now also records successful clearances and hits for each side
+of a named attack. It uses a bounded, smoothed success estimate to prefer the
+side with better observed outcomes, without random movement. Long escape plans
+are executed as short local segments and reassessed, so a distant safe endpoint
+does not become one long walk through overlapping attack lanes.
 Solo Hitless Safety is enabled by default. While alone it keeps dodge protection
 active, scans threats from farther away, increases telegraph margins and projectile
 lookahead, retains named attack parts that activate later in the run, and treats
