@@ -137,6 +137,7 @@ local state = {
     hazardMemory = {},
     hazardMemorySequence = 0,
     hazardMemoryDirty = false,
+    aimObservations = setmetatable({}, { __mode = "k" }),
     observedThreats = setmetatable({}, { __mode = "k" }),
     activeZones = {},
     nearbyEnemies = {},
@@ -206,10 +207,77 @@ local function memoryFor(key)
             if value.sequence < oldestSequence then oldestKey, oldestSequence = candidate, value.sequence end
         end
         if count >= 24 and oldestKey then memory[oldestKey] = nil end
-        entry = { hits = 0, bonus = 0, sequence = 0, sides = {} }
+        entry = { hits = 0, bonus = 0, sequence = 0, sides = {}, aimSamples = 0, aimFollow = 0 }
         memory[key] = entry
     end
     return entry
+end
+
+-- Learn whether a visible attack marker follows the player's movement.
+-- Each marker contributes at most one result, after two movement observations.
+-- Several separate attacks must agree before forecasting influences dodging.
+local function observeAttackAim(zones, rootPart, now)
+    local playerPosition = rootPart.Position
+    for _, zone in ipairs(zones) do
+        local id = zone.id
+        if zone.live and zone.shape ~= "Projectile" and typeof(id) == "Instance"
+            and math.max(zone.size.X, zone.size.Z) < 100
+            and ThreatGeometry.clearance(zone, playerPosition, 0) < 15 then
+            local sample = state.aimObservations[id]
+            local attackPosition = zone.frame.Position
+            if not sample then
+                state.aimObservations[id] = { at = now, player = playerPosition, attack = attackPosition }
+            elseif now - sample.at >= 0.12 then
+                local playerMove = Vector3.new(playerPosition.X - sample.player.X, 0, playerPosition.Z - sample.player.Z)
+                local attackMove = Vector3.new(attackPosition.X - sample.attack.X, 0, attackPosition.Z - sample.attack.Z)
+                if playerMove.Magnitude >= 1.5
+                    and attackMove.Magnitude <= math.min(14, playerMove.Magnitude * 1.6) then
+                    local follow = 0
+                    if attackMove.Magnitude >= 0.5 and attackMove.Unit:Dot(playerMove.Unit) >= 0.7 then
+                        follow = math.clamp(attackMove.Magnitude / playerMove.Magnitude, 0, 1)
+                    end
+                    if not sample.committed then
+                        sample.count = (sample.count or 0) + 1
+                        sample.follow = (sample.follow or 0) + follow
+                        if sample.count >= 2 then
+                            local result = sample.follow / sample.count
+                            local key = hazardMemoryKey(zone)
+                            if result >= 0.5 or state.hazardMemory[key] then
+                                local entry = memoryFor(key)
+                                entry.aimSamples = math.min(16, (entry.aimSamples or 0) + 1)
+                                entry.aimFollow = entry.aimSamples == 1 and result
+                                    or math.clamp((entry.aimFollow or 0) * 0.75 + result * 0.25, 0, 1)
+                                state.hazardMemorySequence = state.hazardMemorySequence + 1
+                                entry.sequence = state.hazardMemorySequence
+                                state.hazardMemoryDirty = true
+                            end
+                            sample.committed = true
+                        end
+                    end
+                end
+                sample.at, sample.player, sample.attack = now, playerPosition, attackPosition
+            end
+        end
+    end
+end
+
+local function forecastAttackAim(zones, rootPart)
+    local velocity = rootPart.AssemblyLinearVelocity
+    local horizontal = Vector3.new(velocity.X, 0, velocity.Z)
+    if horizontal.Magnitude < 4 then return end
+    for _, zone in ipairs(zones) do
+        if zone.live and zone.shape ~= "Projectile" and not zone.moving
+            and ThreatGeometry.clearance(zone, rootPart.Position, 0) < 20 then
+            local entry = state.hazardMemory[hazardMemoryKey(zone)]
+            if entry and (entry.aimSamples or 0) >= 3 and (entry.aimFollow or 0) >= 0.6 then
+                local offset = horizontal * (0.3 * entry.aimFollow)
+                if offset.Magnitude > 5 then offset = offset.Unit * 5 end
+                zone.aimForecast = { frame = zone.frame + offset, size = zone.size, shape = zone.shape,
+                    velocity = zone.velocity, moving = false, lookahead = 0 }
+                zone.aimOffset = offset
+            end
+        end
+    end
 end
 
 local function observeEscape(key, side, success)
@@ -1611,6 +1679,11 @@ local function refreshSafety(rootPart, now)
             end
         end
     end
+    for _, zone in ipairs(zones) do
+        zone.aimForecast, zone.aimOffset = nil, nil
+    end
+    observeAttackAim(zones, rootPart, now)
+    forecastAttackAim(zones, rootPart)
     state.activeZones = zones
     refreshHazardSnapshot(rootPart, ThreatGeometry.risk(zones, rootPart.Position, CFG.HAZARD_MARGIN))
     for _, zone in ipairs(zones) do
@@ -3361,6 +3434,7 @@ end
 connect(player.CharacterAdded, function(character)
     state.combatIntent, state.lastProgressGoal = nil, nil
     state.escapeLearning = nil
+    state.aimObservations = setmetatable({}, { __mode = "k" })
     state.protectorOrbitSide = nil
     state.protectorEscapeVisits = nil
     state.threatReactionAt = nil
@@ -3393,6 +3467,8 @@ local function loadDodgeMemory(data)
             and count < 24 then
             local hits = math.clamp(math.floor(tonumber(source.Hits) or 0), 0, 100)
             local bonus = math.clamp(math.floor(tonumber(source.Bonus) or 0), 0, 5)
+            local aimSamples = math.clamp(math.floor(tonumber(source.AimSamples) or 0), 0, 16)
+            local aimFollow = math.clamp(tonumber(source.AimFollow) or 0, 0, 1)
             sequence = sequence + 1
             local avoidSide = source.AvoidSide == 1 and 1 or source.AvoidSide == -1 and -1 or nil
             local sides = {}
@@ -3408,7 +3484,7 @@ local function loadDodgeMemory(data)
                 end
             end
             memory[key] = { hits = hits, bonus = bonus, sequence = sequence,
-                avoidSide = avoidSide, sides = sides }
+                avoidSide = avoidSide, sides = sides, aimSamples = aimSamples, aimFollow = aimFollow }
             count = count + 1
         end
     end
@@ -3423,7 +3499,8 @@ local function exportDodgeMemory()
             sides[side] = { Count = sample.count, Value = sample.value }
         end
         entries[key] = { Hits = entry.hits, Bonus = entry.bonus,
-            AvoidSide = entry.avoidSide, Sides = sides }
+            AvoidSide = entry.avoidSide, Sides = sides,
+            AimSamples = entry.aimSamples or 0, AimFollow = entry.aimFollow or 0 }
     end
     return { Version = 1, Entries = entries }
 end

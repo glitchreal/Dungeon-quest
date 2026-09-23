@@ -18,7 +18,7 @@ function Geometry.segmentDistance(position, startPosition, endPosition)
     return (position - (startPosition + delta * fraction)).Magnitude
 end
 
-function Geometry.clearance(zone, position, margin, arrivalTime)
+local function clearanceSingle(zone, position, margin, arrivalTime)
     local point = zone.frame:PointToObjectSpace(position)
     local half = zone.size * 0.5
     if zone.shape == "ProtectorSmash" then
@@ -56,6 +56,14 @@ function Geometry.clearance(zone, position, margin, arrivalTime)
     local height = math.abs(point.Y) - half.Y - BASE_MARGIN
     if height > 0 then return height end
     return math.max(math.abs(point.X) - half.X - margin, math.abs(point.Z) - half.Z - margin)
+end
+
+function Geometry.clearance(zone, position, margin, arrivalTime)
+    local clearance = clearanceSingle(zone, position, margin, arrivalTime)
+    if zone.aimForecast then
+        return math.min(clearance, clearanceSingle(zone.aimForecast, position, margin, arrivalTime))
+    end
+    return clearance
 end
 
 -- Lateral exit from a traveling smash corridor: how far sideways out of the
@@ -165,6 +173,7 @@ function Geometry.segmentSafe(zones, startPosition, endPosition, margin)
             local travel = (zone.moving or zone.shape == "Projectile")
                 and zone.velocity.Magnitude * zone.lookahead or 0
             local radius = zone.size.Magnitude * 0.5 + padding + travel
+                + (zone.aimOffset and zone.aimOffset.Magnitude or 0)
             if Geometry.segmentDistance(zone.frame.Position, startPosition, endPosition) <= radius then
                 table.insert(relevant, zone)
             end
