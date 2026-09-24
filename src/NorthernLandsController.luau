@@ -132,6 +132,13 @@ local function isFirstBossProjectile(zone)
         or name:find("bigspike", 1, true) or name:find("big spike", 1, true)
 end
 
+local function isBobHazard(zone)
+    local name = zoneName(zone)
+    return name:find("secondbossbigcircle", 1, true)
+        or name:find("spinninglaser", 1, true)
+        or name:find("secondbossmovingbeam", 1, true)
+end
+
 local function isOdinAttack(zone)
     local name = zoneName(zone)
     return name:find("thirdboss", 1, true) or name:find("third boss", 1, true)
@@ -158,9 +165,11 @@ function NorthernLands.new(options)
     self._workspace = options.workspace or workspace
     self._player = options.player
     self._geometry = options.threatGeometry
+    self._predictor = options.projectilePredictor
     self._memory = options.memory
     self._connect = options.connect or function(signal, callback) return signal:Connect(callback) end
     self._crystals = {}
+    self._centers = setmetatable({}, { __mode = "k" })
     self._safeZoneParts = setmetatable({}, { __mode = "k" })
     self._orbs = setmetatable({}, { __mode = "k" })
     self._orbSamples = setmetatable({}, { __mode = "k" })
@@ -182,6 +191,13 @@ function NorthernLands.new(options)
         MechanicStartedAt = 0,
         MechanicDeadline = 0,
         LastMechanic = nil,
+        MovementOwner = "combat",
+        TemporarySubgoal = nil,
+        OrbColor = nil,
+        OrbTarget = nil,
+        OrbPosition = nil,
+        OrbVelocity = nil,
+        OrbProgress = nil,
     }
 
     local function track(instance) self:_track(instance) end
@@ -202,6 +218,8 @@ end
 
 function NorthernLands:_track(instance)
     if not instance:IsA("BasePart") then return end
+    if instance.Name == "firstBossMiddlePart" or instance.Name == "secondBossMiddlePart"
+        or instance.Name == "thirdBossMiddlePart" then self._centers[instance] = true end
     local lowered = instance.Name:lower():gsub("[^%w]", "")
     local orbColor = ORB_COLORS[lowered]
     if orbColor and instance:IsDescendantOf(self._workspace) then
@@ -217,6 +235,7 @@ function NorthernLands:_track(instance)
 end
 
 function NorthernLands:_untrack(instance)
+    self._centers[instance] = nil
     self._orbs[instance] = nil
     self._orbSamples[instance] = nil
     self._safeZoneParts[instance] = nil
@@ -301,6 +320,8 @@ function NorthernLands:_beginRecovery(now, goal)
     state.MechanicTarget = nil
     state.MechanicStartedAt = now
     state.MechanicDeadline = now + 0.55
+    state.MovementOwner = "recovery"
+    state.TemporarySubgoal = goal and "ResumePreviousObjective" or "ResumeCombat"
     self._recoveryGoal = goal or (self._intent and self._intent.goal)
     self._intent = nil
     self._intentUntil = 0
@@ -314,6 +335,8 @@ function NorthernLands:_normal(now)
     state.MechanicTarget = nil
     state.MechanicStartedAt = now
     state.MechanicDeadline = 0
+    state.MovementOwner = "combat"
+    state.TemporarySubgoal = nil
     self._recoveryGoal = nil
     self._intent = nil
     self._intentUntil = 0
@@ -321,10 +344,14 @@ end
 
 function NorthernLands:Reset()
     self._episode = nil
+    self._suspendedOrbEpisode, self._guidingOrb, self._mobRoom = nil, nil, nil
     self._slam = nil
     self._requiredColor = nil
     self._safeColorActive = false
     self._safeDeadline = 0
+    self.State.MovementOwner, self.State.TemporarySubgoal = "combat", nil
+    self.State.OrbColor, self.State.OrbTarget = nil, nil
+    self.State.OrbPosition, self.State.OrbVelocity, self.State.OrbProgress = nil, nil, nil
     self.State.CurrentBoss = nil
     self:_normal(os.clock())
 end
@@ -415,6 +442,8 @@ function NorthernLands:_commitIntent(context, mechanic, objective, goal, reason,
     }
     self._intent = intent
     self._intentUntil = context.now + lease
+    self.State.MovementOwner = fields and fields.owner or mechanic
+    self.State.TemporarySubgoal = objective
     self:_recordChoice(context, intent, fields)
     return intent
 end
@@ -457,6 +486,11 @@ function NorthernLands:_recordChoice(context, intent, fields)
         -- A new target/color is not evidence the previous objective succeeded.
         episode = { key = key, target = target, started = context.now, choices = {}, damaged = false,
             mechanic = intent.mechanic, color = self._policyColor }
+        if fields and fields.guide and context.target then
+            episode.combatTarget = context.target
+            local humanoid = context.target:FindFirstChildOfClass("Humanoid")
+            episode.startHealth = humanoid and humanoid.Health
+        end
         self._episode = episode
     end
     local goal = intent.goal or context.rootPart.Position
@@ -534,8 +568,8 @@ function NorthernLands:_reuse(context, mechanic, target, drift)
 end
 
 function NorthernLands:_activeOrb(context)
-    local current = (self.State.CurrentMechanic == "ORB_GUIDE" or self.State.CurrentMechanic == "ORB_SETUP")
-        and self.State.MechanicTarget or nil
+    local current = self._guidingOrb or ((self.State.CurrentMechanic == "ORB_GUIDE" or self.State.CurrentMechanic == "ORB_SETUP")
+        and self.State.MechanicTarget or nil)
     if current and current.Parent and self._orbs[current] and self:_orbTargetsPlayer(current, context) then
         return current, self._orbs[current]
     end
@@ -597,14 +631,24 @@ function NorthernLands:_orbTargetsPlayer(orb, context)
 end
 
 function NorthernLands:_guideOrb(context, orb, color)
+    self._guidingOrb = orb
+    if self._suspendedOrbEpisode then
+        if self._suspendedOrbEpisode.target == orb then self._episode = self._suspendedOrbEpisode end
+        self._suspendedOrbEpisode = nil
+    end
     self._policy, self._policyColor = "ORB_GUIDE", color
+    self.State.MovementOwner = "BOB_ORB_GUIDE"
+    self.State.TemporarySubgoal = "MatchingCrystal"
+    self.State.OrbColor, self.State.OrbTarget = color, orb
+    self.State.OrbPosition = orb.Position
     local crystal = self._crystals[color]
     if not crystal or not crystal.Parent then
         return self:_commitIntent(context, "ORB_SETUP", NorthernLands.Objective.MATCH_COLOR,
             context.rootPart.Position, "Locating " .. color .. " crystal", 0.15,
-            { target = orb, mandatory = true, hold = true })
+            { target = orb, mandatory = true, hold = true, owner = "BOB_ORB_GUIDE" })
     end
     local velocity = self:_orbVelocity(orb, context.now)
+    self.State.OrbVelocity = velocity
     local predictedOrb = orb.Position + velocity * 0.25
     local episode = self._episode
     if episode and episode.target == orb and not episode.efficiencyObserved then
@@ -633,6 +677,7 @@ function NorthernLands:_guideOrb(context, orb, color)
         table.insert(candidates, base - tangent * 3)
     end
     local orbDistance = flat(orb.Position - context.rootPart.Position).Magnitude
+    self.State.OrbProgress = math.max(0, 1 - flat(orb.Position - crystal.Position).Magnitude / 160)
     if orbDistance < 14 then
         local away = unitOr(context.rootPart.Position - predictedOrb, tangent)
         table.insert(candidates, context.rootPart.Position + rotate(away, math.pi / 2) * 10)
@@ -656,14 +701,14 @@ function NorthernLands:_guideOrb(context, orb, color)
     if not goal then
         return self:_commitIntent(context, "ORB_GUIDE", NorthernLands.Objective.GUIDE_PROJECTILE,
             context.rootPart.Position, "Holding orb line for " .. color .. " crystal", 0.12,
-            { target = orb, mandatory = true, hold = true, emergencyFirst = true })
+            { target = orb, mandatory = true, hold = true, emergencyFirst = true, owner = "BOB_ORB_GUIDE" })
     end
     local currentRisk = self:_risk(context, context.rootPart.Position, 4)
     local emergencyFirst = currentRisk > 2 and goalRisk >= currentRisk - 0.1
     return self:_commitIntent(context, "ORB_GUIDE", NorthernLands.Objective.GUIDE_PROJECTILE,
         goal, "Guiding " .. color .. " orb into matching crystal", orbDistance < 14 and 0.18 or 0.4,
         { target = orb, mandatory = true, forceBlink = orbDistance < 9 and goalRisk < currentRisk,
-            threat = orb, emergencyFirst = emergencyFirst })
+            threat = orb, emergencyFirst = emergencyFirst, owner = "BOB_ORB_GUIDE" })
 end
 
 function NorthernLands:_matchingSafeZones(color)
@@ -837,30 +882,69 @@ function NorthernLands:_slamIntent(context, zone)
 end
 
 function NorthernLands:_projectileIntent(context, zone)
-    self._policy, self._policyColor = "PROJECTILE_ESCAPE", nil
-    local clearance = self._geometry.clearance(zone, context.rootPart.Position, 7, 0.35)
-    if clearance > 12 then return nil end
-    local reused = self:_reuse(context, "PROJECTILE_ESCAPE", zone.id, 0.25)
+    local mechanic = zone.strategy or "PROJECTILE_ESCAPE"
+    self._policy, self._policyColor = mechanic, nil
+    self.State.TemporarySubgoal = mechanic == "LASER_ESCAPE" and "LaserOuterEdge" or "ProjectilePerpendicular"
+    local hitAt, axis, positive, negative
+    if self._predictor and zone.predictive then
+        hitAt, axis, positive, negative = self._predictor.intersection(zone, context.rootPart.Position, context.now, 7)
+        if not hitAt or hitAt > math.min(3, math.min(positive, negative) / math.max(1, context.humanoid.WalkSpeed) + 0.75) then return nil end
+    elseif self._geometry.clearance(zone, context.rootPart.Position, 7, 0.35) > 12 then return nil end
+    self.State.PredictedIntersection = hitAt
+    local reused = self:_reuse(context, mechanic, zone.id, 0.25)
     if reused then return reused end
     local velocity = unitOr(zone.velocity or zone.frame.LookVector)
     local perpendicular = Vector3.new(-velocity.Z, 0, velocity.X)
     local towardBoss = context.targetRoot and unitOr(context.targetRoot.Position - context.rootPart.Position) or Vector3.zero
     local candidates = {}
+    if axis then
+        table.insert(candidates, context.rootPart.Position + axis * positive)
+        table.insert(candidates, context.rootPart.Position - axis * negative)
+    end
+    -- Bob's expanding white circle is a broad radial hazard. Crossing at the
+    -- nearest outer edge minimizes time inside it and avoids waiting for a
+    -- perfect empty arena while the orb objective remains active.
+    if zone.shape == "Cylinder" and zoneName(zone):find("bigcircle", 1, true) then
+        local center = Vector3.new(zone.frame.Position.X, context.rootPart.Position.Y, zone.frame.Position.Z)
+        local radial = flat(context.rootPart.Position - center)
+        if radial.Magnitude < 0.1 then radial = Vector3.new(1, 0, 0) end
+        radial = radial.Unit
+        local radius = math.max(zone.size.Y, zone.size.Z) * 0.5 + 6
+        local edge = center + radial * radius
+        local tangent = Vector3.new(-radial.Z, 0, radial.X)
+        table.insert(candidates, edge)
+        table.insert(candidates, edge + tangent * 7)
+        table.insert(candidates, edge - tangent * 7)
+    end
+    -- These are candidates behind crystals, not assumptions of cover. Only
+    -- geometry-clear positions/routes receive any credit; no raycast removes
+    -- laser damage simply because decorative scenery is between it and us.
+    if mechanic == "LASER_ESCAPE" then
+        for _, crystal in pairs(self._crystals) do
+            if crystal.Parent then
+                local away = unitOr(crystal.Position - zone.frame.Position)
+                local point = crystal.Position + away * (math.max(crystal.Size.X, crystal.Size.Z) * 0.5 + 7)
+                if flat(point - context.rootPart.Position).Magnitude < 35 then table.insert(candidates, point) end
+            end
+        end
+    end
     for _, distance in ipairs({ 10, 15, 20 }) do
         table.insert(candidates, context.rootPart.Position + perpendicular * distance + towardBoss * 3)
         table.insert(candidates, context.rootPart.Position - perpendicular * distance + towardBoss * 3)
     end
     local function extra(candidate)
         local side = flat(candidate - context.rootPart.Position):Dot(perpendicular) >= 0 and 1 or -1
-        return side == self._escapeSide and 0 or 24
+        local stillInCorridor = self._predictor and zone.predictive
+            and self._predictor.intersection(zone, candidate, context.now, 5)
+        return (side == self._escapeSide and 0 or 4) + (stillInCorridor and 500 or 0)
     end
     local goal, goalRisk = self:_pick(context, candidates, context.rootPart.Position,
         { margin = 4, allowExposure = true, desiredWeight = 0.1 }, extra)
     if not goal then return nil end
     self._escapeSide = flat(goal - context.rootPart.Position):Dot(perpendicular) >= 0 and 1 or -1
     local currentRisk = self:_risk(context, context.rootPart.Position, 4)
-    return self:_commitIntent(context, "PROJECTILE_ESCAPE", NorthernLands.Objective.CROSS_CORRIDOR,
-        goal, "Crossing Northern projectile corridor", 0.38,
+    return self:_commitIntent(context, mechanic, NorthernLands.Objective.CROSS_CORRIDOR,
+        goal, mechanic .. (hitAt and string.format(" | impact %.2fs", hitAt) or " | crossing corridor"), 0.38,
         { target = zone.id, threat = zone.id, allowAttack = true,
             forceBlink = currentRisk > 0 and goalRisk < currentRisk })
 end
@@ -949,6 +1033,20 @@ function NorthernLands:_odinGap(context)
     local current = unitOr(context.rootPart.Position - center)
     local radius = math.clamp(flat(context.rootPart.Position - center).Magnitude, 16, 25)
     local candidates = { context.rootPart.Position }
+    local edgeAttack
+    for _, attack in ipairs(attacks) do
+        local name = zoneName(attack)
+        if name:find("thirdboss", 1, true) and name:find("passiveorb", 1, true)
+            or name:find("passiveorb", 1, true)
+            or name:find("nuke", 1, true) then edgeAttack = attack; break end
+    end
+    if edgeAttack then
+        local side = Vector3.new(-current.Z, 0, current.X)
+        for _, edgeRadius in ipairs({ 34, 44, 54 }) do
+            table.insert(candidates, center + side * edgeRadius)
+            table.insert(candidates, center - side * edgeRadius)
+        end
+    end
     for index = -6, 6 do
         table.insert(candidates, center + rotate(current, index * math.pi / 18) * radius)
     end
@@ -963,7 +1061,7 @@ function NorthernLands:_odinGap(context)
     local holding = currentRisk == 0 and flat(goal - context.rootPart.Position).Magnitude <= 1.75
     return self:_commitIntent(context, "SAFE_GAP_TRAVEL",
         holding and NorthernLands.Objective.HOLD_POSITION or NorthernLands.Objective.ROTATE_AROUND_CENTER,
-        holding and context.rootPart.Position or goal, "Using nearest safe gap in Odin attack", 0.45,
+        holding and context.rootPart.Position or goal, edgeAttack and "Holding Odin outer edge" or "Using nearest safe gap in Odin attack", 0.45,
         { target = attacks[1].id, allowAttack = true, hold = holding,
             forceBlink = currentRisk > 0 and goalRisk < currentRisk })
 end
@@ -999,6 +1097,15 @@ function NorthernLands:Update(context)
     context.zones = context.zones or {}
     local kind = bossKind(context.target)
     local orb, orbColor = self:_activeOrb(context)
+    if orb then
+        self.State.OrbColor, self.State.OrbTarget = orbColor, orb
+        self.State.OrbPosition = orb.Position
+    end
+    if not orb then
+        self.State.OrbColor, self.State.OrbTarget = nil, nil
+        self.State.OrbPosition, self.State.OrbVelocity, self.State.OrbProgress = nil, nil, nil
+        self._guidingOrb = nil
+    end
     if orb and not kind then kind = "BOB_THE_FROST_GIANT" end
     if not kind and self._slam and context.now - self._slam.startedAt < 3 then
         kind = self.State.CurrentBoss or "MIDGARDIAN_CHAMPION"
@@ -1059,8 +1166,21 @@ function NorthernLands:Update(context)
             local intent = self:_beamSector(context, beams)
             if intent then return intent end
         end
+    elseif kind == "BOB_THE_FROST_GIANT" then
+        for _, zone in ipairs(context.zones) do
+            if isBobHazard(zone) then
+                local intent = self:_projectileIntent(context, zone)
+                if intent then return intent end
+            end
+        end
     elseif kind == "ODIN" or kind == "ODIN_REINCARNATION" then
         if context.targetRoot then
+            for _, zone in ipairs(context.zones) do
+                if zone.strategy == "ROCKET_ESCAPE" or zoneName(zone):find("thirdbosssidewaysmissile", 1, true) then
+                    local intent = self:_projectileIntent(context, zone)
+                    if intent then return intent end
+                end
+            end
             local intent = self:_odinGap(context)
             if intent then return intent end
         end

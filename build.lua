@@ -23,6 +23,7 @@ for _, route in ipairs({ "lobby", "dungeon" }) do
     }
     if route == "dungeon" then
         table.insert(parts, module("ThreatGeometry", "src/ThreatGeometry.luau"))
+        table.insert(parts, module("TelegraphedProjectilePredictor", "src/TelegraphedProjectilePredictor.luau"))
         table.insert(parts, module("AdaptiveMemory", "src/AdaptiveMemory.luau"))
         table.insert(parts, module("AdaptiveNavigation", "src/AdaptiveNavigation.luau"))
         table.insert(parts, module("NorthernLandsController", "src/NorthernLandsController.luau"))

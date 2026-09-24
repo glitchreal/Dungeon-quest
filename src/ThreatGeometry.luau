@@ -61,6 +61,18 @@ local function clearanceSingle(zone, position, margin, arrivalTime)
         return Vector2.new(point.Y, point.Z).Magnitude - projectedCircleRadius(zone, arrivalTime) - margin
     end
     if zone.shape == "Projectile" then
+        if zone.predictive then
+            local when = os.clock() + (arrivalTime or 0)
+            if when > zone.expires then return math.huge end
+            local firstTime = math.max(when, zone.starts)
+            local lastTime = math.min(zone.expires, math.max(when + zone.lookahead, firstTime))
+            -- Before launch, reserve only the portion that can arrive within
+            -- the prediction window; don't sweep through the whole arena.
+            if when + zone.lookahead < zone.starts then return math.huge end
+            local first = (zone.origin + zone.travel * math.clamp((firstTime - zone.starts) / zone.duration, 0, 1)).Position
+            local last = (zone.origin + zone.travel * math.clamp((lastTime - zone.starts) / zone.duration, 0, 1)).Position
+            return Geometry.segmentDistance(position, first, last) - zone.projectileRadius - margin
+        end
         local center = zone.frame.Position
         if arrivalTime and arrivalTime > 0 then
             local future = os.clock() + arrivalTime

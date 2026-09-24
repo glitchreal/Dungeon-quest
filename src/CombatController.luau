@@ -485,6 +485,7 @@ end
 local adaptiveMemory = AdaptiveMemory.new()
 local adaptiveNavigation = AdaptiveNavigation.new(adaptiveMemory)
 local northernMechanics = NorthernLandsController.new({
+    projectilePredictor = TelegraphedProjectilePredictor,
     workspace = Workspace,
     player = player,
     threatGeometry = ThreatGeometry,
@@ -516,7 +517,8 @@ local function dangerousName(instance)
         or name:find("spike", 1, true) or name:find("orb", 1, true)
         or name:find("blast", 1, true) or name:find("slam", 1, true)
         or name:find("flame", 1, true) or name:find("beam", 1, true)
-        or name:find("laser", 1, true)
+        or name:find("laser", 1, true) or name:find("spinninglaser", 1, true)
+        or name:find("bigcircle", 1, true) or name:find("bouncingorbbeam", 1, true)
 end
 do
     local templates = game:GetService("ReplicatedStorage"):FindFirstChild("enemyProjectiles")
@@ -659,30 +661,17 @@ pcall(function()
     local syncModule = storage:FindFirstChild("timeSync")
     if not remote or not templates or not syncModule then return end
     local timeSync = require(syncModule)
-    local templateNames = {
-        ["First Boss Seeking Spike"] = "firstBossSeekingSpikes",
-        ["First Boss Big Spike"] = "firstBossBigSpike",
-        ["First Boss Criss Cross Projectile"] = "firstBossCrissCross",
-    }
     connect(remote.OnClientEvent, function(action, data)
-        local templateName = templateNames[action]
-        if state.closed or not templateName or type(data) ~= "table"
-            or type(data[1]) ~= "number" or type(data[2]) ~= "number"
-            or type(data[3]) ~= "number" or type(data[4]) ~= "number"
-            or typeof(data[5]) ~= "CFrame" or data[2] <= 0 then return end
-        local template = templates:FindFirstChild(templateName)
-        if not template or not template:IsA("BasePart") then return end
-        local serverNow, now = timeSync:GetTime(), os.clock()
-        local remaining = data[4] - serverNow
-        if remaining < -0.35 or remaining > 15 then return end
-        local velocity = data[5].LookVector * (data[1] / data[2])
-        table.insert(announcedZones, {
-            frame = data[5], origin = data[5], travel = data[5].LookVector * data[1],
-            duration = data[2], starts = now + data[3] - serverNow,
-            size = template.Size, shape = "Projectile", velocity = velocity,
-            lookahead = math.min(CFG.PROJECTILE_LOOKAHEAD, data[2]),
-            expires = now + remaining + 0.25, id = {}, name = action,
-        })
+        local spec = TelegraphedProjectilePredictor.events[action]
+        if state.closed or not spec then return end
+        local template = templates:FindFirstChild(spec.template)
+        if not template then return end
+        local size
+        if template:IsA("BasePart") then size = template.Size
+        elseif template:IsA("Model") then local _, bounds = template:GetBoundingBox(); size = bounds end
+        local zone = TelegraphedProjectilePredictor.decode(action, data, size, os.clock(), timeSync:GetTime())
+        if not zone then return end
+        table.insert(announcedZones, zone)
         state.lastSafetyScan = -math.huge
         state.lastEscapePlan = -math.huge
     end)
@@ -982,6 +971,21 @@ local function getClosestEnemy(rootPart, now)
             end
         end
     end
+    -- Prefer the reachable edge of a nearby pack when several enemies are
+    -- close together. This keeps melee mobs stacked for splash damage while
+    -- the combat orbit circles their local center. The search distance below
+    -- still prevents pulling a separate room-wide pack.
+    local clusterRadius = 18
+    for _, candidate in ipairs(candidates) do
+        local count, center = 0, Vector3.zero
+        for _, other in ipairs(candidates) do
+            if (other.root.Position - candidate.root.Position).Magnitude <= clusterRadius then
+                count, center = count + 1, center + other.root.Position
+            end
+        end
+        candidate.cluster = count
+        candidate.clusterCenter = count > 0 and center / count or candidate.root.Position
+    end
     table.sort(candidates, function(a, b) return a.distance < b.distance end)
     local searchDistance = candidates[1] and math.max(CFG.THREAT_RADIUS, candidates[1].distance + 24) or 0
     local hasReachable = false
@@ -993,24 +997,30 @@ local function getClosestEnemy(rootPart, now)
     local closestIsVisible = false
     if #candidates > 0 then
         -- Prefer nearby enemies we can engage over a closer one behind a wall.
+        local function engageScore(candidate)
+            local clusterBonus = math.min(4, math.max(0, (candidate.cluster or 1) - 1)) * 8
+            return candidate.distance - clusterBonus
+        end
         for index, candidate in ipairs(candidates) do
             if index > 24 or candidate.distance > searchDistance then break end
             if (not hasReachable or now >= (state.unreachableTargets[candidate.model] or 0))
                 and not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
-                closest = candidate
-                closestIsVisible = true
-                break
+                if not closest or engageScore(candidate) < engageScore(closest) then
+                    closest = candidate
+                    closestIsVisible = true
+                end
             end
         end
         if not closest then
             for _, candidate in ipairs(candidates) do
                 if not hasReachable or now >= (state.unreachableTargets[candidate.model] or 0) then
-                    closest = candidate
-                    break
+                    if not closest or engageScore(candidate) < engageScore(closest) then closest = candidate end
                 end
             end
         end
     end
+    state.packCount = closest and closest.cluster or 0
+    state.packCenter = closest and closest.clusterCenter or nil
     local previousLock = state.lockedTarget
     state.lockedTarget = closest and closest.model
     local pickDist = closest and closest.distance or CFG.DETECTION_RADIUS
@@ -1027,6 +1037,12 @@ local function getClosestEnemy(rootPart, now)
                 and (not closestIsVisible or lockedVisible) and lockedDist <= pickDist + 20
                 and lockedDist <= CFG.DETECTION_RADIUS then
                 state.lockedTarget = previousLock
+                for _, candidate in ipairs(candidates) do
+                    if candidate.model == previousLock then
+                        state.packCount, state.packCenter = candidate.cluster, candidate.clusterCenter
+                        break
+                    end
+                end
                 return previousLock, lockedDist
             end
         end
@@ -1736,12 +1752,16 @@ local function refreshSafety(rootPart, now)
     end
     for i = #announcedZones, 1, -1 do
         local zone = announcedZones[i]
-        if zone.origin then
+        if zone.predictive then
+            TelegraphedProjectilePredictor.advance(zone, now)
+        elseif zone.origin then
             zone.frame = zone.origin + zone.travel * math.clamp((now - zone.starts) / zone.duration, 0, 1)
             zone.lookahead = math.min(CFG.PROJECTILE_LOOKAHEAD, math.max(0, zone.starts + zone.duration - now))
         end
         if zone.expires < now then table.remove(announcedZones, i)
-        elseif (zone.frame.Position - rootPart.Position).Magnitude <= CFG.THREAT_RADIUS + zone.size.Magnitude then
+        elseif (zone.predictive and ThreatGeometry.segmentDistance(rootPart.Position,
+            zone.origin.Position, zone.origin.Position + zone.travel) <= CFG.THREAT_RADIUS + zone.size.Magnitude)
+            or (zone.frame.Position - rootPart.Position).Magnitude <= CFG.THREAT_RADIUS + zone.size.Magnitude then
             table.insert(zones, zone)
         end
     end
@@ -1754,9 +1774,16 @@ local function refreshSafety(rootPart, now)
             if first and second and first.Parent and second.Parent
                 and not first:IsDescendantOf(rootPart.Parent) and not second:IsDescendantOf(rootPart.Parent) then
                 local startPosition, endPosition = first.WorldPosition, second.WorldPosition
+                local forecasted = false
+                for _, zone in ipairs(announcedZones) do
+                    if TelegraphedProjectilePredictor.matchesBeam(zone, beam.Parent.Name, startPosition, endPosition, now) then
+                        forecasted = true
+                        break
+                    end
+                end
                 local delta = endPosition - startPosition
                 local width = math.max(1, beam.Width0, beam.Width1)
-                if delta.Magnitude > 0.1
+                if not forecasted and delta.Magnitude > 0.1
                     and ThreatGeometry.segmentDistance(rootPart.Position, startPosition, endPosition) <= CFG.THREAT_RADIUS then
                     table.insert(zones, { frame = CFrame.lookAt((startPosition + endPosition) * 0.5, endPosition),
                         size = Vector3.new(width, math.max(6, width), delta.Magnitude), shape = "Block",
@@ -3166,6 +3193,12 @@ end
 
 local function northernMechanicIntent(humanoid, rootPart, target, targetRoot, now)
     local waypoint = state.waypoints[state.currentWaypointIndex]
+    local profiles = {}
+    for _, snapshot in pairs(abilities.Snapshot(now)) do table.insert(profiles, FarmPlanner.profile(snapshot)) end
+    local previous = state.routeAnchors[math.max(1, state.routeAnchorIndex - 1)]
+    local nextAnchor = state.routeAnchors[state.routeAnchorIndex]
+    local rayParams = buildRaycastParams(rootPart.Parent, target)
+    rayParams.RespectCanCollide = true
     return northernMechanics:Update({
         now = now,
         humanoid = humanoid,
@@ -3173,6 +3206,27 @@ local function northernMechanicIntent(humanoid, rootPart, target, targetRoot, no
         target = target,
         targetRoot = targetRoot,
         attackRange = CFG.ATTACK_RANGE,
+        enemies = state.nearbyEnemies,
+        roomEntry = previous and previous.part.Position,
+        forward = previous and nextAnchor and (nextAnchor.part.Position - previous.part.Position),
+        canAttack = function(position, model, enemyRoot)
+            model, enemyRoot = model or target, enemyRoot or targetRoot
+            if not enemyRoot or not AttackPolicy.damageable(model) then return false end
+            for _, profile in ipairs(profiles) do
+                if AttackPolicy.canHit(profile, position, enemyRoot.Position,
+                    profile.mode == "self" and CFG.CLOSE_AOE_RANGE or effectiveSpellRange(profile),
+                    function(a, b) return hasBlockingRay(a, b, rootPart.Parent, model) end) then return true end
+            end
+            return false
+        end,
+        wallPoint = function(center, direction)
+            local origin = Vector3.new(center.X, rootPart.Position.Y, center.Z)
+            local hit = Workspace:Raycast(origin, direction * 100, rayParams)
+            if hit and math.abs(hit.Normal.Y) < 0.3 and hit.Distance > 18 then
+                return hit.Position - direction * 7
+            end
+            return nil
+        end,
         approachGoal = state.fallbackGoal or (waypoint and waypoint.Position + Vector3.new(0, 2.5, 0)),
         zones = state.activeZones,
         ground = function(position)
@@ -3400,7 +3454,8 @@ local function controllerTick()
     refreshSafety(rootPart, now)
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
-        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
+        state.castAimTarget, state.farmPlan, state.groupCount, state.groupCenter = nil, nil, 0, nil
+        state.packCount, state.packCenter = 0, nil
         state.retreating = false
         state.targetName, state.targetDist = "None", 0
         state.currentTarget, state.lockedTarget = nil, nil
@@ -3501,7 +3556,13 @@ local function controllerTick()
     local mechanicIntent = northernMechanicIntent(humanoid, rootPart, target, targetRoot, now)
     local unsafeHold = mechanicIntent and mechanicIntent.hold
         and ThreatGeometry.risk(state.activeZones, rootPart.Position, 2, 0.25) > 0
-    local mechanicEmergency = mechanicIntent and (mechanicIntent.emergencyFirst or unsafeHold)
+    -- A persistent mechanic objective remains alive while ordinary attacks
+    -- temporarily take movement ownership. Re-run the shared safety planner
+    -- whenever a hazard is present so an orb route cannot walk through Bob's
+    -- other attacks; NorthernLandsController will resume the same objective
+    -- on the next tick.
+    local mechanicEmergency = mechanicIntent and (mechanicIntent.emergencyFirst or unsafeHold
+        or #state.activeZones > 0)
         and handleSafety(humanoid, rootPart, target, targetRoot, now)
     if mechanicEmergency then
         state.combatIntent, state.lastProgressGoal = nil, nil
@@ -3730,6 +3791,16 @@ local function controllerTick()
         local flat = Vector3.new(offset.X, 0, offset.Z)
         if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
         local basePosition = combatGroundPosition(rootPart, target, targetRoot, flat.Unit)
+        if (state.packCount or 0) >= 2 and state.packCenter then
+            local groupOffset = rootPart.Position - state.packCenter
+            groupOffset = Vector3.new(groupOffset.X, 0, groupOffset.Z)
+            if groupOffset.Magnitude < 0.1 then groupOffset = flat.Unit end
+            local groupSpacing = math.min(CFG.COMBAT_DISTANCE, math.max(10, CFG.ATTACK_RANGE * 0.72))
+            local grouped = groundPosition(state.packCenter + groupOffset.Unit * groupSpacing, character, target)
+            -- Keep the pack center only when the locked enemy remains inside
+            -- a real ability range. Otherwise the edge target gets priority.
+            if (grouped - targetRoot.Position).Magnitude <= CFG.ATTACK_RANGE then basePosition = grouped end
+        end
         local desiredPosition = combatPosition(rootPart, target, targetRoot, basePosition, now)
         if (desiredPosition - rootPart.Position).Magnitude > 1 then
             followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
@@ -3811,7 +3882,8 @@ local function setRunning(running)
         state.unreachableTargets = setmetatable({}, { __mode = "k" })
         state.combatIntent, state.lastProgressGoal = nil, nil
         state.escapeLearning = nil
-        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
+        state.castAimTarget, state.farmPlan, state.groupCount, state.groupCenter = nil, nil, 0, nil
+        state.packCount, state.packCenter = 0, nil
         state.retreating = false
         state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
         state.movementBlocked, state.lastSafetyScan, state.lastEscapePlan = false, -math.huge, -math.huge
@@ -3839,7 +3911,7 @@ local function setRunning(running)
         createWaypointFolder()
         state.pathStatus = "Pathfinding: active"
     else
-        state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
+        state.castAimTarget, state.farmPlan, state.groupCount, state.groupCenter = nil, nil, 0, nil
         restoreFacing()
         local _, humanoid, rootPart = getChar()
         if humanoid and rootPart then stopMovement(humanoid, rootPart) end
@@ -3965,7 +4037,8 @@ connect(player.CharacterAdded, function(character)
     state.protectorOrbitSide = nil
     state.protectorEscapeVisits = nil
     state.threatReactionAt = nil
-    state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
+    state.castAimTarget, state.farmPlan, state.groupCount, state.groupCenter = nil, nil, 0, nil
+    state.packCount, state.packCenter = 0, nil
     state.retreating = false
     state.escapeGoal, state.escapeUntil, state.safetyUntil = nil, 0, 0
     state.movementBlocked, state.lastSafetyScan = false, -math.huge
