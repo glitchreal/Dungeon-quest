@@ -17,13 +17,15 @@ local CFG = {
     SKILL_COOLDOWN = 0.2,
     CONTROL_INTERVAL = 1 / 30,
     UI_INTERVAL = 0.15,
-    THREAT_SCAN_INTERVAL = 0.2,
+    -- Refresh empty-room threat state often enough to catch a newly spawned
+    -- marker even when it has no recognizable attack name yet.
+    THREAT_SCAN_INTERVAL = 0.05,
     DETECTION_RADIUS = 1000,
 
     PATH_UPDATE_INTERVAL = 0.8,
     WAYPOINT_REACH_THRESHOLD = 3,
     DIRECT_PATH_DISTANCE = 40,
-    MOVETO_REFRESH_INTERVAL = 0.45,
+    MOVETO_REFRESH_INTERVAL = 0.35,
     AGENT_RADIUS = 2.0,
     AGENT_HEIGHT = 5.5,
     AGENT_CAN_JUMP = true,
@@ -36,12 +38,17 @@ local CFG = {
     STUCK_TIMEOUT = 0.75,
     FAILED_PATH_COOLDOWN = 2.5,
     TARGET_SCAN_INTERVAL = 0.25,
-    DODGE_COOLDOWN = 0.5,
+    DODGE_COOLDOWN = 0.28,
     DODGE_LATERAL_DISTANCE = 8,
     DODGE_WINDOW = 3,
     DODGE_MAX_PER_WINDOW = 3,
     DODGE_DISTANCE_BUDGET = 18,
-    DODGE_SAME_THREAT_COOLDOWN = 3,
+    DODGE_SAME_THREAT_COOLDOWN = 1,
+    DODGE_EXPOSED_THREAT_COOLDOWN = 0.25,
+    ESCAPE_COMMIT_TIME = 0.24,
+    ESCAPE_EXPOSURE_COMMIT_TIME = 0.45,
+    ESCAPE_BACKUP_COMMIT_TIME = 0.2,
+    ESCAPE_RECHECK_INTERVAL = 0.08,
     THREAT_RADIUS = 90,
     PROJECTILE_LOOKAHEAD = 1.35,
     PRECAST_MARGIN = 3,
@@ -1232,7 +1239,7 @@ local function issueMove(humanoid, position, mode, now, bypass)
     end
     local function safetyHold(root)
         state.adaptiveLocalAttempt = nil
-        if state.motionMode ~= "safety-hold" or now - state.lastMoveToCall >= 0.35 then
+        if state.motionMode ~= "safety-hold" or now - state.lastMoveToCall >= 0.15 then
             humanoid:MoveTo(root.Position)
             state.lastMoveToCall = now
             state.lastMoveToPosition = root.Position
@@ -1702,7 +1709,11 @@ local function updateProgress(humanoid, rootPart, goal, target, now)
 end
 
 local function refreshSafety(rootPart, now)
-    local interval = #state.activeZones > 0 and CFG.CONTROL_INTERVAL * 0.75 or 0.1
+    -- The heartbeat is the movement clock, but a quiet room still needs a
+    -- quick scan: many Northern Lands markers are transparent/generic until
+    -- their first geometry update. Once a zone is active, scan once per
+    -- control tick so overlap changes cannot wait behind the old 25 ms gate.
+    local interval = #state.activeZones > 0 and CFG.CONTROL_INTERVAL * 0.5 or CFG.THREAT_SCAN_INTERVAL
     if now - state.lastSafetyScan < interval then return end
     state.lastSafetyScan = now
     local zones, enemies = {}, {}
@@ -2433,7 +2444,8 @@ local function canTeleportDodge(now, distance, threat, exposed)
     local previous = state.dodgedThreats[threat]
     -- A persistent attack may need a second bounded step if the first leaves
     -- the character exposed; otherwise avoid spending budget on the same ID.
-    if previous and now - previous < (exposed and 0.6 or CFG.DODGE_SAME_THREAT_COOLDOWN) then return false end
+    if previous and now - previous < (exposed and CFG.DODGE_EXPOSED_THREAT_COOLDOWN
+        or CFG.DODGE_SAME_THREAT_COOLDOWN) then return false end
     local spent = 0
     for _, entry in ipairs(history) do spent = spent + entry.distance end
     -- Reserve a full blink for smash windups: anything else may only spend
@@ -2960,7 +2972,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         meleeEscapeActive = false
     end
     if meleeEscapeActive and risk == 0 then
-        if now - (state.lastEscapeCheck or 0) >= 0.2 then
+        if now - (state.lastEscapeCheck or 0) >= CFG.ESCAPE_RECHECK_INTERVAL then
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
                 and safeEnemyStep(rootPart.Position, state.escapeGoal)
                 and ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, state.escapeGoal, CFG.HAZARD_MARGIN)
@@ -3069,7 +3081,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
         state.lastEscapePlan = -math.huge
     end
     if state.escapeGoal and now < (state.escapeUntil or 0) then
-        if now - (state.lastEscapeCheck or 0) >= 0.2 then
+        if now - (state.lastEscapeCheck or 0) >= CFG.ESCAPE_RECHECK_INTERVAL then
             state.escapeClear = walkingSegmentClear(rootPart, state.escapeGoal, target)
             state.lastEscapeCheck = now
         end
@@ -3141,7 +3153,19 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     end
     if risk == 0 and now - state.lastEscapePlan < 0.12 then return true end
     state.lastEscapePlan = now
-    local goal, escapeMargin, escapeReason = findEscapeGoal(rootPart, targetRoot)
+    local goal, escapeMargin, escapeReason
+    -- Overlap response is time-critical. Try the small, bounded side-step
+    -- before the full multi-zone scorer; that scorer remains the fallback for
+    -- cases where no immediately clear landing cell exists.
+    if risk > 0 then
+        goal = findEmergencySideStep(rootPart, target)
+        if goal then
+            escapeMargin, escapeReason = CFG.HAZARD_MARGIN, "Fast hazard sidestep"
+        end
+    end
+    if not goal then
+        goal, escapeMargin, escapeReason = findEscapeGoal(rootPart, targetRoot)
+    end
     if not goal and (risk > 0 or state.blockedByHazard) then
         goal = findEmergencySideStep(rootPart, target)
     end
@@ -3153,7 +3177,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             if backup then
                 clearPath()
                 state.escapeGoal, state.escapeUntil = backup, now + 0.8
-                state.escapeCommitUntil = now + 0.35
+                state.escapeCommitUntil = now + CFG.ESCAPE_BACKUP_COMMIT_TIME
                 state.escapeMargin = 2
                 state.escapeStartRisk = risk
                 state.escapeClear, state.lastEscapeCheck = true, now
@@ -3177,7 +3201,8 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     state.motionGoal, state.fallbackGoal = nil, nil
     state.escapeGoal, state.escapeUntil = goal, now + 1.5
     state.escapeMargin = escapeMargin or CFG.HAZARD_MARGIN
-    state.escapeCommitUntil = escapeMargin and now + 0.9 or now + 0.45
+    state.escapeCommitUntil = escapeMargin and now + CFG.ESCAPE_EXPOSURE_COMMIT_TIME
+        or now + CFG.ESCAPE_COMMIT_TIME
     state.escapeStartRisk = risk
     trackEscapeChoice(rootPart, targetRoot, zone, goal, now)
     state.escapeClear, state.lastEscapeCheck = true, now
